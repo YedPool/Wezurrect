@@ -197,8 +197,17 @@ end
 ---@return string|nil
 function pub.write_current_state(name, type)
 	local file_path = pub.save_state_dir .. utils.separator .. "current_state"
-	local suc, err = file_io.write_file(file_path, string.format("%s\n%s", name, type))
-	return suc, err
+	-- Write directly instead of using file_io.write_file's atomic rename,
+	-- which can fail silently on Windows for small metadata files.
+	local handle = io.open(file_path, "w")
+	if not handle then
+		wezterm.log_error("resurrect: could not open current_state for writing: " .. file_path)
+		return false, "could not open file"
+	end
+	handle:write(string.format("%s\n%s", name, type))
+	handle:flush()
+	handle:close()
+	return true, nil
 end
 
 ---callback for resurrecting workspaces on startup

@@ -163,7 +163,8 @@ pub.register({
 			return false
 		end
 		local name = (process_info.name or ""):lower():gsub("%.exe$", "")
-		if name == "claude" then
+		-- Match "claude", "claude2", "claude-dev", etc.
+		if name:match("^claude%d*$") or name:match("^claude%-") then
 			return true
 		end
 		-- When running via node, check argv for claude-code markers
@@ -182,7 +183,10 @@ pub.register({
 	-- Preserves --dangerously-skip-permissions if it was present.
 	get_restore_cmd = function(process_info, pane_tree)
 		local argv = process_info.argv or {}
-		local parts = { "claude" }
+		-- Use the saved executable name (e.g., "claude", "claude2") so
+		-- multi-account setups restore with the correct binary.
+		local bin = process_info.name or process_info.executable or "claude"
+		local parts = { bin }
 
 		-- Session ID: check --resume, -r, --session-id
 		local session_id = parse_flag_value(argv, "--resume", "-r")
@@ -216,7 +220,12 @@ pub.register({
 	-- gets its exact session ID saved, even when running 6-8 sessions at once.
 	sanitize = function(process_info, pane_id)
 		local argv = process_info.argv or {}
-		local clean = { "claude" }
+		-- Preserve the original binary name (e.g., "claude2") for multi-account setups
+		local bin = (process_info.name or ""):lower():gsub("%.exe$", "")
+		if not bin:match("^claude") then
+			bin = "claude"
+		end
+		local clean = { bin }
 
 		-- Extract session ID from argv first (explicit --resume or --session-id)
 		local session_id = parse_flag_value(argv, "--resume", "-r")
@@ -241,8 +250,8 @@ pub.register({
 			table.insert(clean, "--dangerously-skip-permissions")
 		end
 
-		process_info.executable = "claude"
-		process_info.name = "claude"
+		process_info.executable = bin
+		process_info.name = bin
 		process_info.argv = clean
 	end,
 })
