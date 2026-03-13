@@ -161,6 +161,12 @@ local SAFE_RESTORE_PROCESSES = {
 	tmux = true, screen = true,
 }
 
+-- Delay in seconds before sending process restore commands.
+-- Shell interpreters (especially PowerShell on Windows) need time to initialize
+-- before they can accept input. Without this delay, commands sent during
+-- gui-startup get swallowed by the shell's init sequence.
+pub.process_restore_delay_seconds = 3
+
 --- Function to restore text or processes when restoring panes
 ---@param pane_tree pane_tree
 function pub.default_on_pane_restore(pane_tree)
@@ -170,22 +176,33 @@ function pub.default_on_pane_restore(pane_tree)
 	if pane_tree.alt_screen_active and pane_tree.process and pane_tree.process.argv then
 		-- Check registered process handlers first (e.g., Claude Code)
 		local restore_cmd = process_handlers.get_restore_command(pane_tree.process, pane_tree)
-		if restore_cmd then
-			pane:send_text(restore_cmd .. "\r\n")
-		else
+		if not restore_cmd then
 			-- Fall back to allowlist-based argv replay
 			local proc_name = pane_tree.process.name or ""
 			local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
 			base_name = base_name:gsub("%.exe$", ""):lower()
 
 			if SAFE_RESTORE_PROCESSES[base_name] then
-				pane:send_text(wezterm.shell_join_args(pane_tree.process.argv) .. "\r\n")
+				restore_cmd = wezterm.shell_join_args(pane_tree.process.argv)
 			else
 				wezterm.log_warn(
 					"resurrect: skipping restore of unrecognized process: " .. base_name
 						.. " (add to SAFE_RESTORE_PROCESSES or register a process_handler)"
 				)
 			end
+		end
+
+		if restore_cmd then
+			-- Delay sending the command so the shell has time to initialize.
+			-- pane:send_text() during gui-startup fires before the shell is ready,
+			-- causing the command to be lost (especially on Windows with PowerShell).
+			local pane_id = pane:pane_id()
+			wezterm.time.call_after(pub.process_restore_delay_seconds, function()
+				local target_pane = wezterm.mux.get_pane(pane_id)
+				if target_pane then
+					target_pane:send_text(restore_cmd .. "\r\n")
+				end
+			end)
 		end
 	elseif pane_tree.text then
 		pane:inject_output(pane_tree.text:gsub("%s+$", ""))
