@@ -13,7 +13,126 @@ Resurrect your terminal environment!⚰️ A plugin to save the state of your wi
 - Re-attach to remote domains (e.g. SSH, SSHMUX, WSL, Docker, ect.).
 - Optionally enable encryption and decryption of the saved state.
 
-## Setup example
+## Quick Start
+
+### One-Line Install
+
+Paste into your terminal. This creates a new config or patches your existing one (with backup):
+
+**PowerShell (Windows):**
+
+```powershell
+$f="$HOME\.wezterm.lua"; if (!(Test-Path $f)) { @"
+local wezterm = require("wezterm")
+local config = wezterm.config_builder()
+local resurrect = wezterm.plugin.require("https://github.com/YedPool/resurrect.wezterm")
+
+resurrect.setup(config)
+
+return config
+"@ | Set-Content $f -Encoding UTF8; Write-Host "Created $f with resurrect enabled" } elseif (Select-String -Path $f -Pattern "resurrect" -Quiet) { Write-Host "resurrect is already in your config" } else { Copy-Item $f "$f.bak"; $c = Get-Content $f -Raw; $req = 'local resurrect = wezterm.plugin.require("https://github.com/YedPool/resurrect.wezterm")'; $c = $c -replace '(local\s+config\s*=\s*wezterm\.config_builder\(\))', "`$1`n$req"; $c = $c -replace '(return\s+config)', "resurrect.setup(config)`n`$1"; Set-Content $f $c -Encoding UTF8; Write-Host "Updated $f (backup saved to $f.bak)" }
+```
+
+**Bash (macOS / Linux):**
+
+```bash
+f="$HOME/.wezterm.lua"; if [ ! -f "$f" ]; then cat > "$f" << 'EOF'
+local wezterm = require("wezterm")
+local config = wezterm.config_builder()
+local resurrect = wezterm.plugin.require("https://github.com/YedPool/resurrect.wezterm")
+
+resurrect.setup(config)
+
+return config
+EOF
+echo "Created $f with resurrect enabled"; elif grep -q "resurrect" "$f"; then echo "resurrect is already in your config"; else cp "$f" "$f.bak"; sed -i.tmp '/config_builder()/a local resurrect = wezterm.plugin.require("https://github.com/YedPool/resurrect.wezterm")' "$f"; sed -i.tmp 's/return config/resurrect.setup(config)\nreturn config/' "$f"; rm -f "$f.tmp"; echo "Updated $f (backup saved to $f.bak)"; fi
+```
+
+Then restart WezTerm. On first launch it automatically downloads the plugin from GitHub.
+
+### Manual Install
+
+If you prefer to set things up by hand, or the one-liner didn't work with your config:
+
+**1. Locate your config file:**
+
+| OS | Path |
+|----|------|
+| **Windows** | `C:\Users\<username>\.wezterm.lua` |
+| **macOS** | `~/.wezterm.lua` |
+| **Linux** | `~/.wezterm.lua` or `$XDG_CONFIG_HOME/wezterm/wezterm.lua` |
+
+If you don't have one yet, create it. See the [WezTerm config docs](https://wezfurlong.org/wezterm/config/files.html) for details.
+
+**2. Add these two lines to your config:**
+
+Add the `require` line near the top (after `local config = wezterm.config_builder()`):
+
+```lua
+local resurrect = wezterm.plugin.require("https://github.com/YedPool/resurrect.wezterm")
+```
+
+Add the `setup` call before `return config`:
+
+```lua
+resurrect.setup(config)
+```
+
+A complete minimal config looks like this:
+
+```lua
+local wezterm = require("wezterm")
+local config = wezterm.config_builder()
+local resurrect = wezterm.plugin.require("https://github.com/YedPool/resurrect.wezterm")
+
+-- your existing config here (colors, fonts, shell, etc.)
+
+resurrect.setup(config)
+
+return config
+```
+
+**3. Restart WezTerm.** The plugin downloads automatically on first launch.
+
+`setup(config)` automatically configures:
+- **Event-driven + periodic (5 min) state saving** of workspaces, windows, and tabs
+- **Workspace restoration on startup** -- reopen all your tabs, panes, and working directories
+- **Claude Code session restoration** -- detects Claude Code processes and resumes them via `--resume <session-id>`
+- **Claude Code SessionStart hook** in `~/.claude/settings.json` for session ID tracking
+- **Status bar** showing last save time and tab titles
+- **Keybindings**: Alt+W (save workspace), Alt+R (fuzzy restore), Alt+Shift+W (save window), Alt+Shift+T (save tab)
+
+No manual plugin installation needed -- `wezterm.plugin.require()` auto-fetches from GitHub on first launch.
+
+### Setup Options
+
+All options are optional. Defaults are shown below:
+
+```lua
+resurrect.setup(config, {
+  periodic_interval  = 300,   -- seconds between periodic saves (default: 5 min)
+  restore_delay      = 3,     -- seconds to wait before sending restore commands
+  save_workspaces    = true,  -- save workspace state
+  save_windows       = true,  -- save window state
+  save_tabs          = true,  -- save tab state
+  keybindings        = true,  -- add Alt+W/R/Shift+W/Shift+T bindings
+  status_bar         = true,  -- show save time + tab titles in right status
+  claude_hooks       = true,  -- auto-configure Claude Code SessionStart hook
+})
+```
+
+Set any option to `false` to disable that feature. For example, to skip keybindings and add your own:
+
+```lua
+resurrect.setup(config, { keybindings = false })
+
+-- Add your own custom bindings here
+config.keys = { ... }
+```
+
+## Advanced Setup (Manual Configuration)
+
+If you need fine-grained control over each component, you can configure them individually instead of using `setup()`.
 
 1. Require the plugin:
 
