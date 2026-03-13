@@ -63,12 +63,14 @@ end
 
 --- Sanitize process_info at save time if a handler provides a sanitize function.
 --- This cleans up argv for portable restoration (e.g., stripping full node paths).
+--- The optional pane_id allows handlers to look up external state (e.g., session files).
 ---@param process_info table
+---@param pane_id number|string|nil WezTerm pane ID for external state lookup
 ---@return table process_info (possibly modified in place)
-function pub.sanitize_for_save(process_info)
+function pub.sanitize_for_save(process_info, pane_id)
 	local handler = pub.find_handler(process_info)
 	if handler and handler.sanitize then
-		local ok, err = pcall(handler.sanitize, process_info)
+		local ok, err = pcall(handler.sanitize, process_info, pane_id)
 		if not ok then
 			wezterm.log_error("resurrect: process_handler sanitize failed: " .. tostring(err))
 		end
@@ -115,6 +117,37 @@ local function has_flag(argv, flag)
 		end
 	end
 	return false
+end
+
+-- Read session data from Claude Code's pane-sessions directory.
+-- The SessionStart hook writes JSON to ~/.claude/pane-sessions/<pane_id>.json
+-- containing { session_id, transcript_path, cwd, hook_event_name, source }.
+---@param pane_id number|string WezTerm pane ID
+---@return table|nil session_data parsed JSON or nil on failure
+local function read_pane_session(pane_id)
+	if not pane_id then
+		return nil
+	end
+	local home = os.getenv("HOME") or os.getenv("USERPROFILE")
+	if not home then
+		return nil
+	end
+	local sep = package.config:sub(1, 1)
+	local path = home .. sep .. ".claude" .. sep .. "pane-sessions" .. sep .. tostring(pane_id) .. ".json"
+	local f = io.open(path, "r")
+	if not f then
+		return nil
+	end
+	local content = f:read("*a")
+	f:close()
+	if not content or content == "" then
+		return nil
+	end
+	local ok, data = pcall(wezterm.json_parse, content)
+	if ok and data then
+		return data
+	end
+	return nil
 end
 
 ---------------------------------------------------------------
@@ -176,13 +209,28 @@ pub.register({
 	--   {"node", "C:/Users/.../cli.js", "--dangerously-skip-permissions", "--resume", "uuid"}
 	-- We normalize to:
 	--   {"claude", "--resume", "uuid", "--dangerously-skip-permissions"}
-	sanitize = function(process_info)
+	--
+	-- If the session ID is not in argv (common for fresh sessions that were not
+	-- started with --resume), we look it up from the pane-sessions file written
+	-- by Claude Code's SessionStart hook. This ensures every Claude Code pane
+	-- gets its exact session ID saved, even when running 6-8 sessions at once.
+	sanitize = function(process_info, pane_id)
 		local argv = process_info.argv or {}
 		local clean = { "claude" }
 
-		-- Extract session ID
+		-- Extract session ID from argv first (explicit --resume or --session-id)
 		local session_id = parse_flag_value(argv, "--resume", "-r")
 			or parse_flag_value(argv, "--session-id")
+
+		-- Fall back to the pane-sessions file written by the SessionStart hook.
+		-- This covers fresh sessions that were started without --resume.
+		if not session_id and pane_id then
+			local session_data = read_pane_session(pane_id)
+			if session_data and session_data.session_id then
+				session_id = session_data.session_id
+			end
+		end
+
 		if session_id then
 			table.insert(clean, "--resume")
 			table.insert(clean, session_id)
@@ -198,5 +246,120 @@ pub.register({
 		process_info.argv = clean
 	end,
 })
+
+--- Ensure Claude Code's SessionStart hook is configured to capture session IDs
+--- per WezTerm pane. This is idempotent -- safe to call on every WezTerm startup.
+---
+--- What it does:
+---   1. Creates ~/.claude/pane-sessions/ directory (where session data is stored)
+---   2. Reads ~/.claude/settings.json (or creates it if missing)
+---   3. Adds a SessionStart hook that writes session metadata to
+---      ~/.claude/pane-sessions/<WEZTERM_PANE>.json
+---   4. Writes the updated settings back atomically
+---
+--- Usage in wezterm.lua:
+---   local resurrect = wezterm.plugin.require("...")
+---   resurrect.process_handlers.setup_claude_session_hooks()
+---
+---@param settings_path string|nil optional override for Claude settings file path
+---@return boolean success
+function pub.setup_claude_session_hooks(settings_path)
+	local home = os.getenv("HOME") or os.getenv("USERPROFILE")
+	if not home then
+		wezterm.log_error("resurrect: cannot determine home directory for Claude hook setup")
+		return false
+	end
+
+	local sep = package.config:sub(1, 1)
+	local claude_dir = home .. sep .. ".claude"
+	local pane_sessions_dir = claude_dir .. sep .. "pane-sessions"
+
+	-- Ensure pane-sessions directory exists.
+	-- Use wezterm.run_child_process to avoid cmd.exe flash on Windows.
+	if sep == "\\" then
+		-- Windows: mkdir does not need -p, but won't error if dir exists with 2>nul
+		wezterm.run_child_process({ "cmd", "/c", "if not exist \"" .. pane_sessions_dir .. "\" mkdir \"" .. pane_sessions_dir .. "\"" })
+	else
+		wezterm.run_child_process({ "mkdir", "-p", pane_sessions_dir })
+	end
+
+	-- Resolve settings path
+	if not settings_path then
+		settings_path = claude_dir .. sep .. "settings.json"
+	end
+
+	-- Read existing settings (or start fresh)
+	local settings = {}
+	local f = io.open(settings_path, "r")
+	if f then
+		local content = f:read("*a")
+		f:close()
+		if content and content ~= "" then
+			local ok, parsed = pcall(wezterm.json_parse, content)
+			if ok and parsed then
+				settings = parsed
+			else
+				wezterm.log_warn("resurrect: could not parse " .. settings_path .. ", will add hooks to fresh object")
+			end
+		end
+	end
+
+	-- Check if our hook is already present (idempotency check).
+	-- We look for any SessionStart hook whose command references "pane-sessions".
+	if settings.hooks and settings.hooks.SessionStart then
+		for _, entry in ipairs(settings.hooks.SessionStart) do
+			if entry.hooks then
+				for _, hook in ipairs(entry.hooks) do
+					if hook.command and hook.command:find("pane%-sessions") then
+						-- Already configured -- nothing to do
+						return true
+					end
+				end
+			end
+		end
+	end
+
+	-- Build the hook structure
+	if not settings.hooks then
+		settings.hooks = {}
+	end
+	if not settings.hooks.SessionStart then
+		settings.hooks.SessionStart = {}
+	end
+
+	-- The hook command: Claude Code sends session JSON on stdin via the
+	-- SessionStart hook. We write it to a file keyed by WEZTERM_PANE env var.
+	-- WEZTERM_PANE is set by WezTerm in child shells and inherited by Claude.
+	local hook_command = "bash -c 'cat > \"$HOME/.claude/pane-sessions/${WEZTERM_PANE:-unknown}.json\"'"
+
+	table.insert(settings.hooks.SessionStart, {
+		matcher = "",
+		hooks = {
+			{
+				type = "command",
+				command = hook_command,
+			},
+		},
+	})
+
+	-- Write back atomically (write to .tmp then rename)
+	local json_str = wezterm.json_encode(settings)
+	local tmp_path = settings_path .. ".tmp"
+	local wf = io.open(tmp_path, "w")
+	if not wf then
+		wezterm.log_error("resurrect: cannot write Claude settings to " .. tmp_path)
+		return false
+	end
+	wf:write(json_str)
+	wf:close()
+	local rename_ok, rename_err = os.rename(tmp_path, settings_path)
+	if not rename_ok then
+		wezterm.log_error("resurrect: failed to rename " .. tmp_path .. " -> " .. settings_path .. ": " .. tostring(rename_err))
+		return false
+	end
+
+	wezterm.log_info("resurrect: Claude Code SessionStart hook configured at " .. settings_path)
+	return true
+end
 
 return pub

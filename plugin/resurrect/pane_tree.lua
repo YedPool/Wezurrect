@@ -202,9 +202,10 @@ local function insert_panes(root, panes)
 					end
 				end
 
-				-- Let registered process handlers sanitize argv for portable restoration
-				-- (e.g., Claude Code strips full node path, keeps session ID)
-				process_handlers.sanitize_for_save(process_info)
+				-- Let registered process handlers sanitize argv for portable restoration.
+				-- Pass pane_id so handlers can look up external state (e.g., Claude
+				-- Code reads session IDs from ~/.claude/pane-sessions/<pane_id>.json).
+				process_handlers.sanitize_for_save(process_info, root.pane:pane_id())
 
 				root.process = process_info
 			else
