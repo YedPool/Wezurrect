@@ -1,5 +1,6 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local utils = require("resurrect.utils")
+local process_handlers = require("resurrect.process_handlers")
 
 ---@class pane_tree_module
 ---@field max_nlines integer
@@ -200,6 +201,10 @@ local function insert_panes(root, panes)
 						process_info.argv = args
 					end
 				end
+
+				-- Let registered process handlers sanitize argv for portable restoration
+				-- (e.g., Claude Code strips full node path, keeps session ID)
+				process_handlers.sanitize_for_save(process_info)
 
 				root.process = process_info
 			else

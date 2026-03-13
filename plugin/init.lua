@@ -23,6 +23,7 @@ local function init()
 	pub.tab_state = require("resurrect.tab_state")
 	pub.fuzzy_loader = require("resurrect.fuzzy_loader")
 	pub.state_manager = require("resurrect.state_manager")
+	pub.process_handlers = require("resurrect.process_handlers")
 end
 
 init()

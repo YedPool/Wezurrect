@@ -1,6 +1,7 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local pane_tree_mod = require("resurrect.pane_tree")
 local state_manager_mod = require("resurrect.state_manager")
+local process_handlers = require("resurrect.process_handlers")
 local pub = {}
 
 ---Function used to split panes when mapping over the pane_tree
@@ -167,18 +168,24 @@ function pub.default_on_pane_restore(pane_tree)
 
 	-- Spawn process if using alt screen, otherwise restore text
 	if pane_tree.alt_screen_active and pane_tree.process and pane_tree.process.argv then
-		local proc_name = pane_tree.process.name or ""
-		-- Extract base name without path
-		local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
-		base_name = base_name:gsub("%.exe$", ""):lower()
-
-		if SAFE_RESTORE_PROCESSES[base_name] then
-			pane:send_text(wezterm.shell_join_args(pane_tree.process.argv) .. "\r\n")
+		-- Check registered process handlers first (e.g., Claude Code)
+		local restore_cmd = process_handlers.get_restore_command(pane_tree.process, pane_tree)
+		if restore_cmd then
+			pane:send_text(restore_cmd .. "\r\n")
 		else
-			wezterm.log_warn(
-				"resurrect: skipping restore of unrecognized process: " .. base_name
-				.. " (add to SAFE_RESTORE_PROCESSES if intended)"
-			)
+			-- Fall back to allowlist-based argv replay
+			local proc_name = pane_tree.process.name or ""
+			local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
+			base_name = base_name:gsub("%.exe$", ""):lower()
+
+			if SAFE_RESTORE_PROCESSES[base_name] then
+				pane:send_text(wezterm.shell_join_args(pane_tree.process.argv) .. "\r\n")
+			else
+				wezterm.log_warn(
+					"resurrect: skipping restore of unrecognized process: " .. base_name
+						.. " (add to SAFE_RESTORE_PROCESSES or register a process_handler)"
+				)
+			end
 		end
 	elseif pane_tree.text then
 		pane:inject_output(pane_tree.text:gsub("%s+$", ""))
