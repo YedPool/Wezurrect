@@ -72,18 +72,20 @@ function utils.execute(cmd)
 end
 
 -- Shell-safe wrapper around mkdir for a single already-assembled path segment.
--- Uses wezterm.run_child_process instead of os.execute to avoid visible
--- cmd.exe window flashes on Windows (fixes #125).
+-- Uses os.execute because this runs during plugin init where
+-- wezterm.run_child_process is forbidden (yields across C-call boundary).
 local function shell_mkdir(path)
 	if utils.is_windows then
 		if path:find('"') then
 			return false
 		end
-		local success, _, _ = wezterm.run_child_process({ "cmd.exe", "/c", "mkdir", path })
-		return success
+		-- Use os.execute; the >nul suppresses output. A brief cmd.exe flash
+		-- may occur on first run only (dirs persist across restarts).
+		os.execute('cmd /c mkdir "' .. path .. '" >nul 2>nul')
+		return true
 	else
-		local success, _, _ = wezterm.run_child_process({ "mkdir", path })
-		return success
+		os.execute('mkdir -p "' .. path .. '" 2>/dev/null')
+		return true
 	end
 end
 

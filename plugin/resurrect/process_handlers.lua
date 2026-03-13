@@ -275,12 +275,12 @@ function pub.setup_claude_session_hooks(settings_path)
 	local pane_sessions_dir = claude_dir .. sep .. "pane-sessions"
 
 	-- Ensure pane-sessions directory exists.
-	-- Use wezterm.run_child_process to avoid cmd.exe flash on Windows.
+	-- Use os.execute because this may run during plugin init where
+	-- wezterm.run_child_process is forbidden (yields across C-call boundary).
 	if sep == "\\" then
-		-- Windows: mkdir does not need -p, but won't error if dir exists with 2>nul
-		wezterm.run_child_process({ "cmd", "/c", "if not exist \"" .. pane_sessions_dir .. "\" mkdir \"" .. pane_sessions_dir .. "\"" })
+		os.execute('cmd /c if not exist "' .. pane_sessions_dir .. '" mkdir "' .. pane_sessions_dir .. '" >nul 2>nul')
 	else
-		wezterm.run_child_process({ "mkdir", "-p", pane_sessions_dir })
+		os.execute('mkdir -p "' .. pane_sessions_dir .. '" 2>/dev/null')
 	end
 
 	-- Resolve settings path
