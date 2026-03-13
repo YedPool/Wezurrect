@@ -98,6 +98,10 @@ function pub.restore_tab(tab, tab_state, opts)
 	wezterm.emit("resurrect.tab_state.restore_tab.start")
 	if opts.pane then
 		tab_state.pane_tree.pane = opts.pane
+		-- Set the CWD of the reused pane to match saved state
+		if tab_state.pane_tree.cwd and tab_state.pane_tree.cwd ~= "" then
+			opts.pane:send_text("cd " .. wezterm.shell_join_args({ tab_state.pane_tree.cwd }) .. "\r\n")
+		end
 	else
 		local split_args = { cwd = tab_state.pane_tree.cwd }
 		if tab_state.pane_tree.domain then
@@ -144,16 +148,42 @@ function pub.save_tab_action()
 	end)
 end
 
+-- Known safe executables that can be restored via send_text.
+-- Process names not in this set will be logged but not auto-launched,
+-- preventing arbitrary command execution from tampered state files.
+local SAFE_RESTORE_PROCESSES = {
+	vim = true, nvim = true, gvim = true, vi = true,
+	htop = true, btop = true, top = true,
+	less = true, more = true, man = true,
+	claude = true,
+	nano = true,
+	tmux = true, screen = true,
+}
+
 --- Function to restore text or processes when restoring panes
 ---@param pane_tree pane_tree
 function pub.default_on_pane_restore(pane_tree)
 	local pane = pane_tree.pane
 
 	-- Spawn process if using alt screen, otherwise restore text
-	if pane_tree.alt_screen_active then
-		pane:send_text(wezterm.shell_join_args(pane_tree.process.argv) .. "\r\n")
+	if pane_tree.alt_screen_active and pane_tree.process and pane_tree.process.argv then
+		local proc_name = pane_tree.process.name or ""
+		-- Extract base name without path
+		local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
+		base_name = base_name:gsub("%.exe$", ""):lower()
+
+		if SAFE_RESTORE_PROCESSES[base_name] then
+			pane:send_text(wezterm.shell_join_args(pane_tree.process.argv) .. "\r\n")
+		else
+			wezterm.log_warn(
+				"resurrect: skipping restore of unrecognized process: " .. base_name
+				.. " (add to SAFE_RESTORE_PROCESSES if intended)"
+			)
+		end
 	elseif pane_tree.text then
 		pane:inject_output(pane_tree.text:gsub("%s+$", ""))
+		-- Send newline to trigger a fresh shell prompt at the correct position
+		pane:send_text("\r\n")
 	end
 end
 

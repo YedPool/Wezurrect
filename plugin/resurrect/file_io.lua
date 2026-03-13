@@ -4,20 +4,35 @@ local pub = {
 	encryption = { enable = false },
 }
 
--- Write a file with the content of a string
+-- Write a file atomically: writes to a temp file first, then renames.
+-- This prevents data loss if the process crashes mid-write.
 ---@param file_path string full filename
 ---@return boolean success result
 ---@return string|nil error
 function pub.write_file(file_path, str)
+	local tmp_path = file_path .. ".tmp"
 	local suc, err = pcall(function()
-		local handle = io.open(file_path, "w+")
+		local handle = io.open(tmp_path, "w+")
 		if not handle then
-			error("Could not open file: " .. file_path)
+			error("Could not open file: " .. tmp_path)
 		end
 		handle:write(str)
 		handle:flush()
 		handle:close()
+		-- Atomic rename (on same filesystem)
+		local ok, rename_err = os.rename(tmp_path, file_path)
+		if not ok then
+			-- Fallback: on Windows os.rename can fail if target exists
+			os.remove(file_path)
+			ok, rename_err = os.rename(tmp_path, file_path)
+			if not ok then
+				error("Could not rename temp file: " .. (rename_err or "unknown"))
+			end
+		end
 	end)
+	if not suc then
+		os.remove(tmp_path)
+	end
 	return suc, err
 end
 
@@ -57,7 +72,7 @@ end
 --- @param data string
 --- @return string
 local function sanitize_json(data)
-	wezterm.emit("resurrect.file_io.sanitize_json.start", data)
+	wezterm.emit("resurrect.file_io.sanitize_json.start", #data)
 	-- escapes control characters to ensure valid json
 	data = data:gsub("[\x00-\x1F]", function(c)
 		return string.format("\\u00%02X", string.byte(c))
@@ -80,7 +95,7 @@ function pub.write_state(file_path, state, event_type)
 		end)
 		if not ok then
 			wezterm.emit("resurrect.error", "Encryption failed: " .. tostring(err))
-			wezterm.log_error("Decryption failed: " .. tostring(err))
+			wezterm.log_error("Encryption failed: " .. tostring(err))
 		else
 			wezterm.emit("resurrect.file_io.encrypt.finished", file_path)
 		end
@@ -111,16 +126,14 @@ function pub.load_json(file_path)
 			wezterm.emit("resurrect.file_io.decrypt.finished", file_path)
 		end
 	else
-		local lines = {}
-		for line in io.lines(file_path) do
-			table.insert(lines, line)
+		local ok, content = pub.read_file(file_path)
+		if ok then
+			json = content
 		end
-		json = table.concat(lines)
 	end
 	if not json then
 		return nil
 	end
-	json = sanitize_json(json)
 
 	return wezterm.json_parse(json)
 end

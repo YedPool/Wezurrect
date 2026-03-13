@@ -81,13 +81,14 @@ function pub.restore_window(window, window_state, opts)
 		end
 	end
 
-	active_tab:activate()
+	if active_tab then
+		active_tab:activate()
+	end
 	wezterm.emit("resurrect.window_state.restore_window.finished")
 end
 
 function pub.save_window_action()
 	return wezterm.action_callback(function(win, pane)
-		local resurrect = require("resurrect")
 		local mux_win = win:mux_window()
 		if mux_win:get_title() == "" then
 			win:perform_action(

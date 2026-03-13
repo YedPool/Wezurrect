@@ -67,20 +67,33 @@ end
 ---@param file_path string
 ---@param lines string
 function pub.encrypt(file_path, lines)
-	local cmd = string.format("%s -r %s -o %s", pub.method, pub.public_key, file_path:gsub(" ", "\\ "))
+	-- Write data to a temp file, then encrypt from file to avoid shell injection
+	-- and command-line length limits
+	local temp_input = os.tmpname()
+	local f = io.open(temp_input, "w")
+	if not f then
+		error("Encryption failed: could not create temp file")
+	end
+	f:write(lines)
+	f:flush()
+	f:close()
 
+	local cmd
 	if pub.method:find("gpg") then
-		cmd = string.format(
-			"%s --batch --yes --encrypt --recipient %s --output %s",
-			pub.method,
-			pub.public_key,
-			file_path:gsub(" ", "\\ ")
-		)
+		cmd = {
+			pub.method, "--batch", "--yes", "--encrypt",
+			"--recipient", pub.public_key,
+			"--output", file_path,
+			temp_input,
+		}
+	else
+		cmd = { pub.method, "-r", pub.public_key, "-o", file_path, temp_input }
 	end
 
-	local success, output = execute_cmd_with_stdin(cmd, lines)
+	local success, _, stderr = wezterm.run_child_process(cmd)
+	os.remove(temp_input)
 	if not success then
-		error("Encryption failed:" .. output)
+		error("Encryption failed: " .. (stderr or "unknown error"))
 	end
 end
 

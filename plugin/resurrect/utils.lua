@@ -44,27 +44,30 @@ function utils.utf8len(str)
 	return len
 end
 
--- Execute a cmd and return its stdout
+-- Execute a command array and return its stdout.
+-- Uses wezterm.run_child_process to avoid shell injection and cmd.exe flashes.
+---@param cmd_args string[] array of command and arguments
+---@return boolean success result
+---@return string|nil output
+function utils.exec(cmd_args)
+	local success, stdout, stderr = wezterm.run_child_process(cmd_args)
+	if success then
+		return true, stdout
+	else
+		return false, stderr or "Command failed"
+	end
+end
+
+-- Legacy wrapper: execute a shell command string via sh -c (Unix) or cmd /c (Windows).
+-- Prefer utils.exec() with argument arrays for new code.
 ---@param cmd string command
 ---@return boolean success result
 ---@return string|nil error
 function utils.execute(cmd)
-	local stdout
-	local suc, err = pcall(function()
-		local handle = io.popen(cmd)
-		if not handle then
-			error("Could not open process: " .. cmd)
-		end
-		stdout = handle:read("*a")
-		if stdout == nil then
-			error("Error running process: " .. cmd)
-		end
-		handle:close()
-	end)
-	if suc then
-		return suc, stdout
+	if utils.is_windows then
+		return utils.exec({ "cmd.exe", "/c", cmd })
 	else
-		return suc, err
+		return utils.exec({ "sh", "-c", cmd })
 	end
 end
 
@@ -79,8 +82,7 @@ local function shell_mkdir(path)
 		local success, _, _ = wezterm.run_child_process({ "cmd.exe", "/c", "mkdir", path })
 		return success
 	else
-		local quoted = "'" .. path:gsub("'", "'\\''") .. "'"
-		local success, _, _ = wezterm.run_child_process({ "sh", "-c", "mkdir " .. quoted })
+		local success, _, _ = wezterm.run_child_process({ "mkdir", path })
 		return success
 	end
 end
