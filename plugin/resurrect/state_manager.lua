@@ -27,14 +27,26 @@ function pub.save_state(state, opt_name)
 	if state.window_states then
 		file_io.write_state(get_file_path(state.workspace, "workspace", opt_name), state, "workspace")
 		-- Always update current_state when saving a workspace so that
-		-- resurrect_on_gui_startup knows what to restore. Previously this
-		-- was only called from event_driven_save, which often never fired
-		-- before the user restarted WezTerm.
+		-- resurrect_on_gui_startup knows what to restore.
 		pub.write_current_state(state.workspace, "workspace")
 	elseif state.tabs then
 		file_io.write_state(get_file_path(state.title, "window", opt_name), state, "window")
 	elseif state.pane_tree then
 		file_io.write_state(get_file_path(state.title, "tab", opt_name), state, "tab")
+	end
+end
+
+--- Full workspace save: saves workspace state, current_state, and instance state.
+--- Single entry point for the complete save operation, used by periodic_save,
+--- event_driven_save, and the Alt+S keybinding to avoid duplication.
+function pub.save_workspace_full()
+	local workspace_state = require("resurrect.workspace_state").get_workspace_state()
+	pub.save_state(workspace_state)
+
+	-- Save per-instance state if instance manager is active
+	local im = require("resurrect.instance_manager")
+	if im.instance_id then
+		im.save_instance(workspace_state)
 	end
 end
 
@@ -66,9 +78,7 @@ function pub.periodic_save(opts)
 		local ok, err = pcall(function()
 			wezterm.emit("resurrect.state_manager.periodic_save.start", opts)
 			if opts.save_workspaces then
-				local workspace_state = require("resurrect.workspace_state").get_workspace_state()
-				pub.save_state(workspace_state)
-				pub.write_current_state(workspace_state.workspace, "workspace")
+				pub.save_workspace_full()
 			end
 
 			if opts.save_windows then
@@ -105,11 +115,6 @@ function pub.periodic_save(opts)
 end
 
 ---Saves the state whenever the pane or tab structure changes.
----More responsive than periodic_save: fires immediately on splits, new tabs,
----and closed panes rather than waiting for a timer.
----Also supports an optional user variable trigger for shell-reported events
----such as directory changes (requires shell integration to send the OSC 1337
----SetUserVar sequence; see the README for details).
 ---@param opts? { save_workspaces: boolean?, save_windows: boolean?, save_tabs: boolean?, user_var: string? }
 local _event_driven_save_registered = false
 function pub.event_driven_save(opts)
@@ -130,9 +135,7 @@ function pub.event_driven_save(opts)
 		wezterm.emit("resurrect.state_manager.event_driven_save.start", opts)
 
 		if opts.save_workspaces then
-			local workspace_state = require("resurrect.workspace_state").get_workspace_state()
-			pub.save_state(workspace_state)
-			pub.write_current_state(workspace_state.workspace, "workspace")
+			pub.save_workspace_full()
 		end
 
 		if opts.save_windows then
@@ -157,9 +160,7 @@ function pub.event_driven_save(opts)
 	end
 
 	-- Save shortly after startup using update-status, which fires reliably
-	-- within seconds of window creation (unlike pane-focus-changed which
-	-- requires user interaction). This ensures current_state is written
-	-- before the user restarts WezTerm.
+	-- within seconds of window creation.
 	local initial_save_done = false
 	wezterm.on("update-status", function(window, pane)
 		if not initial_save_done then
@@ -169,8 +170,6 @@ function pub.event_driven_save(opts)
 	end)
 
 	-- Save when the pane/tab structure changes (new split, new tab, closed pane).
-	-- pane-focus-changed fires on every focus move, so we compare tab+pane counts
-	-- and only save when the structure actually changes.
 	wezterm.on("pane-focus-changed", function(window, pane)
 		local win_id = tostring(window:window_id())
 		local tabs = window:mux_window():tabs()
@@ -186,8 +185,6 @@ function pub.event_driven_save(opts)
 	end)
 
 	-- Optional: also save when the shell reports a user-defined variable change.
-	-- Useful for saving on directory change. Example shell integration (zsh/bash):
-	--   precmd() { printf "\033]1337;SetUserVar=WEZTERM_SAVE=%s\007" "$(printf 1 | base64)"; }
 	if opts.user_var then
 		wezterm.on("user-var-changed", function(window, pane, name, value)
 			if name == opts.user_var then
@@ -204,8 +201,6 @@ end
 ---@return string|nil
 function pub.write_current_state(name, type)
 	local file_path = pub.save_state_dir .. utils.separator .. "current_state"
-	-- Write directly instead of using file_io.write_file's atomic rename,
-	-- which can fail silently on Windows for small metadata files.
 	local handle = io.open(file_path, "w")
 	if not handle then
 		wezterm.log_error("resurrect: could not open current_state for writing: " .. file_path)
@@ -269,7 +264,8 @@ function pub.delete_state(file_path)
 		wezterm.emit("resurrect.error", "Invalid path: only .json files can be deleted")
 		return
 	end
-	local path = pub.save_state_dir .. file_path
+	-- Use explicit separator to avoid path join fragility
+	local path = pub.save_state_dir .. utils.separator .. file_path
 	local success = os.remove(path)
 	if not success then
 		wezterm.emit("resurrect.error", "Failed to delete state: " .. path)
@@ -287,7 +283,7 @@ end
 ---Changes the directory to save the state to
 ---@param directory string
 function pub.change_state_save_dir(directory)
-	local types = { "workspace", "window", "tab" }
+	local types = { "workspace", "window", "tab", "instances" }
 	for _, type in ipairs(types) do
 		utils.ensure_folder_exists(directory .. utils.separator .. type)
 	end

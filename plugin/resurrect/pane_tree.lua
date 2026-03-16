@@ -68,12 +68,22 @@ local function pop_connected_right(root, panes)
 	end
 end
 
+-- Maximum recursion depth to prevent stack overflow from maliciously
+-- crafted state files with deeply nested pane trees.
+local MAX_PANE_DEPTH = 100
+
 ---@param root pane_tree | nil
 ---@param panes PaneInformation[]
+---@param depth? number current recursion depth (defaults to 0)
 ---@return pane_tree | nil
-local function insert_panes(root, panes)
+local function insert_panes(root, panes, depth)
+	depth = depth or 0
 	if root == nil then
 		return nil
+	end
+	if depth > MAX_PANE_DEPTH then
+		wezterm.log_error("resurrect: pane tree exceeds maximum depth of " .. MAX_PANE_DEPTH)
+		return root
 	end
 
 	-- Guard against duplicate processing in symmetric layouts
@@ -114,24 +124,36 @@ local function insert_panes(root, panes)
 			local process_info = root.pane:get_foreground_process_info()
 			local has_handler = process_handlers.find_handler(process_info)
 
-			-- If the foreground process doesn't match a handler, check the
-			-- pane-session file. When Claude Code runs a child process (bash,
-			-- node, etc.), that child becomes the foreground process and
-			-- find_handler misses Claude Code. The pane-session file written
-			-- by Claude Code's SessionStart hook is the reliable signal.
-			if not has_handler then
-				local pane_session = process_handlers.read_pane_session(root.pane:pane_id())
-				if pane_session and pane_session.session_id then
-					has_handler = true
-					-- Build synthetic process_info since the foreground
-					-- process is a child (bash, etc.), not claude itself.
-					process_info = {
-						name = "claude",
-						executable = "claude",
-						argv = {},
-						cwd = process_info.cwd or "",
-					}
+			-- Check the pane-session file for Claude Code detection and
+			-- binary disambiguation. This serves two purposes:
+			-- 1. Fallback: when Claude runs a child process (bash, node),
+			--    the foreground process isn't "claude" so find_handler misses it.
+			-- 2. Binary fix: claude2.bat wraps the same "claude" binary with
+			--    CLAUDE_CONFIG_DIR=~/.claude-alt. WezTerm reports name="claude"
+			--    for both, but the transcript_path reveals which config dir
+			--    was used, letting us restore with the correct binary.
+			local pane_session = process_handlers.read_pane_session(root.pane:pane_id())
+			if pane_session and pane_session.session_id then
+				-- Infer which claude binary from the transcript_path.
+				local bin = "claude"
+				local tp = pane_session.transcript_path or ""
+				if tp:find("[/\\]%.claude%-alt[/\\]") then
+					bin = "claude2"
 				end
+
+				if not has_handler then
+					-- Fallback: foreground process is a child, not claude
+					has_handler = true
+				end
+
+				-- Always rebuild process_info from pane-session data so
+				-- the correct binary name is used (claude vs claude2).
+				process_info = {
+					name = bin,
+					executable = bin,
+					argv = process_info.argv or {},
+					cwd = process_info.cwd or "",
+				}
 			end
 
 			if root.alt_screen_active or has_handler then
@@ -259,12 +281,12 @@ local function insert_panes(root, panes)
 
 	if #right > 0 then
 		local right_child = pop_connected_right(root, right)
-		root.right = insert_panes(right_child, right)
+		root.right = insert_panes(right_child, right, depth + 1)
 	end
 
 	if #bottom > 0 then
 		local bottom_child = pop_connected_bottom(root, bottom)
-		root.bottom = insert_panes(bottom_child, bottom)
+		root.bottom = insert_panes(bottom_child, bottom, depth + 1)
 	end
 
 	return root
@@ -279,10 +301,10 @@ function pub.create_pane_tree(panes)
 	return insert_panes(root, panes)
 end
 
----maps over the pane tree
+---maps over the pane tree (mutates in place)
 ---@param pane_tree pane_tree
 ---@param f fun(pane_tree: pane_tree): pane_tree
----@return nil
+---@return pane_tree|nil
 function pub.map(pane_tree, f)
 	if pane_tree == nil then
 		return nil

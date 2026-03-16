@@ -95,12 +95,13 @@ return config
 **3. Restart WezTerm.** The plugin downloads automatically on first launch.
 
 `setup(config)` automatically configures:
+- **Per-instance state saving** -- each WezTerm window saves independently (no more clobbering between windows)
 - **Event-driven + periodic (5 min) state saving** of workspaces, windows, and tabs
-- **Workspace restoration on startup** -- reopen all your tabs, panes, and working directories
+- **Instance selector on startup** -- if saved instances exist, shows a selector to restore/delete/rename them
 - **Claude Code session restoration** -- detects Claude Code processes and resumes them via `--resume <session-id>`
-- **Claude Code SessionStart hook** in `~/.claude/settings.json` for session ID tracking
+- **Claude Code SessionStart hook** in `~/.claude/settings.json` (and `~/.claude-alt/settings.json` for multi-account `claude2` setups)
 - **Status bar** showing last save time and tab titles
-- **Keybindings**: Alt+W (save workspace), Alt+R (fuzzy restore), Alt+Shift+W (save window), Alt+Shift+T (save tab)
+- **Keybindings**: Alt+S (full save), Alt+R (instance selector / restore), Alt+W (save workspace), Alt+Shift+W (save window), Alt+Shift+T (save tab)
 
 No manual plugin installation needed -- `wezterm.plugin.require()` auto-fetches from GitHub on first launch.
 
@@ -110,14 +111,16 @@ All options are optional. Defaults are shown below:
 
 ```lua
 resurrect.setup(config, {
-  periodic_interval  = 300,   -- seconds between periodic saves (default: 5 min)
-  restore_delay      = 3,     -- seconds to wait before sending restore commands
-  save_workspaces    = true,  -- save workspace state
-  save_windows       = true,  -- save window state
-  save_tabs          = true,  -- save tab state
-  keybindings        = true,  -- add Alt+W/R/Shift+W/Shift+T bindings
-  status_bar         = true,  -- show save time + tab titles in right status
-  claude_hooks       = true,  -- auto-configure Claude Code SessionStart hook
+  periodic_interval    = 300,   -- seconds between periodic saves (default: 5 min)
+  restore_delay        = 3,     -- seconds to wait before sending restore commands
+  save_workspaces      = true,  -- save workspace state
+  save_windows         = true,  -- save window state
+  save_tabs            = true,  -- save tab state
+  keybindings          = true,  -- add Alt+S/R/W/Shift+W/Shift+T bindings
+  status_bar           = true,  -- show save time + tab titles in right status
+  claude_hooks         = true,  -- auto-configure Claude Code SessionStart hook
+  auto_restore_prompt  = true,  -- show instance selector on startup if saved instances exist
+  retention_days       = 7,     -- auto-delete instance states older than this many days
 })
 ```
 
@@ -375,8 +378,14 @@ required for `resurrect_on_gui_startup` to restore the correct workspace.
 
 ### Resurrecting on startup
 
-You can resume from where you left off by resurrecting on startup with
-the following addition to your config:
+If you use `setup()`, startup restoration is automatic. On startup:
+1. Old instances (older than `retention_days`) are cleaned up
+2. If saved instances exist and `auto_restore_prompt` is true, an instance selector appears
+3. If no instances exist, it falls back to the legacy `current_state` mechanism
+
+You can dismiss the selector (Esc) to start fresh.
+
+For manual configuration without `setup()`, you can still use the legacy approach:
 
 ```lua
 wezterm.on("gui-startup", resurrect.state_manager.resurrect_on_gui_startup)
@@ -511,6 +520,8 @@ This plugin emits the following events that you can use for your own callback fu
 - `resurrect.state_manager.periodic_save.finished(opts)`
 - `resurrect.file_io.write_state.finished(file_path, event_type)`
 - `resurrect.file_io.write_state.start(file_path, event_type)`
+- `resurrect.instance_manager.save_instance.finished(instance_id)`
+- `resurrect.instance_manager.delete_instance.finished(instance_id)`
 - `resurrect.tab_state.restore_tab.finished`
 - `resurrect.tab_state.restore_tab.start`
 - `resurrect.window_state.restore_window.finished`

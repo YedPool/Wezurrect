@@ -19,6 +19,7 @@ pub.default_fuzzy_load_opts = {
 	ignore_workspaces = false,
 	ignore_windows = false,
 	ignore_tabs = false,
+	ignore_instances = true,
 	ignore_screen_width = true,
 	date_format = "%d-%m-%Y %H:%M:%S",
 	show_state_with_date = false,
@@ -75,16 +76,20 @@ local function find_json_files_recursive(base_path)
 			ps_cmd,
 		})
 	elseif utils.is_mac then
+		-- Use single-quote escaping to prevent shell injection via $() and backticks
+		local safe_path = base_path:gsub("'", "'\\''")
 		success, stdout, stderr = wezterm.run_child_process({
 			"sh",
 			"-c",
-			'find "' .. base_path:gsub('"', '\\"') .. '" -type f -name "*.json" -print0 | xargs -0 stat -f "%m %N"',
+			"find '" .. safe_path .. "' -type f -name '*.json' -print0 | xargs -0 stat -f '%m %N'",
 		})
 	else
+		-- Use single-quote escaping to prevent shell injection via $() and backticks
+		local safe_path = base_path:gsub("'", "'\\''")
 		success, stdout, stderr = wezterm.run_child_process({
 			"sh",
 			"-c",
-			'find "' .. base_path:gsub('"', '\\"') .. '" -type f -name "*.json" -printf "%T@ %p\\n" | awk \'{split($1, a, "."); print a[1], $2}\'',
+			"find '" .. safe_path .. "' -type f -name '*.json' -printf '%T@ %p\\n' | awk '{split($1, a, \".\"); print a[1], $2}'",
 		})
 	end
 
@@ -125,7 +130,10 @@ local function insert_choices(stdout, opts)
 		-- MacOS it is from January 1st, 1904 0 UTC
 		-- Windows NTFS (up to Win 11) it is from January 1st, 1601 0 UTC
 		-- The function `os.date()` used later on will convert the date according to the host OS
-		if epoch and file and type and not opts[string.format("ignore_%ss", type)] then
+		-- Skip instance files when ignore_instances is set (they use their own selector)
+		if type == "instances" and opts.ignore_instances then
+			-- fall through: do not add instance files to the fuzzy loader
+		elseif epoch and file and type and not opts[string.format("ignore_%ss", type)] then
 			-- consider the "cost" of the formatting of the filename, i.e., if the format function adds characters
 			-- to the visible part of the file section, we test the three possible formatter to get the highest cost
 			-- we use a real entry instead of an empty string to prevent formatting error if the format function has

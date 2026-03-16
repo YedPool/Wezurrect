@@ -84,6 +84,9 @@ local function shell_mkdir(path)
 		os.execute('cmd /c mkdir "' .. path .. '" >nul 2>nul')
 		return true
 	else
+		if path:find('["%$`\n;|&()]') then
+			return false
+		end
 		os.execute('mkdir -p "' .. path .. '" 2>/dev/null')
 		return true
 	end
