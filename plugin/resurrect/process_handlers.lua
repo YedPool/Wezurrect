@@ -297,49 +297,15 @@ pub.register({
 	end,
 })
 
---- Ensure Claude Code's SessionStart hook is configured to capture session IDs
---- per WezTerm pane. This is idempotent -- safe to call on every WezTerm startup.
----
---- What it does:
----   1. Creates ~/.claude/pane-sessions/ directory (where session data is stored)
----   2. Reads ~/.claude/settings.json (or creates it if missing)
----   3. Adds a SessionStart hook that writes session metadata to
----      ~/.claude/pane-sessions/<WEZTERM_PANE>.json
----   4. Writes the updated settings back atomically
----
---- Usage in wezterm.lua:
----   local resurrect = wezterm.plugin.require("...")
----   resurrect.process_handlers.setup_claude_session_hooks()
----
----@param settings_path string|nil optional override for Claude settings file path
+-- Configure the SessionStart hook in a single Claude Code settings file.
+-- Returns true if hook is already present or was successfully added.
+---@param target_settings_path string path to settings.json
+---@param pane_sessions_dir string path to pane-sessions directory
 ---@return boolean success
-function pub.setup_claude_session_hooks(settings_path)
-	local home = os.getenv("HOME") or os.getenv("USERPROFILE")
-	if not home then
-		wezterm.log_error("resurrect: cannot determine home directory for Claude hook setup")
-		return false
-	end
-
-	local sep = utils.separator
-	local claude_dir = home .. sep .. ".claude"
-	local pane_sessions_dir = claude_dir .. sep .. "pane-sessions"
-
-	-- Ensure pane-sessions directory exists.
-	-- Use utils.shell_mkdir which validates the path (rejects shell
-	-- metacharacters) before passing it to os.execute.
-	if not utils.ensure_folder_exists(pane_sessions_dir) then
-		wezterm.log_error("resurrect: failed to create pane-sessions directory: " .. pane_sessions_dir)
-		return false
-	end
-
-	-- Resolve settings path
-	if not settings_path then
-		settings_path = claude_dir .. sep .. "settings.json"
-	end
-
+local function configure_hook_in_settings(target_settings_path, pane_sessions_dir)
 	-- Read existing settings (or start fresh)
 	local settings = {}
-	local f = io.open(settings_path, "r")
+	local f = io.open(target_settings_path, "r")
 	if f then
 		local content = f:read("*a")
 		f:close()
@@ -348,7 +314,7 @@ function pub.setup_claude_session_hooks(settings_path)
 			if ok and parsed then
 				settings = parsed
 			else
-				wezterm.log_warn("resurrect: could not parse " .. settings_path .. ", will add hooks to fresh object")
+				wezterm.log_warn("resurrect: could not parse " .. target_settings_path .. ", will add hooks to fresh object")
 			end
 		end
 	end
@@ -381,10 +347,12 @@ function pub.setup_claude_session_hooks(settings_path)
 	-- WEZTERM_PANE is set by WezTerm in child shells and inherited by Claude.
 	-- The pane ID is validated as numeric to prevent path traversal via
 	-- crafted WEZTERM_PANE values (e.g., "../../.bashrc").
+	-- All instances write to the same pane-sessions dir (~/.claude/pane-sessions/)
+	-- so the restore logic can find session data regardless of which binary ran.
 	local hook_command = "bash -c '"
 		.. 'pane_id="${WEZTERM_PANE:-unknown}"; '
 		.. 'if [[ "$pane_id" =~ ^[0-9]+$ ]]; then '
-		.. 'cat > "$HOME/.claude/pane-sessions/${pane_id}.json"; '
+		.. 'cat > "' .. pane_sessions_dir:gsub("\\", "/") .. '/${pane_id}.json"; '
 		.. "else echo \"resurrect: invalid WEZTERM_PANE: $pane_id\" >&2; cat > /dev/null; fi'"
 
 	table.insert(settings.hooks.SessionStart, {
@@ -400,17 +368,73 @@ function pub.setup_claude_session_hooks(settings_path)
 	-- Write directly (not atomic rename -- os.rename fails on Windows
 	-- when the target file already exists, causing silent failures).
 	local json_str = wezterm.json_encode(settings)
-	local wf = io.open(settings_path, "w")
+	local wf = io.open(target_settings_path, "w")
 	if not wf then
-		wezterm.log_error("resurrect: cannot write Claude settings to " .. settings_path)
+		wezterm.log_error("resurrect: cannot write Claude settings to " .. target_settings_path)
 		return false
 	end
 	wf:write(json_str)
 	wf:flush()
 	wf:close()
 
-	wezterm.log_info("resurrect: Claude Code SessionStart hook configured at " .. settings_path)
+	wezterm.log_info("resurrect: Claude Code SessionStart hook configured at " .. target_settings_path)
 	return true
+end
+
+--- Ensure Claude Code's SessionStart hook is configured to capture session IDs
+--- per WezTerm pane. This is idempotent -- safe to call on every WezTerm startup.
+---
+--- What it does:
+---   1. Creates ~/.claude/pane-sessions/ directory (where session data is stored)
+---   2. Configures the SessionStart hook in ~/.claude/settings.json
+---   3. Also configures ~/.claude-alt/settings.json if it exists (for claude2
+---      multi-account setups that use CLAUDE_CONFIG_DIR)
+---   4. All instances write to the same pane-sessions directory so restore
+---      logic can find session data regardless of which binary was used
+---
+--- Usage in wezterm.lua:
+---   local resurrect = wezterm.plugin.require("...")
+---   resurrect.process_handlers.setup_claude_session_hooks()
+---
+---@param settings_path string|nil optional override for Claude settings file path
+---@return boolean success
+function pub.setup_claude_session_hooks(settings_path)
+	local home = os.getenv("HOME") or os.getenv("USERPROFILE")
+	if not home then
+		wezterm.log_error("resurrect: cannot determine home directory for Claude hook setup")
+		return false
+	end
+
+	local sep = utils.separator
+	local claude_dir = home .. sep .. ".claude"
+	local pane_sessions_dir = claude_dir .. sep .. "pane-sessions"
+
+	-- Ensure pane-sessions directory exists.
+	if not utils.ensure_folder_exists(pane_sessions_dir) then
+		wezterm.log_error("resurrect: failed to create pane-sessions directory: " .. pane_sessions_dir)
+		return false
+	end
+
+	-- Configure the primary settings file
+	if settings_path then
+		return configure_hook_in_settings(settings_path, pane_sessions_dir)
+	end
+
+	local primary_path = claude_dir .. sep .. "settings.json"
+	local primary_ok = configure_hook_in_settings(primary_path, pane_sessions_dir)
+
+	-- Also configure alternate Claude config directories (e.g., .claude-alt for
+	-- claude2 multi-account setups). Only if the directory already exists --
+	-- we don't create new config dirs, just hook into existing ones.
+	local alt_dir = home .. sep .. ".claude-alt"
+	local alt_settings = alt_dir .. sep .. "settings.json"
+	local alt_f = io.open(alt_settings, "r")
+	if alt_f then
+		alt_f:close()
+		configure_hook_in_settings(alt_settings, pane_sessions_dir)
+	end
+
+	return primary_ok
 end
 
 return pub

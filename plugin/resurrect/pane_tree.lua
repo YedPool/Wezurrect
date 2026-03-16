@@ -114,24 +114,36 @@ local function insert_panes(root, panes)
 			local process_info = root.pane:get_foreground_process_info()
 			local has_handler = process_handlers.find_handler(process_info)
 
-			-- If the foreground process doesn't match a handler, check the
-			-- pane-session file. When Claude Code runs a child process (bash,
-			-- node, etc.), that child becomes the foreground process and
-			-- find_handler misses Claude Code. The pane-session file written
-			-- by Claude Code's SessionStart hook is the reliable signal.
-			if not has_handler then
-				local pane_session = process_handlers.read_pane_session(root.pane:pane_id())
-				if pane_session and pane_session.session_id then
-					has_handler = true
-					-- Build synthetic process_info since the foreground
-					-- process is a child (bash, etc.), not claude itself.
-					process_info = {
-						name = "claude",
-						executable = "claude",
-						argv = {},
-						cwd = process_info.cwd or "",
-					}
+			-- Check the pane-session file for Claude Code detection and
+			-- binary disambiguation. This serves two purposes:
+			-- 1. Fallback: when Claude runs a child process (bash, node),
+			--    the foreground process isn't "claude" so find_handler misses it.
+			-- 2. Binary fix: claude2.bat wraps the same "claude" binary with
+			--    CLAUDE_CONFIG_DIR=~/.claude-alt. WezTerm reports name="claude"
+			--    for both, but the transcript_path reveals which config dir
+			--    was used, letting us restore with the correct binary.
+			local pane_session = process_handlers.read_pane_session(root.pane:pane_id())
+			if pane_session and pane_session.session_id then
+				-- Infer which claude binary from the transcript_path.
+				local bin = "claude"
+				local tp = pane_session.transcript_path or ""
+				if tp:find("[/\\]%.claude%-alt[/\\]") then
+					bin = "claude2"
 				end
+
+				if not has_handler then
+					-- Fallback: foreground process is a child, not claude
+					has_handler = true
+				end
+
+				-- Always rebuild process_info from pane-session data so
+				-- the correct binary name is used (claude vs claude2).
+				process_info = {
+					name = bin,
+					executable = bin,
+					argv = process_info.argv or {},
+					cwd = process_info.cwd or "",
+				}
 			end
 
 			if root.alt_screen_active or has_handler then

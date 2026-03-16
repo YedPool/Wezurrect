@@ -69,6 +69,12 @@ function pub.periodic_save(opts)
 				local workspace_state = require("resurrect.workspace_state").get_workspace_state()
 				pub.save_state(workspace_state)
 				pub.write_current_state(workspace_state.workspace, "workspace")
+
+				-- Also save per-instance state if instance manager is active
+				local im = require("resurrect.instance_manager")
+				if im.instance_id then
+					im.save_instance(workspace_state)
+				end
 			end
 
 			if opts.save_windows then
@@ -133,6 +139,12 @@ function pub.event_driven_save(opts)
 			local workspace_state = require("resurrect.workspace_state").get_workspace_state()
 			pub.save_state(workspace_state)
 			pub.write_current_state(workspace_state.workspace, "workspace")
+
+			-- Also save per-instance state if instance manager is active
+			local im = require("resurrect.instance_manager")
+			if im.instance_id then
+				im.save_instance(workspace_state)
+			end
 		end
 
 		if opts.save_windows then
@@ -287,7 +299,7 @@ end
 ---Changes the directory to save the state to
 ---@param directory string
 function pub.change_state_save_dir(directory)
-	local types = { "workspace", "window", "tab" }
+	local types = { "workspace", "window", "tab", "instances" }
 	for _, type in ipairs(types) do
 		utils.ensure_folder_exists(directory .. utils.separator .. type)
 	end
