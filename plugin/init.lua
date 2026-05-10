@@ -7,7 +7,13 @@ local function init()
 	-- enable_sub_modules()
 	local opts = {
 		auto = true,
-		keywords = { "YedPool", "resurrect", "wezterm" },
+		-- Substring(s) present in the encoded plugin path. wezterm caches by the
+		-- URL the user supplied (NOT the redirect target), so paths can be
+		-- "...sZsYedPoolsZsWezurrect" (canonical URL) OR
+		-- "...sZsYedPoolsZsresurrectsDswezterm" (README's redirected URL).
+		-- "YedPool" is the only substring common to both forms; it also
+		-- correctly excludes the upstream MLFlexer fork.
+		keywords = { "YedPool" },
 	}
 	local plugin_path = dev.setup(opts)
 
