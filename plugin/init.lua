@@ -7,7 +7,7 @@ local function init()
 	-- enable_sub_modules()
 	local opts = {
 		auto = true,
-		keywords = { "YedPool", "resurrect", "wezterm" },
+		keywords = { "YedPool", "Wezurrect" },
 	}
 	local plugin_path = dev.setup(opts)
 
