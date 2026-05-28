@@ -101,7 +101,7 @@ return config
 - **Claude Code session restoration** -- detects Claude Code processes and resumes them via `--resume <session-id>`
 - **Claude Code SessionStart hook** in `~/.claude/settings.json` (and `~/.claude-alt/settings.json` for multi-account `claude2` setups)
 - **Status bar** showing last save time and tab titles
-- **Keybindings**: Alt+S (full save), Alt+R (instance selector / restore), Alt+W (save workspace), Alt+Shift+W (save window), Alt+Shift+T (save tab)
+- **Keybindings**: Alt+S (full save), Alt+R (instance selector / restore), Alt+W (save workspace), Alt+Shift+W (save window), Alt+Shift+T (save tab), Ctrl+Shift+B (break active pane into a new window)
 
 No manual plugin installation needed -- `wezterm.plugin.require()` auto-fetches from GitHub on first launch.
 
@@ -116,7 +116,7 @@ resurrect.setup(config, {
   save_workspaces      = true,  -- save workspace state
   save_windows         = true,  -- save window state
   save_tabs            = true,  -- save tab state
-  keybindings          = true,  -- add Alt+S/R/W/Shift+W/Shift+T bindings
+  keybindings          = true,  -- add Alt+S/R/W/Shift+W/Shift+T + Ctrl+Shift+B bindings
   status_bar           = true,  -- show save time + tab titles in right status
   claude_hooks         = true,  -- auto-configure Claude Code SessionStart hook
   auto_restore_prompt  = true,  -- show instance selector on startup if saved instances exist

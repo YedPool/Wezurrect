@@ -44,7 +44,7 @@ init()
 ---   save_workspaces      = true
 ---   save_windows         = true
 ---   save_tabs            = true
----   keybindings          = true   -- add Alt+S/R/W/Shift+W/Shift+T bindings
+---   keybindings          = true   -- add Alt+S/R/W/Shift+W/Shift+T + Ctrl+Shift+B bindings
 ---   status_bar           = true   -- show save time + tab titles in right status
 ---   claude_hooks         = true   -- auto-configure Claude Code SessionStart hook
 ---   auto_restore_prompt  = true   -- show instance selector on startup if saved instances exist
@@ -197,6 +197,15 @@ function pub.setup(config, opts)
 			mods = "ALT",
 			action = wezterm.action_callback(function(win, pane)
 				pub.instance_manager.show_instance_selector(win, pane, restore_opts)
+			end),
+		})
+
+		-- Ctrl+Shift+B: break the active pane out into a new window
+		table.insert(config.keys, {
+			key = "b",
+			mods = "CTRL|SHIFT",
+			action = wezterm.action_callback(function(win, pane)
+				pane:move_to_new_window()
 			end),
 		})
 	end
