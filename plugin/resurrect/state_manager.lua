@@ -4,6 +4,11 @@ local utils = require("resurrect.utils")
 
 local pub = {}
 
+-- How many timestamped backups to keep per named save. Set via
+-- pub.backup_retention_count = N from the user's wezterm.lua. Set to 0 to
+-- disable dated backups (the rolling .bak still runs).
+pub.backup_retention_count = 10
+
 ---@param file_name string
 ---@param type string
 ---@param opt_name string?
@@ -20,19 +25,115 @@ local function get_file_path(file_name, type, opt_name)
 	)
 end
 
+-- Strip directory + ".json" from a state file path to get the base name.
+local function basename_no_ext(file_path)
+	local sep = utils.separator
+	local name = file_path:match("[^" .. sep .. "]+$") or file_path
+	return (name:gsub("%.json$", ""))
+end
+
+-- Return the directory portion of a file path (without trailing separator).
+local function dirname(file_path)
+	local sep = utils.separator
+	return (file_path:gsub(sep .. "[^" .. sep .. "]+$", ""))
+end
+
+-- List timestamped backups for a basename in a given .backups dir. Returns
+-- file paths sorted oldest -> newest by embedded timestamp (works without
+-- mtime lookups, which Lua doesn't expose portably).
+local function list_dated_backups(backups_dir, basename)
+	-- The PowerShell / sh probes mirror the pattern used in instance_manager
+	-- to keep behaviour symmetrical across platforms.
+	local pattern = basename .. ".*.json"
+	local stdout
+	if utils.is_windows then
+		local ok, output = wezterm.run_child_process({
+			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
+			string.format(
+				"Get-ChildItem -Path '%s' -Filter '%s' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }",
+				backups_dir:gsub("'", "''"), pattern:gsub("'", "''")
+			),
+		})
+		if ok then stdout = output end
+	else
+		local safe = backups_dir:gsub("'", "'\\''")
+		local safe_pat = pattern:gsub("'", "'\\''")
+		local ok, output = wezterm.run_child_process({
+			"sh", "-c",
+			"ls '" .. safe .. "'/'" .. safe_pat .. "' 2>/dev/null | xargs -n1 basename",
+		})
+		if ok then stdout = output end
+	end
+	local entries = {}
+	if not stdout then return entries end
+	for name in stdout:gmatch("[^\r\n]+") do
+		name = name:match("^%s*(.-)%s*$")
+		-- Match the dated suffix we generate: basename.YYYYMMDD-HHMMSS.json
+		local stamp = name:match("^" .. basename:gsub("[%-%.%+%(%)%%%[%]%*%?%^%$]", "%%%1") .. "%.(%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d)%.json$")
+		if stamp then
+			table.insert(entries, { path = backups_dir .. utils.separator .. name, stamp = stamp })
+		end
+	end
+	table.sort(entries, function(a, b) return a.stamp < b.stamp end)
+	return entries
+end
+
+-- Rotate the previous content of file_path to file_path.bak (instant rename,
+-- cheap) and write a dated archive copy to <dir>/.backups/. The rolling .bak
+-- protects against the immediately-prior save; the dated archive provides a
+-- short window of history. Both are deliberately separate: a single .bak is
+-- cheap to grep / restore; dated backups give defense-in-depth without
+-- bloating disk.
+local function rotate_backup(file_path)
+	if not file_io.file_exists(file_path) then
+		return -- first save; nothing to rotate
+	end
+	local bak = file_path .. ".bak"
+	-- Read content BEFORE the rename so we can also write the dated copy.
+	-- Reading first avoids reading from .bak after the move (one fewer file
+	-- handle, and matches the "source of truth" semantic).
+	local rok, content = file_io.read_file(file_path)
+	-- Roll the previous canonical file to .bak. Windows-safe via move_file.
+	file_io.move_file(file_path, bak)
+
+	-- Dated archive (best-effort; never fail the save over an archive error).
+	if pub.backup_retention_count and pub.backup_retention_count > 0 and rok and content then
+		local dir = dirname(file_path)
+		local backups_dir = dir .. utils.separator .. ".backups"
+		utils.ensure_folder_exists(backups_dir)
+		local base = basename_no_ext(file_path)
+		local stamp = os.date("%Y%m%d-%H%M%S")
+		local archive_path = backups_dir .. utils.separator .. base .. "." .. stamp .. ".json"
+		file_io.write_file(archive_path, content)
+
+		-- Prune oldest beyond retention.
+		local entries = list_dated_backups(backups_dir, base)
+		while #entries > pub.backup_retention_count do
+			local oldest = table.remove(entries, 1)
+			os.remove(oldest.path)
+		end
+	end
+end
+
 ---save state to a file
 ---@param state workspace_state | window_state | tab_state
 ---@param opt_name? string
 function pub.save_state(state, opt_name)
 	if state.window_states then
-		file_io.write_state(get_file_path(state.workspace, "workspace", opt_name), state, "workspace")
+		local fp = get_file_path(state.workspace, "workspace", opt_name)
+		rotate_backup(fp)
+		file_io.write_state(fp, state, "workspace")
 		-- Always update current_state when saving a workspace so that
 		-- resurrect_on_gui_startup knows what to restore.
 		pub.write_current_state(state.workspace, "workspace")
 	elseif state.tabs then
-		file_io.write_state(get_file_path(state.title, "window", opt_name), state, "window")
+		local fp = get_file_path(state.title, "window", opt_name)
+		rotate_backup(fp)
+		file_io.write_state(fp, state, "window")
 	elseif state.pane_tree then
-		file_io.write_state(get_file_path(state.title, "tab", opt_name), state, "tab")
+		local fp = get_file_path(state.title, "tab", opt_name)
+		rotate_backup(fp)
+		file_io.write_state(fp, state, "tab")
 	end
 end
 
@@ -293,5 +394,13 @@ end
 function pub.set_max_nlines(max_nlines)
 	require("resurrect.pane_tree").max_nlines = max_nlines
 end
+
+-- Expose internals for unit testing only
+pub._test = {
+	rotate_backup = rotate_backup,
+	list_dated_backups = list_dated_backups,
+	basename_no_ext = basename_no_ext,
+	dirname = dirname,
+}
 
 return pub
