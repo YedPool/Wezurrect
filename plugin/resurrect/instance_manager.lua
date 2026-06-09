@@ -447,7 +447,104 @@ function pub.delete_instance(instance_id)
 	return true
 end
 
---- Remove instances older than retention_days.
+--- Return the absolute path to the tombstone (post-restore) instance directory.
+--- Files here are former instances kept around after a successful restore so a
+--- crash before the next save doesn't lose the snapshot. list_instances() does
+--- not recurse into this dir, so tombstones don't appear in the selector.
+---@return string
+function pub.get_tombstone_dir()
+	return pub.get_instances_dir() .. utils.separator .. "restored"
+end
+
+local function tombstone_state_path(instance_id)
+	return pub.get_tombstone_dir() .. utils.separator .. instance_id .. ".json"
+end
+
+local function tombstone_meta_path(instance_id)
+	return pub.get_tombstone_dir() .. utils.separator .. instance_id .. ".meta"
+end
+
+--- Move an instance to the tombstone directory instead of deleting it.
+--- Used by restore_instances after a successful restore. The files persist
+--- for retention_days, after which cleanup_old_tombstones removes them.
+---@param instance_id string
+---@return boolean
+function pub.tombstone_instance(instance_id)
+	if not is_valid_instance_id(instance_id) then
+		wezterm.log_error("resurrect: tombstone_instance rejected invalid ID: " .. tostring(instance_id))
+		wezterm.emit("resurrect.error", "Invalid instance ID")
+		return false
+	end
+
+	utils.ensure_folder_exists(pub.get_tombstone_dir())
+
+	local json_src = state_path(instance_id)
+	local meta_src = meta_path(instance_id)
+	local json_dst = tombstone_state_path(instance_id)
+	local meta_dst = tombstone_meta_path(instance_id)
+
+	file_io.move_file(json_src, json_dst)
+	file_io.move_file(meta_src, meta_dst)
+
+	wezterm.log_info("resurrect: tombstoned instance " .. instance_id)
+	wezterm.emit("resurrect.instance_manager.tombstone_instance.finished", instance_id)
+	return true
+end
+
+-- List instance IDs in a given directory (live or tombstone). Returns plain
+-- IDs; callers join paths themselves. Mirrors the platform-specific scan
+-- logic used by list_instances.
+local function list_ids_in_dir(dir)
+	local stdout
+	if utils.is_windows then
+		local ok, output = wezterm.run_child_process({
+			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
+			string.format(
+				"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName }",
+				dir:gsub("'", "''")
+			),
+		})
+		if ok then stdout = output end
+	else
+		local safe = dir:gsub("'", "'\\''")
+		local ok, output = wezterm.run_child_process({
+			"sh", "-c",
+			"ls '" .. safe .. "'/*.json 2>/dev/null | xargs -I{} basename {} .json",
+		})
+		if ok then stdout = output end
+	end
+	local ids = {}
+	if not stdout then return ids end
+	for id in stdout:gmatch("[^\r\n]+") do
+		id = id:match("^%s*(.-)%s*$")
+		if is_valid_instance_id(id) then
+			table.insert(ids, id)
+		end
+	end
+	return ids
+end
+
+--- Remove tombstoned instances whose last_save_epoch is older than cutoff.
+---@param cutoff number unix epoch; entries strictly older are deleted
+function pub.cleanup_old_tombstones(cutoff)
+	local dir = pub.get_tombstone_dir()
+	for _, id in ipairs(list_ids_in_dir(dir)) do
+		local meta_p = dir .. utils.separator .. id .. ".meta"
+		local last_save_epoch = 0
+		local ok, content = file_io.read_file(meta_p)
+		if ok and content then
+			local epoch = content:match('"last_save_epoch":(%d+)')
+			if epoch then last_save_epoch = tonumber(epoch) end
+		end
+		if last_save_epoch < cutoff then
+			os.remove(dir .. utils.separator .. id .. ".json")
+			os.remove(meta_p)
+			wezterm.log_info("resurrect: pruned tombstoned instance " .. id)
+		end
+	end
+end
+
+--- Remove live AND tombstoned instances older than retention_days.
 function pub.cleanup_old_instances()
 	local cutoff = os.time() - (pub.retention_days * 86400)
 	local instances = pub.list_instances()
@@ -456,6 +553,7 @@ function pub.cleanup_old_instances()
 			pub.delete_instance(entry.instance_id)
 		end
 	end
+	pub.cleanup_old_tombstones(cutoff)
 end
 
 -- ---------------------------------------------------------------------------
@@ -605,8 +703,11 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 				pub.display_name = old_meta.display_name
 			end
 
-			-- Auto-delete old instance after restore (it now has a new ID)
-			pub.delete_instance(id)
+			-- Tombstone the old instance: move to restored/ subdirectory rather
+			-- than delete, so a crash before the next save still leaves a
+			-- recoverable copy on disk. Tombstones are filtered out of the
+			-- selector and pruned by cleanup_old_tombstones (retention_days).
+			pub.tombstone_instance(id)
 		end
 	end
 end
@@ -856,6 +957,8 @@ pub._test = {
 	count_panes = count_panes,
 	extract_project_name = extract_project_name,
 	extract_project_names = extract_project_names,
+	restore_instances = restore_instances,
+	list_ids_in_dir = list_ids_in_dir,
 }
 
 return pub
