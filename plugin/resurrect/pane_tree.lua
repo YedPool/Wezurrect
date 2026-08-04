@@ -72,6 +72,29 @@ end
 -- crafted state files with deeply nested pane trees.
 local MAX_PANE_DEPTH = 100
 
+--- Identify which pane-session file (if any) belongs to this pane.
+---
+--- Local panes are keyed by WezTerm's pane id, which WezTerm exports to child
+--- processes as WEZTERM_PANE. WSL panes cannot use that: WezTerm's WSLENV list
+--- covers only TERM/COLORTERM/TERM_PROGRAM/TERM_PROGRAM_VERSION, so WEZTERM_PANE
+--- does not cross into the distro. They are keyed instead by a per-shell id that
+--- the shell integration we install inside the distro publishes as a user var
+--- and exports into the environment, so Claude Code's hook can name its file
+--- after it. See resurrect.wsl_integration.
+---@param pane Pane
+---@param is_wsl boolean
+---@return number|string|nil
+local function session_key_for(pane, is_wsl)
+	if not is_wsl then
+		return pane:pane_id()
+	end
+	local ok, user_vars = pcall(pane.get_user_vars, pane)
+	if ok and user_vars then
+		return user_vars.resurrect_shell_id
+	end
+	return nil
+end
+
 ---@param root pane_tree | nil
 ---@param panes PaneInformation[]
 ---@param depth? number current recursion depth (defaults to 0)
@@ -100,29 +123,28 @@ local function insert_panes(root, panes, depth)
 	else
 		root.domain = domain
 
-		if not root.pane:get_current_working_dir() then
-			root.cwd = ""
-		else
-			root.cwd = root.pane:get_current_working_dir().file_path
-			if utils.is_windows then
-				-- WezTerm returns file_path as /C:/... on Windows; strip the leading slash.
-				root.cwd = root.cwd:gsub("^/([a-zA-Z]):", "%1:")
-				-- WSL mounts Windows drives at /mnt/c/...; convert to C:\... so that
-				-- WezTerm's mux can validate the path in Windows context before spawning.
-				root.cwd = root.cwd:gsub("^/mnt/([a-zA-Z])(.*)", function(drive, rest)
-					return drive:upper() .. ":" .. rest:gsub("/", "\\")
-				end)
-			end
-		end
+		local is_wsl = utils.is_wsl_domain(domain)
 
-		if domain == "local" then
-			-- pane:inject_output() is unavailable for non-local domains,
-			-- only saving local scrollback because it would slow down the process
-			-- See: https://github.com/MLFlexer/resurrect.wezterm/issues/41
+		local cwd_url = root.pane:get_current_working_dir()
+		root.cwd = utils.normalize_saved_cwd(cwd_url and cwd_url.file_path, domain)
+
+		-- WSL panes are local ptys as far as the terminal is concerned, so
+		-- scrollback capture and inject_output work on them exactly as they do
+		-- for the "local" domain. Genuine multiplexer domains (SSH/mux) stay
+		-- excluded: inject_output is unavailable there, and pulling scrollback
+		-- over the wire would slow every save down.
+		-- See: https://github.com/MLFlexer/resurrect.wezterm/issues/41
+		if domain == "local" or is_wsl then
 			root.alt_screen_active = root.pane:is_alt_screen_active()
 
+			-- Windows can read the argv and cwd of a local child process. A WSL
+			-- pane's foreground process lives inside the WSL VM and is reported
+			-- as wsl.exe, so its argv is never replayable. For WSL panes the
+			-- pane-session file is the only trustworthy process signal, and
+			-- everything else falls through to scrollback restore.
+			local can_replay_argv = not is_wsl
 			local process_info = root.pane:get_foreground_process_info()
-			local has_handler = process_handlers.find_handler(process_info)
+			local has_handler = can_replay_argv and process_handlers.find_handler(process_info) or false
 
 			-- Check the pane-session file for Claude Code detection and
 			-- binary disambiguation. This serves two purposes:
@@ -132,7 +154,8 @@ local function insert_panes(root, panes, depth)
 			--    CLAUDE_CONFIG_DIR=~/.claude-alt. WezTerm reports name="claude"
 			--    for both, but the transcript_path reveals which config dir
 			--    was used, letting us restore with the correct binary.
-			local pane_session = process_handlers.read_pane_session(root.pane:pane_id())
+			local session_key = session_key_for(root.pane, is_wsl)
+			local pane_session = process_handlers.read_pane_session(session_key)
 			if pane_session and pane_session.session_id then
 				-- Infer which claude binary from the transcript_path.
 				local bin = "claude"
@@ -148,15 +171,17 @@ local function insert_panes(root, panes, depth)
 
 				-- Always rebuild process_info from pane-session data so
 				-- the correct binary name is used (claude vs claude2).
+				-- The hook payload's cwd is authoritative: for a WSL pane it is
+				-- the only source that reports a path from inside the distro.
 				process_info = {
 					name = bin,
 					executable = bin,
-					argv = process_info.argv or {},
-					cwd = process_info.cwd or "",
+					argv = (process_info and process_info.argv) or {},
+					cwd = pane_session.cwd or (process_info and process_info.cwd) or "",
 				}
 			end
 
-			if root.alt_screen_active or has_handler then
+			if (root.alt_screen_active and can_replay_argv and process_info) or has_handler then
 				process_info.children = nil
 				process_info.pid = nil
 				process_info.ppid = nil
@@ -248,9 +273,9 @@ local function insert_panes(root, panes, depth)
 				end
 
 				-- Let registered process handlers sanitize argv for portable restoration.
-				-- Pass pane_id so handlers can look up external state (e.g., Claude
-				-- Code reads session IDs from ~/.claude/pane-sessions/<pane_id>.json).
-				process_handlers.sanitize_for_save(process_info, root.pane:pane_id())
+				-- Pass the session key so handlers can look up external state (e.g.,
+				-- Claude Code reads session IDs from ~/.claude/pane-sessions/<key>.json).
+				process_handlers.sanitize_for_save(process_info, session_key)
 
 				root.process = process_info
 			else

@@ -1,5 +1,6 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local window_state_mod = require("resurrect.window_state")
+local utils = require("resurrect.utils")
 
 local pub = {}
 
@@ -29,11 +30,18 @@ function pub.restore_workspace(workspace_state, opts)
 				end
 			end
 		else
+			local first_pane_tree = window_state.tabs[1].pane_tree
 			local spawn_window_args = {
 				width = window_state.size.cols,
 				height = window_state.size.rows,
-				cwd = window_state.tabs[1].pane_tree.cwd,
 			}
+			-- The window's initial pane is spawned in the default domain, so a
+			-- WSL tab's POSIX cwd is meaningless (and unresolvable) here. That
+			-- tab is respawned in its own domain by restore_window, which puts
+			-- it in the right directory.
+			if not utils.is_wsl_domain(first_pane_tree.domain) then
+				spawn_window_args.cwd = first_pane_tree.cwd
+			end
 			if opts.spawn_in_workspace then
 				spawn_window_args.workspace = workspace_state.workspace
 			end

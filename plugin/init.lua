@@ -28,6 +28,7 @@ local function init()
 	pub.state_manager = require("resurrect.state_manager")
 	pub.process_handlers = require("resurrect.process_handlers")
 	pub.instance_manager = require("resurrect.instance_manager")
+	pub.wsl_integration = require("resurrect.wsl_integration")
 end
 
 init()
@@ -49,6 +50,8 @@ init()
 ---   claude_hooks         = true   -- auto-configure Claude Code SessionStart hook
 ---   auto_restore_prompt  = true   -- show instance selector on startup if saved instances exist
 ---   retention_days       = 7      -- auto-delete instance states older than this
+---   wsl_integration      = true   -- auto-install cwd + Claude session reporting into WSL distros
+---   wsl_integration_delay = 10    -- seconds to wait after startup before doing so
 ---
 ---@param config table wezterm config_builder object
 ---@param opts? table optional overrides
@@ -66,6 +69,22 @@ function pub.setup(config, opts)
 	-- Claude Code session hook setup (idempotent)
 	if opts.claude_hooks ~= false then
 		pub.process_handlers.setup_claude_session_hooks()
+	end
+
+	-- WSL panes cannot report their working directory or their Claude sessions
+	-- to Windows on their own; install the shell integration that lets them.
+	-- Deferred off the startup path because it shells out to wsl.exe, which can
+	-- take seconds when the distro is not already running. Idempotent, and a
+	-- marker file means it only actually runs once per distro.
+	if opts.wsl_integration ~= false then
+		local state_dir = pub.state_manager.save_state_dir:gsub("[/\\]+$", "")
+		local marker_dir = state_dir .. require("resurrect.utils").separator .. "wsl-integration"
+		wezterm.time.call_after(opts.wsl_integration_delay or 10, function()
+			local ok, err = pcall(pub.wsl_integration.ensure_installed, marker_dir)
+			if not ok then
+				wezterm.log_error("resurrect: WSL integration setup failed: " .. tostring(err))
+			end
+		end)
 	end
 
 	-- Event-driven save: fires on pane/tab structure changes

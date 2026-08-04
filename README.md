@@ -121,6 +121,8 @@ resurrect.setup(config, {
   claude_hooks         = true,  -- auto-configure Claude Code SessionStart hook
   auto_restore_prompt  = true,  -- show instance selector on startup if saved instances exist
   retention_days       = 7,     -- auto-delete instance states older than this many days
+  wsl_integration      = true,  -- auto-install cwd + Claude reporting into WSL distros (Windows)
+  wsl_integration_delay = 10,   -- seconds after startup before doing so
 })
 ```
 
@@ -132,6 +134,39 @@ resurrect.setup(config, { keybindings = false })
 -- Add your own custom bindings here
 config.keys = { ... }
 ```
+
+### WSL panes (Windows)
+
+WSL tabs restore their scrollback, working directory and Claude Code sessions
+just like local tabs do, with no setup beyond installing the plugin.
+
+Getting there needs one thing Windows cannot do on its own. A pane in a `WSL:*`
+domain runs `wsl.exe`, and Windows cannot see the process inside the VM: the
+working directory WezTerm reports is the Windows directory `wsl.exe` was
+launched from, not the shell's actual `$PWD`. Restoring from that value used to
+type a Windows path into `bash`, which always failed.
+
+So, ten seconds after startup, `setup()` installs a small shell snippet into
+every WSL distribution it finds:
+
+- `~/.config/wezterm-resurrect/integration.sh` — emits [OSC 7][osc7] on each
+  prompt, which is how a shell tells the terminal its real working directory,
+  and publishes a per-shell id as the `resurrect_shell_id` user var.
+- `~/.bashrc` — one guarded line sourcing the snippet.
+- `~/.claude/settings.json` inside the distro — the same pane-session hook that
+  `claude_hooks` installs on the Windows side, keyed by that shell id.
+
+The shell id exists because `WEZTERM_PANE` does not cross the WSL boundary:
+WezTerm's `WSLENV` forwards only `TERM`, `COLORTERM`, `TERM_PROGRAM` and
+`TERM_PROGRAM_VERSION`.
+
+Installation is idempotent and runs once per distro (a marker is kept under
+`state/wsl-integration/`). It takes effect in **newly opened** WSL tabs; shells
+already running have not sourced it. Pass `wsl_integration = false` to opt out —
+WSL scrollback still restores, but the working directory falls back to whatever
+Windows can see.
+
+[osc7]: https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/prompts.md
 
 ## Advanced Setup (Manual Configuration)
 
@@ -666,6 +701,10 @@ end)
 
 If your pane CWD is incorrect then it might be a problem with the shell
 integration and OSC 7. See [Wezterm documentation](https://wezfurlong.org/wezterm/shell-integration.html).
+
+For panes in a `WSL:*` domain this is installed for you — see
+[WSL panes (Windows)](#wsl-panes-windows). It applies to newly opened WSL tabs,
+so restart the tab if an existing one still reports a Windows path.
 
 ### How do I keep my plugins up to date?
 

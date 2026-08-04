@@ -140,18 +140,23 @@ end
 local is_safe_cwd = utils.is_safe_cwd
 
 -- Read session data from Claude Code's pane-sessions directory.
--- The SessionStart hook writes JSON to ~/.claude/pane-sessions/<pane_id>.json
+-- The SessionStart hook writes JSON to ~/.claude/pane-sessions/<key>.json
 -- containing { session_id, transcript_path, cwd, hook_event_name, source }.
----@param pane_id number|string WezTerm pane ID
+--
+-- The key is WezTerm's numeric pane id for local panes, or the per-shell UUID
+-- published by the WSL shell integration for panes inside a WSL distro (see
+-- resurrect.wsl_integration for why WEZTERM_PANE cannot be used there).
+---@param pane_id number|string WezTerm pane ID or WSL shell id
 ---@return table|nil session_data parsed JSON or nil on failure
 function pub.read_pane_session(pane_id)
 	if not pane_id then
 		return nil
 	end
-	-- Validate pane_id is numeric to prevent path traversal
+	-- Restrict the key to alphanumerics, dashes and underscores so it cannot
+	-- escape the pane-sessions directory via path traversal.
 	local id_str = tostring(pane_id)
-	if not id_str:match("^%d+$") then
-		wezterm.log_error("resurrect: read_pane_session rejected non-numeric pane_id: " .. id_str)
+	if #id_str > 64 or not id_str:match("^[%w][%w%-_]*$") then
+		wezterm.log_error("resurrect: read_pane_session rejected malformed key: " .. id_str)
 		return nil
 	end
 	local home = os.getenv("HOME") or os.getenv("USERPROFILE")
@@ -320,12 +325,37 @@ pub.register({
 	end,
 })
 
--- Configure the SessionStart hook in a single Claude Code settings file.
--- Returns true if hook is already present or was successfully added.
+--- Build the Claude Code hook command that records a pane's session.
+---
+--- Claude Code sends the session JSON on stdin for every hook event; we write it
+--- to a file named after whichever environment variable identifies the pane.
+--- The key is validated against a strict character class so a crafted value
+--- (e.g. "../../.bashrc") cannot escape the pane-sessions directory.
+--- All Claude instances write to the same directory so the restore logic finds
+--- session data regardless of which binary, or which distro, ran.
+---@param pane_sessions_dir string directory to write session files into
+---@param key_env_var string environment variable holding the pane key
+---@return string hook_command
+function pub.build_pane_session_hook_command(pane_sessions_dir, key_env_var)
+	local safe_dir = pane_sessions_dir:gsub("\\", "/"):gsub("'", "'\\''")
+	return "bash -c '"
+		.. 'key="${' .. key_env_var .. ':-unknown}"; '
+		.. 'if [[ "$key" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then '
+		.. 'cat > "' .. safe_dir .. '/${key}.json"; '
+		.. 'else echo "resurrect: invalid ' .. key_env_var .. ': $key" >&2; cat > /dev/null; fi\''
+end
+
+--- Configure the pane-session hooks in a single Claude Code settings file.
+--- Returns true if the hooks are already present or were successfully added.
+---
+--- The hook command is supplied by the caller because it differs per platform:
+--- a Windows Claude writes to the pane-sessions directory keyed by WEZTERM_PANE,
+--- while a Claude running inside WSL writes to the same directory through its
+--- /mnt mount, keyed by the shell id from our WSL shell integration.
 ---@param target_settings_path string path to settings.json
----@param pane_sessions_dir string path to pane-sessions directory
+---@param hook_command string command to run for SessionStart and Stop
 ---@return boolean success
-local function configure_hook_in_settings(target_settings_path, pane_sessions_dir)
+function pub.configure_pane_session_hooks(target_settings_path, hook_command)
 	-- Read existing settings (or start fresh)
 	local settings = {}
 	local f = io.open(target_settings_path, "r")
@@ -374,20 +404,6 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 	if not settings.hooks then
 		settings.hooks = {}
 	end
-
-	-- The hook command: Claude Code sends session JSON on stdin for every
-	-- hook event. We write it to a file keyed by WEZTERM_PANE env var.
-	-- WEZTERM_PANE is set by WezTerm in child shells and inherited by Claude.
-	-- The pane ID is validated as numeric to prevent path traversal via
-	-- crafted WEZTERM_PANE values (e.g., "../../.bashrc").
-	-- All instances write to the same pane-sessions dir (~/.claude/pane-sessions/)
-	-- so the restore logic can find session data regardless of which binary ran.
-	local safe_dir = pane_sessions_dir:gsub("\\", "/"):gsub("'", "'\\''")
-	local hook_command = "bash -c '"
-		.. 'pane_id="${WEZTERM_PANE:-unknown}"; '
-		.. 'if [[ "$pane_id" =~ ^[0-9]+$ ]]; then '
-		.. 'cat > "' .. safe_dir .. '/${pane_id}.json"; '
-		.. "else echo \"resurrect: invalid WEZTERM_PANE: $pane_id\" >&2; cat > /dev/null; fi'"
 
 	local hook_entry = {
 		matcher = "",
@@ -471,13 +487,15 @@ function pub.setup_claude_session_hooks(settings_path)
 		return false
 	end
 
+	local hook_command = pub.build_pane_session_hook_command(pane_sessions_dir, "WEZTERM_PANE")
+
 	-- Configure the primary settings file
 	if settings_path then
-		return configure_hook_in_settings(settings_path, pane_sessions_dir)
+		return pub.configure_pane_session_hooks(settings_path, hook_command)
 	end
 
 	local primary_path = claude_dir .. sep .. "settings.json"
-	local primary_ok = configure_hook_in_settings(primary_path, pane_sessions_dir)
+	local primary_ok = pub.configure_pane_session_hooks(primary_path, hook_command)
 
 	-- Also configure alternate Claude config directories (e.g., .claude-alt for
 	-- claude2 multi-account setups). Only if the directory already exists --
@@ -487,7 +505,7 @@ function pub.setup_claude_session_hooks(settings_path)
 	local alt_f = io.open(alt_settings, "r")
 	if alt_f then
 		alt_f:close()
-		configure_hook_in_settings(alt_settings, pane_sessions_dir)
+		pub.configure_pane_session_hooks(alt_settings, hook_command)
 	end
 
 	return primary_ok

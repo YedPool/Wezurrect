@@ -9,6 +9,30 @@ local pub = {}
 -- when sending cd commands via send_text().
 local is_safe_cwd = utils.is_safe_cwd
 
+--- Fill in the domain and cwd of spawn/split arguments for a pane.
+---
+--- WSL panes deliberately omit cwd. WezTerm resolves a spawn cwd in Windows
+--- terms before handing it to wsl.exe, so a POSIX path such as /home/you either
+--- fails that check or lands somewhere unintended. Those panes cd themselves
+--- once their shell is up (see build_cd_command), which is also the only way to
+--- reach a path that has no Windows spelling.
+---@param args table spawn or split arguments, mutated in place
+---@param pane_tree pane_tree
+---@return table args
+function pub.apply_spawn_target(args, pane_tree)
+	if pane_tree.domain then
+		args.domain = { DomainName = pane_tree.domain }
+	end
+	if utils.is_wsl_domain(pane_tree.domain) then
+		pane_tree.restore_cwd = true
+	else
+		args.cwd = pane_tree.cwd
+		pane_tree.restore_cwd = false
+	end
+	return args
+end
+local apply_spawn_target = pub.apply_spawn_target
+
 ---Function used to split panes when mapping over the pane_tree
 ---@param opts restore_opts
 ---@return fun(acc: {active_pane: Pane, is_zoomed: boolean}, pane_tree: pane_tree): {active_pane: Pane, is_zoomed: boolean}
@@ -26,7 +50,7 @@ local function make_splits(opts)
 
 		local bottom = pane_tree.bottom
 		if bottom then
-			local split_args = { direction = "Bottom", cwd = bottom.cwd }
+			local split_args = apply_spawn_target({ direction = "Bottom" }, bottom)
 			if opts.relative then
 				split_args.size = bottom.height / (pane_tree.height + bottom.height)
 			elseif opts.absolute then
@@ -38,7 +62,7 @@ local function make_splits(opts)
 
 		local right = pane_tree.right
 		if right then
-			local split_args = { direction = "Right", cwd = right.cwd }
+			local split_args = apply_spawn_target({ direction = "Right" }, right)
 			if opts.relative then
 				split_args.size = right.width / (pane_tree.width + right.width)
 			elseif opts.absolute then
@@ -104,19 +128,17 @@ function pub.restore_tab(tab, tab_state, opts)
 	wezterm.emit("resurrect.tab_state.restore_tab.start")
 	if opts.pane then
 		tab_state.pane_tree.pane = opts.pane
-		-- Set the CWD of the reused pane to match saved state.
-		-- Validate the CWD contains no shell metacharacters to prevent
-		-- command injection via tampered state files.
-		if is_safe_cwd(tab_state.pane_tree.cwd) then
-			opts.pane:send_text("cd " .. wezterm.shell_join_args({ tab_state.pane_tree.cwd }) .. "\r\n")
-		elseif tab_state.pane_tree.cwd and tab_state.pane_tree.cwd ~= "" then
-			wezterm.log_error("resurrect: rejected suspicious CWD: " .. tab_state.pane_tree.cwd)
+		-- A reused pane we did not spawn ourselves started in whatever directory
+		-- the caller happened to be in, so it has to cd itself. That is done
+		-- from default_on_pane_restore, so every write into the pane goes
+		-- through the same delayed, correctly ordered code path. When the caller
+		-- did spawn the pane, apply_spawn_target has already recorded whether
+		-- the cwd was handed to the spawn.
+		if tab_state.pane_tree.restore_cwd == nil then
+			tab_state.pane_tree.restore_cwd = true
 		end
 	else
-		local split_args = { cwd = tab_state.pane_tree.cwd }
-		if tab_state.pane_tree.domain then
-			split_args.domain = { DomainName = tab_state.pane_tree.domain }
-		end
+		local split_args = apply_spawn_target({}, tab_state.pane_tree)
 		local new_pane = tab:active_pane():split(split_args)
 		tab_state.pane_tree.pane = new_pane
 	end
@@ -172,56 +194,111 @@ local SAFE_RESTORE_PROCESSES = {
 	tmux = true, screen = true,
 }
 
--- Delay in seconds before sending process restore commands.
+-- Delay in seconds before writing anything into a restored pane.
 -- Shell interpreters (especially PowerShell on Windows) need time to initialize
 -- before they can accept input. Without this delay, commands sent during
--- gui-startup get swallowed by the shell's init sequence.
+-- gui-startup get swallowed by the shell's init sequence -- and, just as
+-- importantly, injected scrollback is erased: ConPTY repaints the whole visible
+-- screen when the shell first draws, overwriting anything already sitting there.
 pub.process_restore_delay_seconds = 3
+
+--- Build the `cd` line for a pane that could not be spawned in its saved
+--- directory, or nil when no cd is needed or the path is unusable.
+--- A WSL pane always gets a POSIX path: typing a Windows path into bash is the
+--- one thing guaranteed to fail, and WezTerm reports Windows paths for WSL
+--- panes until the distro's shell integration starts emitting OSC 7.
+---@param pane_tree pane_tree
+---@return string|nil
+local function build_cd_command(pane_tree)
+	if not pane_tree.restore_cwd then
+		return nil
+	end
+	local cwd = pane_tree.cwd
+	if not cwd or cwd == "" then
+		return nil
+	end
+	if utils.is_wsl_domain(pane_tree.domain) then
+		cwd = utils.to_wsl_path(cwd)
+	end
+	-- Validate the CWD contains no shell metacharacters to prevent command
+	-- injection via tampered state files.
+	if not is_safe_cwd(cwd) then
+		wezterm.log_error("resurrect: rejected suspicious CWD: " .. tostring(cwd))
+		return nil
+	end
+	return "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n"
+end
+
+--- Resolve the command that re-launches the process a pane was running, or nil
+--- when the pane had no restorable process.
+---@param pane_tree pane_tree
+---@return string|nil
+local function build_restore_command(pane_tree)
+	if not (pane_tree.process and pane_tree.process.argv) then
+		return nil
+	end
+
+	-- Check registered process handlers first (e.g., Claude Code)
+	local restore_cmd = process_handlers.get_restore_command(pane_tree.process, pane_tree)
+	if restore_cmd then
+		return restore_cmd
+	end
+
+	-- Fall back to allowlist-based argv replay
+	local proc_name = pane_tree.process.name or ""
+	local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
+	base_name = base_name:gsub("%.exe$", ""):lower()
+
+	if SAFE_RESTORE_PROCESSES[base_name] then
+		return wezterm.shell_join_args(pane_tree.process.argv)
+	end
+
+	wezterm.log_warn(
+		"resurrect: skipping restore of unrecognized process: " .. base_name
+			.. " (add to SAFE_RESTORE_PROCESSES or register a process_handler)"
+	)
+	return nil
+end
 
 --- Function to restore text or processes when restoring panes
 ---@param pane_tree pane_tree
 function pub.default_on_pane_restore(pane_tree)
-	local pane = pane_tree.pane
-
 	-- Spawn process if process info was saved (alt screen OR registered handler),
 	-- otherwise restore scrollback text. Some TUI apps (e.g., Claude Code) don't
 	-- use the alt screen buffer but still need process-based restoration.
-	if pane_tree.process and pane_tree.process.argv then
-		-- Check registered process handlers first (e.g., Claude Code)
-		local restore_cmd = process_handlers.get_restore_command(pane_tree.process, pane_tree)
-		if not restore_cmd then
-			-- Fall back to allowlist-based argv replay
-			local proc_name = pane_tree.process.name or ""
-			local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
-			base_name = base_name:gsub("%.exe$", ""):lower()
+	local restore_cmd = build_restore_command(pane_tree)
+	-- A process restore command carries its own cd, so don't send a second one.
+	local cd_cmd = restore_cmd == nil and build_cd_command(pane_tree) or nil
+	local text = (restore_cmd == nil and pane_tree.text) and pane_tree.text:gsub("%s+$", "") or nil
 
-			if SAFE_RESTORE_PROCESSES[base_name] then
-				restore_cmd = wezterm.shell_join_args(pane_tree.process.argv)
-			else
-				wezterm.log_warn(
-					"resurrect: skipping restore of unrecognized process: " .. base_name
-						.. " (add to SAFE_RESTORE_PROCESSES or register a process_handler)"
-				)
-			end
-		end
-
-		if restore_cmd then
-			-- Delay sending the command so the shell has time to initialize.
-			-- pane:send_text() during gui-startup fires before the shell is ready,
-			-- causing the command to be lost (especially on Windows with PowerShell).
-			local pane_id = pane:pane_id()
-			wezterm.time.call_after(pub.process_restore_delay_seconds, function()
-				local target_pane = wezterm.mux.get_pane(pane_id)
-				if target_pane then
-					target_pane:send_text(restore_cmd .. "\r\n")
-				end
-			end)
-		end
-	elseif pane_tree.text then
-		pane:inject_output(pane_tree.text:gsub("%s+$", ""))
-		-- Send newline to trigger a fresh shell prompt at the correct position
-		pane:send_text("\r\n")
+	if not (restore_cmd or cd_cmd or text) then
+		return
 	end
+
+	-- Everything that writes into the pane happens in one delayed callback so
+	-- it lands after the shell has drawn its first prompt (see
+	-- process_restore_delay_seconds) and in a deterministic order.
+	local pane_id = pane_tree.pane:pane_id()
+	wezterm.time.call_after(pub.process_restore_delay_seconds, function()
+		local pane = wezterm.mux.get_pane(pane_id)
+		if not pane then
+			return
+		end
+
+		if text and text ~= "" then
+			-- Leading newline so the restored scrollback starts on its own line
+			-- below the shell's opening prompt rather than running into it.
+			pane:inject_output("\r\n" .. text .. "\r\n")
+			-- Newline to the shell so it draws a fresh prompt underneath.
+			pane:send_text("\r\n")
+		end
+		if cd_cmd then
+			pane:send_text(cd_cmd)
+		end
+		if restore_cmd then
+			pane:send_text(restore_cmd .. "\r\n")
+		end
+	end)
 end
 
 return pub
