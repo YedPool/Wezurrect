@@ -194,13 +194,51 @@ local SAFE_RESTORE_PROCESSES = {
 	tmux = true, screen = true,
 }
 
--- Delay in seconds before writing anything into a restored pane.
+-- Delay in seconds before sending keystrokes into a restored pane.
 -- Shell interpreters (especially PowerShell on Windows) need time to initialize
 -- before they can accept input. Without this delay, commands sent during
--- gui-startup get swallowed by the shell's init sequence -- and, just as
--- importantly, injected scrollback is erased: ConPTY repaints the whole visible
--- screen when the shell first draws, overwriting anything already sitting there.
+-- gui-startup get swallowed by the shell's init sequence.
 pub.process_restore_delay_seconds = 3
+
+--- Write a pane's saved scrollback into it, scrolled up out of the visible
+--- screen so that the shell draws its first prompt directly beneath it.
+---
+--- inject_output is invisible to the process driving the pty, and on Windows
+--- both PowerShell and WSL run behind ConPTY, which paints the visible screen at
+--- absolute positions of its own choosing. Anything we leave on screen is
+--- therefore doomed twice over: ConPTY's first paint overwrites it, and the
+--- shell's opening prompt lands at the top of the screen as though the restored
+--- history were not there.
+---
+--- Padding the injected text with exactly enough newlines to push its last row
+--- above the top of the viewport moves the whole history into the scrollback
+--- buffer, which ConPTY neither knows about nor touches. The shell then gets a
+--- blank screen to draw into, and the restored history sits immediately above
+--- its prompt in the buffer -- scroll up and it is all there, in order.
+---@param pane Pane
+---@param text string scrollback, already trimmed of trailing whitespace
+local function inject_scrollback(pane, text)
+	local ok, dims = pcall(pane.get_dimensions, pane)
+	local viewport_rows = (ok and dims and dims.viewport_rows) or 24
+	pane:inject_output(text .. string.rep("\r\n", pub.scrollback_padding_rows(text, viewport_rows)))
+end
+
+--- How many newlines must follow injected scrollback to lift its last row above
+--- the top of the viewport. That is one per row of text, capped at the viewport
+--- height (beyond which the text has already scrolled itself out).
+---
+--- get_lines_as_escapes emits one line per physical row, so counting newlines
+--- counts rows and there is no wrapping to reason about.
+---@param text string
+---@param viewport_rows number
+---@return number
+function pub.scrollback_padding_rows(text, viewport_rows)
+	if not text or text == "" then
+		return 0
+	end
+	local _, newlines = text:gsub("\n", "")
+	return math.min(newlines + 1, viewport_rows)
+end
 
 --- Build the `cd` line for a pane that could not be spawned in its saved
 --- directory, or nil when no cd is needed or the path is unusable.
@@ -275,8 +313,19 @@ function pub.default_on_pane_restore(pane_tree)
 		return
 	end
 
-	-- Everything that writes into the pane happens in one delayed callback so
-	-- it lands after the shell has drawn its first prompt (see
+	-- Scrollback goes in immediately, while the pane is still blank, so that the
+	-- shell's own opening output lands beneath it. Keystrokes cannot: the shell
+	-- is not ready to read them yet.
+	if text and text ~= "" then
+		inject_scrollback(pane_tree.pane, text)
+	end
+
+	if not (restore_cmd or cd_cmd) then
+		return
+	end
+
+	-- Everything typed into the pane happens in one delayed callback so it lands
+	-- after the shell has drawn its first prompt (see
 	-- process_restore_delay_seconds) and in a deterministic order.
 	local pane_id = pane_tree.pane:pane_id()
 	wezterm.time.call_after(pub.process_restore_delay_seconds, function()
@@ -285,13 +334,6 @@ function pub.default_on_pane_restore(pane_tree)
 			return
 		end
 
-		if text and text ~= "" then
-			-- Leading newline so the restored scrollback starts on its own line
-			-- below the shell's opening prompt rather than running into it.
-			pane:inject_output("\r\n" .. text .. "\r\n")
-			-- Newline to the shell so it draws a fresh prompt underneath.
-			pane:send_text("\r\n")
-		end
 		if cd_cmd then
 			pane:send_text(cd_cmd)
 		end

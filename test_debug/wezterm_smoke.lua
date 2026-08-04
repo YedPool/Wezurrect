@@ -90,6 +90,16 @@ check("wsl spawn omits cwd", wsl_args.cwd, nil)
 check("wsl spawn domain", wsl_args.domain.DomainName, "WSL:Ubuntu-22.04")
 check("wsl needs cd", wsl_node.restore_cwd, true)
 
+-- Enough padding to lift the last row of restored scrollback above the top of
+-- the viewport, so ConPTY cannot repaint over it and the shell's first prompt
+-- lands underneath it rather than on top of it.
+check("padding one line", ts.scrollback_padding_rows("only line", 40), 1)
+check("padding three lines", ts.scrollback_padding_rows("a\nb\nc", 40), 3)
+check("padding exactly viewport", ts.scrollback_padding_rows(string.rep("x\n", 39) .. "x", 40), 40)
+check("padding capped at viewport", ts.scrollback_padding_rows(string.rep("x\n", 500) .. "x", 40), 40)
+check("padding empty", ts.scrollback_padding_rows("", 40), 0)
+check("padding nil", ts.scrollback_padding_rows(nil, 40), 0)
+
 -------------------------------------------------------- wsl_integration
 local wi = resurrect.wsl_integration
 local cands = wi._test.unc_candidates("Ubuntu-22.04", "/home/me/.bashrc")
