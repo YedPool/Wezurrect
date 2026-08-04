@@ -86,7 +86,7 @@ local MAX_PANE_DEPTH = 100
 ---@return number|string|nil
 local function session_key_for(pane, is_wsl)
 	if not is_wsl then
-		return pane:pane_id()
+		return process_handlers.local_pane_session_key(pane:pane_id())
 	end
 	local ok, user_vars = pcall(pane.get_user_vars, pane)
 	if ok and user_vars then

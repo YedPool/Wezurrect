@@ -23,8 +23,9 @@ local process_handlers = require("resurrect.process_handlers")
 
 local pub = {}
 
--- Bump when the installed snippet changes so existing distros are upgraded.
-pub.integration_version = 1
+-- Bump when the installed snippet or the hooks change so existing distros are
+-- upgraded. v2 added the SessionEnd hook that forgets a closed Claude session.
+pub.integration_version = 2
 
 -- Where the snippet lives inside the distro, relative to $HOME.
 local INTEGRATION_REL_PATH = "/.config/wezterm-resurrect/integration.sh"
@@ -207,8 +208,11 @@ local function ensure_claude_hook(distro, home)
 		return false
 	end
 	local pane_sessions_dir = utils.to_wsl_path(windows_home .. "\\.claude\\pane-sessions")
-	local hook_command =
-		process_handlers.build_pane_session_hook_command(pane_sessions_dir, "WEZTERM_RESURRECT_SHELL_ID")
+	-- The shell id is already unique per shell, so unlike the local key it needs
+	-- no instance prefix to stay distinct across WezTerm restarts.
+	local key_expr = "${WEZTERM_RESURRECT_SHELL_ID:-unknown}"
+	local hook_command = process_handlers.build_pane_session_hook_command(pane_sessions_dir, key_expr)
+	local cleanup_command = process_handlers.build_pane_session_cleanup_command(pane_sessions_dir, key_expr)
 
 	-- configure_pane_session_hooks does plain io.open on the path it is given,
 	-- so hand it whichever UNC spelling actually resolves for this distro.
@@ -217,7 +221,7 @@ local function ensure_claude_hook(distro, home)
 		local probe = io.open(path, "rb")
 		if probe then
 			probe:close()
-			return process_handlers.configure_pane_session_hooks(path, hook_command)
+			return process_handlers.configure_pane_session_hooks(path, hook_command, cleanup_command)
 		end
 	end
 
@@ -226,7 +230,7 @@ local function ensure_claude_hook(distro, home)
 		local probe = io.open(path, "ab")
 		if probe then
 			probe:close()
-			return process_handlers.configure_pane_session_hooks(path, hook_command)
+			return process_handlers.configure_pane_session_hooks(path, hook_command, cleanup_command)
 		end
 	end
 

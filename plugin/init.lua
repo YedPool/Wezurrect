@@ -69,24 +69,42 @@ function pub.setup(config, opts)
 
 	-- Claude Code session hook setup (idempotent)
 	if opts.claude_hooks ~= false then
+		-- Namespace this process's pane-session files. Pane ids restart from 0
+		-- in every WezTerm process, so without this a fresh pane 0 reads the
+		-- file left by a previous run's pane 0 and is saved -- and restored --
+		-- as a Claude pane running a conversation from days ago.
+		pub.process_handlers.pane_session_prefix = pub.instance_manager.instance_id
+		config.set_environment_variables = config.set_environment_variables or {}
+		config.set_environment_variables.RESURRECT_INSTANCE = pub.instance_manager.instance_id
+
 		pub.process_handlers.setup_claude_session_hooks()
 	end
 
-	-- WSL panes cannot report their working directory or their Claude sessions
-	-- to Windows on their own; install the shell integration that lets them.
-	-- Deferred off the startup path because it shells out to wsl.exe, which can
-	-- take seconds when the distro is not already running. Idempotent, and a
-	-- marker file means it only actually runs once per distro.
-	if opts.wsl_integration ~= false then
-		local state_dir = pub.state_manager.save_state_dir:gsub("[/\\]+$", "")
-		local marker_dir = state_dir .. require("resurrect.utils").separator .. "wsl-integration"
-		wezterm.time.call_after(opts.wsl_integration_delay or 10, function()
+	-- Deferred housekeeping. Both of these shell out, so they must stay off the
+	-- config-evaluation path (run_child_process yields), and the WSL install can
+	-- take seconds when the distro is not already running.
+	local retention_days = pub.instance_manager.retention_days
+	local state_dir = pub.state_manager.save_state_dir:gsub("[/\\]+$", "")
+	local marker_dir = state_dir .. require("resurrect.utils").separator .. "wsl-integration"
+	wezterm.time.call_after(opts.wsl_integration_delay or 10, function()
+		-- SessionEnd clears a pane's session file when Claude exits cleanly, but
+		-- a crash strands one. The directory is shared by every WezTerm process,
+		-- so age is the only safe thing to delete by.
+		if opts.claude_hooks ~= false then
+			pcall(pub.process_handlers.sweep_pane_sessions, retention_days)
+		end
+
+		-- WSL panes cannot report their working directory or their Claude
+		-- sessions to Windows on their own; install the shell integration that
+		-- lets them. Idempotent, and a marker file means it only actually runs
+		-- once per distro.
+		if opts.wsl_integration ~= false then
 			local ok, err = pcall(pub.wsl_integration.ensure_installed, marker_dir)
 			if not ok then
 				wezterm.log_error("resurrect: WSL integration setup failed: " .. tostring(err))
 			end
-		end)
-	end
+		end
+	end)
 
 	-- Event-driven save: fires on pane/tab structure changes
 	pub.state_manager.event_driven_save({

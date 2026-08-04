@@ -70,11 +70,62 @@ check("normalize empty", utils.normalize_saved_cwd(nil, "local"), "")
 
 ------------------------------------------------------- process_handlers
 local ph = resurrect.process_handlers
-local hook = ph.build_pane_session_hook_command("/mnt/c/Users/me/.claude/pane-sessions", "WEZTERM_RESURRECT_SHELL_ID")
+local hook = ph.build_pane_session_hook_command("/mnt/c/Users/me/.claude/pane-sessions", "${SHELL_ID:-unknown}")
 truthy("hook cmd has dir", hook:find("/mnt/c/Users/me/.claude/pane%-sessions/%${key}%.json") ~= nil)
-truthy("hook cmd has env var", hook:find("WEZTERM_RESURRECT_SHELL_ID") ~= nil)
+truthy("hook cmd has key expr", hook:find("%${SHELL_ID:%-unknown}") ~= nil)
 check("read_pane_session traversal", ph.read_pane_session("../../.bashrc"), nil)
 check("read_pane_session absent", ph.read_pane_session("definitelynotarealkey"), nil)
+
+local cleanup = ph.build_pane_session_cleanup_command("/mnt/c/Users/me/.claude/pane-sessions", "${SHELL_ID:-unknown}")
+truthy("cleanup removes the file", cleanup:find('rm %-f "/mnt/c/Users/me/.claude/pane%-sessions/%${key}%.json"') ~= nil)
+truthy("cleanup drains stdin", cleanup:find("cat > /dev/null") ~= nil)
+
+-- Local keys carry the WezTerm process's instance id, because pane ids restart
+-- from 0 every launch. Both sides of the boundary must spell it the same way.
+local saved_prefix = ph.pane_session_prefix
+ph.pane_session_prefix = "1785872700_35949"
+check("local key is prefixed", ph.local_pane_session_key(0), "1785872700_35949-0")
+ph.pane_session_prefix = nil
+check("local key without instance", ph.local_pane_session_key(7), "noinstance-7")
+ph.pane_session_prefix = saved_prefix
+check("key expr matches lua", ph.local_pane_session_key_expr(), "${RESURRECT_INSTANCE:-noinstance}-${WEZTERM_PANE:-unknown}")
+
+-- Reinstalling must replace our hooks rather than stack them up, or a stale
+-- command writing under an old key would keep running forever.
+local tmp = (os.getenv("TEMP") or "/tmp") .. "/resurrect-smoke-settings.json"
+local seed = io.open(tmp, "w")
+seed:write([[{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"play-a-sound"}]},]]
+	.. [[{"hooks":[{"type":"command","command":"cat > /old/pane-sessions/0.json"}]}]}}]])
+seed:close()
+truthy("configure rewrites settings", ph.configure_pane_session_hooks(tmp, "NEWWRITE pane-sessions", "NEWCLEAN pane-sessions"))
+local written = io.open(tmp, "r")
+local settings = wezterm.json_parse(written:read("*a"))
+written:close()
+os.remove(tmp)
+local stop_commands = {}
+for _, entry in ipairs(settings.hooks.Stop) do
+	for _, h in ipairs(entry.hooks or {}) do
+		table.insert(stop_commands, h.command)
+	end
+end
+check("unrelated hook survives", stop_commands[1], "play-a-sound")
+check("stale hook replaced, not stacked", #stop_commands, 2)
+check("stop hook is the new one", stop_commands[2], "NEWWRITE pane-sessions")
+check("session end registered", settings.hooks.SessionEnd[1].hooks[1].command, "NEWCLEAN pane-sessions")
+truthy("session end skips clear/resume", settings.hooks.SessionEnd[1].matcher:find("prompt_input_exit") ~= nil)
+check("session end excludes clear", settings.hooks.SessionEnd[1].matcher:find("clear"), nil)
+
+-- Rewriting the whole file means unparseable input must abort, not be treated
+-- as empty and silently discard everything the user had configured.
+local broken = (os.getenv("TEMP") or "/tmp") .. "/resurrect-smoke-broken.json"
+local bf = io.open(broken, "w")
+bf:write('{"hooks": {"Stop": [ }}}')
+bf:close()
+check("refuses unparseable settings", ph.configure_pane_session_hooks(broken, "W pane-sessions", "C pane-sessions"), false)
+local after = io.open(broken, "r")
+check("unparseable settings left alone", after:read("*a"), '{"hooks": {"Stop": [ }}}')
+after:close()
+os.remove(broken)
 
 ------------------------------------------------------------- tab_state
 local ts = resurrect.tab_state
