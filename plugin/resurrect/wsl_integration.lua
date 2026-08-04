@@ -148,11 +148,14 @@ local function read_wsl_file(distro, posix_path)
 end
 
 --- Write a file inside a distro, trying each UNC spelling in turn.
+--- Line endings are forced to LF: a shell script with CRLF line endings does
+--- not run, and git's autocrlf can hand us a CRLF copy of this very source file.
 ---@param distro string
 ---@param posix_path string
 ---@param content string
 ---@return boolean success
 local function write_wsl_file(distro, posix_path, content)
+	content = content:gsub("\r\n", "\n")
 	for _, path in ipairs(unc_candidates(distro, posix_path)) do
 		local f = io.open(path, "wb")
 		if f then
