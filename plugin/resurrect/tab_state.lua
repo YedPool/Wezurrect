@@ -220,15 +220,28 @@ pub.process_restore_delay_seconds = 3
 local function inject_scrollback(pane, text)
 	local ok, dims = pcall(pane.get_dimensions, pane)
 	local viewport_rows = (ok and dims and dims.viewport_rows) or 24
-	pane:inject_output(text .. string.rep("\r\n", pub.scrollback_padding_rows(text, viewport_rows)))
+	-- Home the cursor afterwards so the shell starts drawing at the top of the
+	-- blank screen. Without it a shell that writes relative to the cursor (bash
+	-- behind a pty, as opposed to ConPTY's absolute repaints) would start at the
+	-- bottom row and scroll blank lines into the scrollback buffer, between the
+	-- restored history and the new prompt.
+	pane:inject_output(text .. string.rep("\r\n", pub.scrollback_padding_rows(text, viewport_rows)) .. "\27[H")
 end
 
 --- How many newlines must follow injected scrollback to lift its last row above
---- the top of the viewport. That is one per row of text, capped at the viewport
---- height (beyond which the text has already scrolled itself out).
+--- the top of the viewport.
 ---
---- get_lines_as_escapes emits one line per physical row, so counting newlines
---- counts rows and there is no wrapping to reason about.
+--- Always a full viewport, whatever the size of the history. A terminal only
+--- scrolls once the cursor is already on the bottom row, so writing R rows of
+--- text and then N newlines scrolls exactly max(0, R + N - viewport) rows. To
+--- scroll all R rows of history out of view, N must be the viewport height --
+--- padding by the row count instead leaves a short history sitting on screen,
+--- where ConPTY's first repaint erases it.
+---
+--- The count is exact rather than generous on purpose: the padding rows fill the
+--- viewport that the shell is about to draw over, so none of them reach the
+--- scrollback buffer, and scrolling up from the restored prompt lands directly
+--- on the last line of the restored history with no blank gap.
 ---@param text string
 ---@param viewport_rows number
 ---@return number
@@ -236,8 +249,7 @@ function pub.scrollback_padding_rows(text, viewport_rows)
 	if not text or text == "" then
 		return 0
 	end
-	local _, newlines = text:gsub("\n", "")
-	return math.min(newlines + 1, viewport_rows)
+	return viewport_rows
 end
 
 --- Build the `cd` line for a pane that could not be spawned in its saved
@@ -265,6 +277,35 @@ local function build_cd_command(pane_tree)
 		return nil
 	end
 	return "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n"
+end
+
+-- Scroll a restored pane back a page so the history it was given is on screen,
+-- instead of leaving the user looking at an apparently fresh prompt with no clue
+-- that anything was restored. Set to false to keep restored panes at the prompt.
+pub.scroll_to_restored_history = true
+
+--- Park a restored pane one page up, where the last rows of its restored
+--- history are. Typing scrolls back to the prompt, so this costs nothing.
+---
+--- Scheduled after the restore keystrokes rather than alongside the injection:
+--- output arriving in a scrolled-back pane snaps it to the bottom again, and the
+--- shell's reply to the cd lands a moment after we send it.
+---@param pane_id number
+local function park_pane_on_history(pane_id)
+	if not pub.scroll_to_restored_history then
+		return
+	end
+	wezterm.time.call_after(pub.process_restore_delay_seconds + 1, function()
+		local pane = wezterm.mux.get_pane(pane_id)
+		if not pane then
+			return
+		end
+		-- Best effort: a GUI window may not exist yet (or at all, under the
+		-- mux server), and a pane can be closed between scheduling and firing.
+		pcall(function()
+			pane:window():gui_window():perform_action(wezterm.action.ScrollByPage(-1), pane)
+		end)
+	end)
 end
 
 --- Resolve the command that re-launches the process a pane was running, or nil
@@ -313,11 +354,14 @@ function pub.default_on_pane_restore(pane_tree)
 		return
 	end
 
+	local pane_id = pane_tree.pane:pane_id()
+
 	-- Scrollback goes in immediately, while the pane is still blank, so that the
 	-- shell's own opening output lands beneath it. Keystrokes cannot: the shell
 	-- is not ready to read them yet.
 	if text and text ~= "" then
 		inject_scrollback(pane_tree.pane, text)
+		park_pane_on_history(pane_id)
 	end
 
 	if not (restore_cmd or cd_cmd) then
@@ -327,7 +371,6 @@ function pub.default_on_pane_restore(pane_tree)
 	-- Everything typed into the pane happens in one delayed callback so it lands
 	-- after the shell has drawn its first prompt (see
 	-- process_restore_delay_seconds) and in a deterministic order.
-	local pane_id = pane_tree.pane:pane_id()
 	wezterm.time.call_after(pub.process_restore_delay_seconds, function()
 		local pane = wezterm.mux.get_pane(pane_id)
 		if not pane then

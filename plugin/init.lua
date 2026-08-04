@@ -42,6 +42,7 @@ init()
 --- Options (all optional):
 ---   periodic_interval    = 300    -- seconds between periodic saves
 ---   restore_delay        = 3      -- seconds to wait before sending restore commands
+---   scroll_to_history    = true   -- park restored panes on their restored scrollback
 ---   save_workspaces      = true
 ---   save_windows         = true
 ---   save_tabs            = true
@@ -105,6 +106,12 @@ function pub.setup(config, opts)
 	-- Restore delay for process commands (shells need time to init)
 	if opts.restore_delay then
 		pub.tab_state.process_restore_delay_seconds = opts.restore_delay
+	end
+
+	-- Park restored panes on their restored history rather than at a prompt that
+	-- looks like nothing happened.
+	if opts.scroll_to_history ~= nil then
+		pub.tab_state.scroll_to_restored_history = opts.scroll_to_history
 	end
 
 	-- Restore on startup: show instance selector if saved instances exist,

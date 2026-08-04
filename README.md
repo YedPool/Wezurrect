@@ -113,6 +113,7 @@ All options are optional. Defaults are shown below:
 resurrect.setup(config, {
   periodic_interval    = 300,   -- seconds between periodic saves (default: 5 min)
   restore_delay        = 3,     -- seconds to wait before sending restore commands
+  scroll_to_history    = true,  -- park restored panes on their restored scrollback
   save_workspaces      = true,  -- save workspace state
   save_windows         = true,  -- save window state
   save_tabs            = true,  -- save tab state
