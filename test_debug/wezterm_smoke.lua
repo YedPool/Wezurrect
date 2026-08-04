@@ -115,6 +115,28 @@ check("session end registered", settings.hooks.SessionEnd[1].hooks[1].command, "
 truthy("session end skips clear/resume", settings.hooks.SessionEnd[1].matcher:find("prompt_input_exit") ~= nil)
 check("session end excludes clear", settings.hooks.SessionEnd[1].matcher:find("clear"), nil)
 
+-- setup() runs on every launch and config reload, so an unchanged file must not
+-- be rewritten -- a stale read written back would undo an edit Claude Code made
+-- to settings.json in the meantime.
+local stable = (os.getenv("TEMP") or "/tmp") .. "/resurrect-smoke-stable.json"
+local sf = io.open(stable, "w")
+sf:write("{}")
+sf:close()
+ph.configure_pane_session_hooks(stable, "W pane-sessions", "C pane-sessions")
+local first = io.open(stable, "r")
+local first_text = first:read("*a")
+first:close()
+-- Mark the file so a rewrite is detectable even if it would be byte-identical.
+local marked = io.open(stable, "w")
+marked:write(first_text .. "\n")
+marked:close()
+ph.configure_pane_session_hooks(stable, "W pane-sessions", "C pane-sessions")
+local second = io.open(stable, "r")
+local second_text = second:read("*a")
+second:close()
+os.remove(stable)
+check("unchanged hooks are not rewritten", second_text, first_text .. "\n")
+
 -- Rewriting the whole file means unparseable input must abort, not be treated
 -- as empty and silently discard everything the user had configured.
 local broken = (os.getenv("TEMP") or "/tmp") .. "/resurrect-smoke-broken.json"

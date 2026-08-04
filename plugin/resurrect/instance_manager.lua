@@ -911,10 +911,57 @@ end
 -- Startup integration
 -- ---------------------------------------------------------------------------
 
+-- What to do at gui-startup when saved instances exist:
+--   "prompt"  show the instance selector (default)
+--   "latest"  restore the newest instance that is not this process's own
+--   false     do nothing; Alt+R still works
+pub.auto_restore_mode = "prompt"
+
+--- Is another WezTerm GUI already running?
+---
+--- Without a mux server each `wezterm` launch is its own GUI process with its
+--- own gui-startup, so "latest" would otherwise reopen, in the second window,
+--- the very session already on screen in the first. Counting GUI processes is
+--- the signal available at startup: the state files cannot tell a running
+--- instance apart from one that crashed.
+---@return boolean
+function pub.another_gui_is_running()
+	local ok, out
+	if utils.is_windows then
+		ok, out = utils.exec({
+			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
+			"(Get-Process wezterm-gui -ErrorAction SilentlyContinue | Measure-Object).Count",
+		})
+	else
+		ok, out = utils.exec({ "sh", "-c", "pgrep -c wezterm-gui 2>/dev/null || echo 0" })
+	end
+	if not ok or not out then
+		return false
+	end
+	local count = tonumber(out:match("%d+"))
+	-- One of them is us. Anything more means a WezTerm was already open.
+	return count ~= nil and count > 1
+end
+
+--- The newest saved instance that is not the one this process is writing.
+---
+--- The exclusion matters: by the time the startup restore runs, event-driven
+--- save has already written this process's own instance -- a single blank tab --
+--- and it sorts to the top as the most recently saved thing there is.
+---@return table|nil entry
+function pub.latest_other_instance()
+	for _, entry in ipairs(pub.list_instances()) do
+		if entry.instance_id ~= pub.instance_id then
+			return entry
+		end
+	end
+	return nil
+end
+
 --- Auto-restore callback for gui-startup.
 --- 1. Cleans up old instances
---- 2. If instances exist and auto_restore_prompt: spawns window + shows selector
---- 3. If no instances: falls back to state_manager.resurrect_on_gui_startup()
+--- 2. If no instances: falls back to state_manager.resurrect_on_gui_startup()
+--- 3. Otherwise honours auto_restore_mode: restore the latest, or prompt
 function pub.auto_restore_on_startup()
 	pub.cleanup_old_instances()
 
@@ -926,8 +973,13 @@ function pub.auto_restore_on_startup()
 		return
 	end
 
-	if not pub.auto_restore_prompt then
-		-- User disabled auto-prompt; they can use Alt+R manually
+	-- Legacy switch, still honoured for configs that set it directly
+	if pub.auto_restore_prompt == false then
+		return
+	end
+	local mode = pub.auto_restore_mode
+	if mode == false or mode == nil then
+		-- User disabled startup restore; they can use Alt+R manually
 		return
 	end
 
@@ -938,16 +990,29 @@ function pub.auto_restore_on_startup()
 
 	wezterm.time.call_after(1, function()
 		local gui_windows = wezterm.gui.gui_windows()
-		if #gui_windows > 0 then
-			local gui_win = gui_windows[1]
-			local active_pane = gui_win:active_pane()
-			local restore_opts = {
-				relative = true,
-				restore_text = true,
-				on_pane_restore = require("resurrect.tab_state").default_on_pane_restore,
-			}
-			pub.show_instance_selector(gui_win, active_pane, restore_opts)
+		if #gui_windows == 0 then
+			return
 		end
+		local gui_win = gui_windows[1]
+		local active_pane = gui_win:active_pane()
+		local restore_opts = {
+			relative = true,
+			restore_text = true,
+			on_pane_restore = require("resurrect.tab_state").default_on_pane_restore,
+		}
+
+		-- Only the first WezTerm restores automatically. A second one would
+		-- duplicate the session already open in the first, so it gets the
+		-- selector instead and the user picks what they actually want.
+		if mode == "latest" and not pub.another_gui_is_running() then
+			local target = pub.latest_other_instance()
+			if target then
+				restore_instances({ target.instance_id }, gui_win, active_pane, restore_opts)
+				return
+			end
+		end
+
+		pub.show_instance_selector(gui_win, active_pane, restore_opts)
 	end)
 end
 

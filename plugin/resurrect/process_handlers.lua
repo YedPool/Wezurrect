@@ -403,6 +403,31 @@ local SESSION_END_MATCHER = "prompt_input_exit|logout|bypass_permissions_disable
 --- hook command change between plugin versions. The key expression is part of
 --- the command, so a stale hook writing under an old key would silently stop
 --- matching what the save path looks for.
+--- Every pane-session hook currently configured, as a sorted, comparable list.
+--- Used to skip the write when nothing would change: setup() runs on every
+--- WezTerm launch and config reload, and rewriting settings.json each time would
+--- eventually clobber an edit Claude Code made to it in the meantime.
+---@param settings table parsed settings.json
+---@return string[] sorted signatures
+local function pane_session_hook_signatures(settings)
+	local found = {}
+	if type(settings.hooks) == "table" then
+		for event_name, entries in pairs(settings.hooks) do
+			if type(entries) == "table" then
+				for _, entry in ipairs(entries) do
+					for _, hook in ipairs(entry.hooks or {}) do
+						if hook.command and hook.command:find("pane%-sessions") then
+							table.insert(found, event_name .. "\0" .. tostring(entry.matcher) .. "\0" .. hook.command)
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(found)
+	return found
+end
+
 ---@param settings table parsed settings.json, mutated in place
 local function strip_pane_session_hooks(settings)
 	if type(settings.hooks) ~= "table" then
@@ -466,6 +491,8 @@ function pub.configure_pane_session_hooks(target_settings_path, hook_command, cl
 		end
 	end
 
+	local before = table.concat(pane_session_hook_signatures(settings), "\1")
+
 	-- Replace rather than append: see strip_pane_session_hooks for why.
 	strip_pane_session_hooks(settings)
 
@@ -495,6 +522,12 @@ function pub.configure_pane_session_hooks(target_settings_path, hook_command, cl
 	-- SessionEnd: forgets the pane so a closed Claude is not resurrected.
 	if cleanup_command then
 		add("SessionEnd", SESSION_END_MATCHER, cleanup_command)
+	end
+
+	-- Already exactly right: leave the file alone rather than rewrite it on
+	-- every launch, where a stale read could undo a change made meanwhile.
+	if before == table.concat(pane_session_hook_signatures(settings), "\1") then
+		return true
 	end
 
 	-- Write directly (not atomic rename -- os.rename fails on Windows

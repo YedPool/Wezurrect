@@ -3,6 +3,10 @@ local dev = wezterm.plugin.require("https://github.com/chrisgve/dev.wezterm")
 
 local pub = {}
 
+-- Set once the command event handlers have been registered with wezterm.on, so
+-- a second setup() call does not stack duplicate handlers on the same events.
+local _commands_registered = false
+
 local function init()
 	-- enable_sub_modules()
 	local opts = {
@@ -49,7 +53,9 @@ init()
 ---   keybindings          = true   -- add Alt+S/R/W/Shift+W/Shift+T + Ctrl+Shift+B bindings
 ---   status_bar           = true   -- show save time + tab titles in right status
 ---   claude_hooks         = true   -- auto-configure Claude Code SessionStart hook
----   auto_restore_prompt  = true   -- show instance selector on startup if saved instances exist
+---   command_palette      = true   -- add labelled entries to the command palette
+---   auto_restore         = "prompt" -- "prompt" | "latest" | false, see below
+---   auto_restore_prompt  = true   -- older spelling of auto_restore = false
 ---   retention_days       = 7      -- auto-delete instance states older than this
 ---   wsl_integration      = true   -- auto-install cwd + Claude session reporting into WSL distros
 ---   wsl_integration_delay = 10    -- seconds to wait after startup before doing so
@@ -65,7 +71,15 @@ function pub.setup(config, opts)
 	-- Initialize per-instance state management
 	pub.instance_manager.init_instance_id()
 	pub.instance_manager.retention_days = opts.retention_days or 7
-	pub.instance_manager.auto_restore_prompt = opts.auto_restore_prompt ~= false
+
+	-- auto_restore: what the first window does when saved instances exist.
+	-- auto_restore_prompt = false is the older spelling of auto_restore = false.
+	local auto_restore = opts.auto_restore
+	if auto_restore == nil then
+		auto_restore = (opts.auto_restore_prompt == false) and false or "prompt"
+	end
+	pub.instance_manager.auto_restore_mode = auto_restore
+	pub.instance_manager.auto_restore_prompt = auto_restore ~= false
 
 	-- Claude Code session hook setup (idempotent)
 	if opts.claude_hooks ~= false then
@@ -190,7 +204,7 @@ function pub.setup(config, opts)
 		end)
 	end
 
-	-- Keybindings for manual save/restore
+	-- Keybindings and command palette entries for manual save/restore
 	if opts.keybindings ~= false then
 		local restore_opts = {
 			relative = true,
@@ -198,60 +212,108 @@ function pub.setup(config, opts)
 			on_pane_restore = pub.tab_state.default_on_pane_restore,
 		}
 
+		-- Each command is a named event rather than a wezterm.action_callback.
+		-- The command palette derives its label from the action, and for an
+		-- action_callback that reads "Emit event `user-defined-3`" -- a number
+		-- that depends on registration order and says nothing about what the
+		-- command does. A named event at least reads as itself, and the
+		-- augment-command-palette entries below give each one a real label.
+		local commands = {
+			{
+				event = "resurrect.save-workspace",
+				key = "w",
+				mods = "ALT",
+				brief = "Resurrect: Save workspace",
+				icon = "md_content_save",
+				run = function()
+					pub.state_manager.save_state(pub.workspace_state.get_workspace_state())
+				end,
+			},
+			{
+				event = "resurrect.save-window",
+				key = "W",
+				mods = "ALT|SHIFT",
+				brief = "Resurrect: Save window (prompts for a name)",
+				icon = "md_window_restore",
+				run = function(win, pane)
+					win:perform_action(pub.window_state.save_window_action(), pane)
+				end,
+			},
+			{
+				event = "resurrect.save-tab",
+				key = "T",
+				mods = "ALT|SHIFT",
+				brief = "Resurrect: Save tab (prompts for a name)",
+				icon = "md_tab",
+				run = function(win, pane)
+					win:perform_action(pub.tab_state.save_tab_action(), pane)
+				end,
+			},
+			{
+				event = "resurrect.save-all",
+				key = "s",
+				mods = "ALT",
+				brief = "Resurrect: Save everything now",
+				icon = "md_content_save_all",
+				run = function()
+					pub.state_manager.save_workspace_full()
+					wezterm.emit("resurrect.save.finished")
+				end,
+			},
+			{
+				event = "resurrect.restore",
+				key = "r",
+				mods = "ALT",
+				brief = "Resurrect: Restore a saved session",
+				icon = "md_restore",
+				run = function(win, pane)
+					pub.instance_manager.show_instance_selector(win, pane, restore_opts)
+				end,
+			},
+			{
+				event = "resurrect.break-pane-into-window",
+				key = "b",
+				mods = "CTRL|SHIFT",
+				brief = "Resurrect: Move pane into its own window",
+				icon = "md_open_in_new",
+				run = function(_, pane)
+					pane:move_to_new_window()
+				end,
+			},
+		}
+
 		config.keys = config.keys or {}
+		for _, command in ipairs(commands) do
+			table.insert(config.keys, {
+				key = command.key,
+				mods = command.mods,
+				action = wezterm.action.EmitEvent(command.event),
+			})
+		end
 
-		-- Alt+W: save workspace
-		table.insert(config.keys, {
-			key = "w",
-			mods = "ALT",
-			action = wezterm.action_callback(function(win, pane)
-				pub.state_manager.save_state(
-					pub.workspace_state.get_workspace_state()
-				)
-			end),
-		})
+		-- Guarded like event_driven_save: handlers registered here would
+		-- otherwise stack up if setup() runs more than once, and every keypress
+		-- would fire the command once per registration.
+		if not _commands_registered then
+			_commands_registered = true
+			for _, command in ipairs(commands) do
+				wezterm.on(command.event, command.run)
+			end
 
-		-- Alt+Shift+W: save window
-		table.insert(config.keys, {
-			key = "W",
-			mods = "ALT|SHIFT",
-			action = pub.window_state.save_window_action(),
-		})
-
-		-- Alt+Shift+T: save tab
-		table.insert(config.keys, {
-			key = "T",
-			mods = "ALT|SHIFT",
-			action = pub.tab_state.save_tab_action(),
-		})
-
-		-- Alt+S: full save (workspace + instance + status bar update)
-		table.insert(config.keys, {
-			key = "s",
-			mods = "ALT",
-			action = wezterm.action_callback(function(win, pane)
-				pub.state_manager.save_workspace_full()
-				wezterm.emit("resurrect.save.finished")
-			end),
-		})
-
-		-- Alt+R: show instance selector (with fallthrough to named saves)
-		table.insert(config.keys, {
-			key = "r",
-			mods = "ALT",
-			action = wezterm.action_callback(function(win, pane)
-				pub.instance_manager.show_instance_selector(win, pane, restore_opts)
-			end),
-		})
-
-		-- Ctrl+Shift+B: break the active pane out into a new window
-		table.insert(config.keys, {
-			key = "b",
-			mods = "CTRL|SHIFT",
-			action = wezterm.action_callback(function(win, pane)
-				pane:move_to_new_window()
-			end),
-		})
+			if opts.command_palette ~= false then
+				wezterm.on("augment-command-palette", function()
+					local entries = {}
+					for _, command in ipairs(commands) do
+						table.insert(entries, {
+							brief = command.brief,
+							icon = command.icon,
+							action = wezterm.action.EmitEvent(command.event),
+						})
+					end
+					return entries
+				end)
+			end
+		end
 	end
 end
 
