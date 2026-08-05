@@ -15,8 +15,14 @@ function pub.get_window_state(window, opts)
 		tabs = {},
 	}
 
+	-- Every save carries geometry, but only the ones that ask for it pay to read
+	-- it fresh. The rest reuse the last value seen, so a save triggered by
+	-- opening a tab does not erase the position a periodic save recorded.
+	local window_geometry = require("resurrect.window_geometry")
 	if opts and opts.capture_geometry then
-		window_state.geometry = require("resurrect.window_geometry").capture()
+		window_state.geometry = window_geometry.capture()
+	else
+		window_state.geometry = window_geometry.last_known()
 	end
 
 	local tabs = window:tabs_with_info()

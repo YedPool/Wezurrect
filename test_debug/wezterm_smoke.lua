@@ -222,6 +222,19 @@ truthy("geometry never sets a size", not geom._test.SCRIPT:find("set_inner_size"
 truthy("apply tolerates nil geometry", pcall(geom.apply, nil, nil))
 truthy("apply tolerates a dead window", pcall(geom.apply, nil, { x = 1, y = 2, maximized = true }))
 
+-- Saves that do not pay for a capture must still carry the last geometry seen,
+-- or opening a tab would erase the position the last periodic save recorded.
+geom._test.reset()
+geom.enabled = true
+check("nothing known before a capture", geom.last_known(), nil)
+geom.apply(nil, { x = 7, y = 9, maximized = true })
+local remembered = geom.last_known()
+check("restoring seeds what is known", remembered and remembered.x, 7)
+check("...including maximized", remembered and remembered.maximized, true)
+geom.enabled = false
+check("nothing known while disabled", geom.last_known(), nil)
+geom._test.reset()
+
 -------------------------------------------------- powershell_integration
 local psi = resurrect.powershell_integration
 truthy("ps snippet emits osc7", psi._test.INTEGRATION_SCRIPT:find("%]7;file://") ~= nil)

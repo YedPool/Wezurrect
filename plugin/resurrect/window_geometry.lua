@@ -88,6 +88,14 @@ $r = $placement.rcNormalPosition
 local MEMO_SECONDS = 2
 local memo = { at = nil, value = nil }
 
+-- The last geometry this process saw, with no expiry.
+--
+-- Most saves are event-driven and deliberately do not pay for a capture. Without
+-- somewhere to remember the answer they would each write a state with no
+-- geometry in it, so opening a tab would quietly erase the position that the
+-- last periodic save recorded -- and closing before the next one would lose it.
+local last_known = nil
+
 ---@return string|nil script_path
 ---@return string|nil assembly_path
 local function ensure_script()
@@ -169,7 +177,21 @@ function pub.capture()
 	end
 
 	memo.at, memo.value = now, geometry
+	-- Only on success: a capture declined because two windows are open says
+	-- nothing about where the window was, and must not erase what we knew.
+	if geometry then
+		last_known = geometry
+	end
 	return geometry
+end
+
+--- The most recent geometry seen, for saves that do not pay for a capture.
+---@return table|nil
+function pub.last_known()
+	if not pub.enabled then
+		return nil
+	end
+	return last_known
 end
 
 --- Put a restored window back where it was.
@@ -178,7 +200,13 @@ end
 ---@param gui_window any GuiWindow
 ---@param geometry table|nil
 function pub.apply(gui_window, geometry)
-	if not geometry or not gui_window then
+	if not geometry then
+		return
+	end
+	-- Seed what we know from what we just restored, so the saves before the
+	-- first capture of this process carry it forward rather than dropping it.
+	last_known = geometry
+	if not gui_window then
 		return
 	end
 	if geometry.x and geometry.y then
@@ -196,8 +224,9 @@ end
 -- Expose internals for unit testing only
 pub._test = {
 	SCRIPT = SCRIPT,
-	reset_memo = function()
+	reset = function()
 		memo.at, memo.value = nil, nil
+		last_known = nil
 	end,
 }
 
