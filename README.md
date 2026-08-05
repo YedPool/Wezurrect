@@ -124,8 +124,9 @@ resurrect.setup(config, {
   auto_restore_prompt  = true,  -- show instance selector on startup if saved instances
                                 -- exist (deprecated; superseded by auto_restore)
   retention_days       = 7,     -- auto-delete instance states older than this many days
+  powershell_integration = true, -- auto-install cwd reporting into PowerShell profiles (Windows)
   wsl_integration      = true,  -- auto-install cwd + Claude reporting into WSL distros (Windows)
-  wsl_integration_delay = 10,   -- seconds after startup before doing so
+  wsl_integration_delay = 10,   -- seconds after startup before either
 })
 ```
 
@@ -158,6 +159,37 @@ Every WezTerm window follows `auto_restore`, with one exception: under
 instead of restoring, so you do not get a second copy of the session already on
 screen.
 
+### Working directories (Windows)
+
+A pane is restored into the directory it was saved in, which requires the shell
+to have told WezTerm where it was. Neither of the shells Windows users get does
+that by default:
+
+- **PowerShell** `Set-Location` moves only PowerShell's own provider location.
+  The process working directory -- the one Windows reports, and all WezTerm can
+  read unaided -- never leaves the directory the shell started in.
+- **WSL** shells run inside the VM, which Windows cannot see into at all.
+
+Both are fixed the same way, by [OSC 7][osc7], and `setup()` installs it for you
+ten seconds after startup:
+
+- `~/.config/wezterm-resurrect/integration.ps1`, dot-sourced from a guarded
+  block at the end of `$PROFILE.CurrentUserAllHosts`, for each PowerShell found.
+  It wraps whatever prompt function is already defined rather than replacing it.
+- The equivalent inside each WSL distribution â€” see below.
+
+Both are idempotent and run once per profile or distro. They apply to **newly
+opened** panes; a shell already running has not loaded them. Set
+`powershell_integration = false` or `wsl_integration = false` to opt out, or if
+you already have shell integration configured.
+
+The symptom, if this is missing, is a restored session where every tab lands
+correctly except the first, which snaps back to the default directory. Panes a
+restore spawns are launched in the right directory by WezTerm itself; the one it
+reuses has to be told, and it can only be told what was recorded.
+
+[osc7]: https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/prompts.md
+
 ### WSL panes (Windows)
 
 WSL tabs restore their scrollback, working directory and Claude Code sessions
@@ -189,7 +221,6 @@ already running have not sourced it. Pass `wsl_integration = false` to opt out â
 WSL scrollback still restores, but the working directory falls back to whatever
 Windows can see.
 
-[osc7]: https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/prompts.md
 
 ## Advanced Setup (Manual Configuration)
 

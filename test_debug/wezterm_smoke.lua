@@ -207,6 +207,40 @@ check("unc fallback", cands[2], "\\\\wsl$\\Ubuntu-22.04\\home\\me\\.bashrc")
 truthy("snippet has osc7", wi._test.INTEGRATION_SCRIPT:find("]7;file://") ~= nil)
 truthy("snippet publishes shell id", wi._test.INTEGRATION_SCRIPT:find("SetUserVar=resurrect_shell_id") ~= nil)
 
+-------------------------------------------------- powershell_integration
+local psi = resurrect.powershell_integration
+truthy("ps snippet emits osc7", psi._test.INTEGRATION_SCRIPT:find("%]7;file://") ~= nil)
+truthy("ps snippet wraps the existing prompt", psi._test.INTEGRATION_SCRIPT:find("__WeztermResurrectInnerPrompt") ~= nil)
+truthy("ps snippet guards re-sourcing", psi._test.INTEGRATION_SCRIPT:find("__WeztermResurrectInstalled") ~= nil)
+truthy("ps block dot-sources the snippet", psi.profile_block("C:\\x\\y.ps1"):find(". 'C:\\x\\y.ps1'", 1, true) ~= nil)
+-- PowerShell escapes a quote inside a single-quoted string by doubling it.
+truthy("ps block escapes quotes", psi.profile_block("C:\\it's\\y.ps1"):find("it''s", 1, true) ~= nil)
+
+-- Appending to a profile must be idempotent: setup() runs on every launch, and
+-- a second copy of the block would wrap the prompt twice.
+local prof = (os.getenv("TEMP") or "/tmp") .. "/resurrect-smoke-profile.ps1"
+local pf = io.open(prof, "wb")
+pf:write("Set-Alias ll Get-ChildItem\n")
+pf:close()
+truthy("ps profile patched", psi.ensure_profile_sources(prof, "C:\\snippet.ps1"))
+truthy("ps profile patched again", psi.ensure_profile_sources(prof, "C:\\snippet.ps1"))
+local pr = io.open(prof, "rb")
+local profile_text = pr:read("*a")
+pr:close()
+os.remove(prof)
+-- Counted with plain finds: the marker contains a dash, which is a quantifier
+-- in a Lua pattern and would silently never match.
+local block_count, at = 0, 1
+while true do
+	local found = profile_text:find(psi._test.PROFILE_BEGIN, at, true)
+	if not found then
+		break
+	end
+	block_count, at = block_count + 1, found + 1
+end
+check("ps block added exactly once", block_count, 1)
+truthy("ps profile keeps what was there", profile_text:find("Set-Alias ll", 1, true) ~= nil)
+
 local distro = os.getenv("RESURRECT_SMOKE_DISTRO")
 if distro then
 	local home = os.getenv("RESURRECT_SMOKE_HOME") or ("/home/" .. (os.getenv("USERNAME") or "user"))

@@ -33,6 +33,7 @@ local function init()
 	pub.process_handlers = require("resurrect.process_handlers")
 	pub.instance_manager = require("resurrect.instance_manager")
 	pub.wsl_integration = require("resurrect.wsl_integration")
+	pub.powershell_integration = require("resurrect.powershell_integration")
 end
 
 init()
@@ -56,8 +57,9 @@ init()
 ---   auto_restore         = "prompt" -- "prompt" | "latest" | false, see below
 ---   auto_restore_prompt  = true   -- older spelling of auto_restore = false
 ---   retention_days       = 7      -- auto-delete instance states older than this
+---   powershell_integration = true -- auto-install cwd reporting into PowerShell profiles
 ---   wsl_integration      = true   -- auto-install cwd + Claude session reporting into WSL distros
----   wsl_integration_delay = 10    -- seconds to wait after startup before doing so
+---   wsl_integration_delay = 10    -- seconds to wait after startup before either
 ---
 ---@param config table wezterm config_builder object
 ---@param opts? table optional overrides
@@ -107,10 +109,18 @@ function pub.setup(config, opts)
 			pcall(pub.process_handlers.sweep_pane_sessions, retention_days)
 		end
 
-		-- WSL panes cannot report their working directory or their Claude
-		-- sessions to Windows on their own; install the shell integration that
-		-- lets them. Idempotent, and a marker file means it only actually runs
-		-- once per distro.
+		-- Neither PowerShell nor a WSL shell reports its working directory to
+		-- WezTerm on its own, so a pane the user has cd'd around in is saved as
+		-- still sitting where its shell started. Install the shell integration
+		-- that closes that. Both are idempotent, and marker files mean they only
+		-- actually run once per profile or distro.
+		if opts.powershell_integration ~= false then
+			local ok, err = pcall(pub.powershell_integration.ensure_installed, marker_dir)
+			if not ok then
+				wezterm.log_error("resurrect: PowerShell integration setup failed: " .. tostring(err))
+			end
+		end
+
 		if opts.wsl_integration ~= false then
 			local ok, err = pcall(pub.wsl_integration.ensure_installed, marker_dir)
 			if not ok then
