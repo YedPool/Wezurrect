@@ -230,6 +230,9 @@ local geom = resurrect.window_geometry
 check("geometry is opt-in", geom.enabled, false)
 check("geometry capture is a no-op when off", geom.capture(), nil)
 truthy("geometry script reads placement", geom._test.SCRIPT:find("GetWindowPlacement") ~= nil)
+-- Written back through the same struct it was read from, so Windows resolves
+-- the monitor and its scaling instead of us guessing at coordinates.
+truthy("geometry script writes placement", geom._test.SCRIPT:find("SetWindowPlacement") ~= nil)
 truthy("geometry script caches its assembly", geom._test.SCRIPT:find("OutputAssembly") ~= nil)
 -- The rect Windows reports is the outer window; set_inner_size takes the inner
 -- one. Feeding the first into the second would grow the window by its frame on

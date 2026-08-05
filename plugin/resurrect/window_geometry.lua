@@ -26,17 +26,27 @@ pub.enabled = false
 pub.cache_dir = nil
 
 -- Bump when SCRIPT changes so a stale copy on disk is replaced.
-local SCRIPT_VERSION = 1
+-- v2 added the apply mode and SetWindowPlacement.
+local SCRIPT_VERSION = 2
 
 local SCRIPT = [==[
-param([string]$AssemblyPath)
+param(
+    [string]$AssemblyPath,
+    [switch]$Apply,
+    [int]$Left = 0, [int]$Top = 0, [int]$Right = 0, [int]$Bottom = 0, [int]$ShowCmd = 0
+)
 
-# Prints "<left> <top> <right> <bottom> <showCmd>" for the main WezTerm window,
-# or exits non-zero when there is not one to read.
+# Without -Apply: prints "<left> <top> <right> <bottom> <showCmd>" for the main
+# WezTerm window, or exits non-zero when there is not one to read.
+# With -Apply: hands those five numbers straight back to Windows.
 #
 # showCmd: 1 normal, 2 minimized, 3 maximized. The rect is rcNormalPosition --
 # where the window sits when it is not maximized -- which is the only sensible
 # thing to remember for a window that is.
+#
+# Reading and writing through the same struct is the point. Windows decides for
+# itself which monitor the rect belongs to and how it scales there, so nothing
+# has to reason about virtual desktop coordinates or per-monitor DPI.
 
 $source = @"
 using System;
@@ -49,6 +59,7 @@ public struct WINDOWPLACEMENT {
 }
 public static class WeztermResurrectWin32 {
   [DllImport("user32.dll")] public static extern bool GetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
+  [DllImport("user32.dll")] public static extern bool SetWindowPlacement(IntPtr hWnd, ref WINDOWPLACEMENT lpwndpl);
 }
 "@
 
@@ -74,6 +85,18 @@ if (-not $proc) { exit 1 }
 $placement = New-Object WINDOWPLACEMENT
 $placement.length = [System.Runtime.InteropServices.Marshal]::SizeOf($placement)
 if (-not [WeztermResurrectWin32]::GetWindowPlacement($proc.MainWindowHandle, [ref]$placement)) { exit 1 }
+
+if ($Apply) {
+    $rect = New-Object RECT
+    $rect.Left = $Left; $rect.Top = $Top; $rect.Right = $Right; $rect.Bottom = $Bottom
+    $placement.rcNormalPosition = $rect
+    # Never restore a window minimized: it was saved that way, but reopening to
+    # nothing visible reads as a failure to open at all.
+    $placement.showCmd = if ($ShowCmd -eq 3) { 3 } else { 1 }
+    if (-not [WeztermResurrectWin32]::SetWindowPlacement($proc.MainWindowHandle, [ref]$placement)) { exit 1 }
+    "applied"
+    exit 0
+}
 
 $r = $placement.rcNormalPosition
 "$($r.Left) $($r.Top) $($r.Right) $($r.Bottom) $($placement.showCmd)"
@@ -195,9 +218,19 @@ function pub.last_known()
 end
 
 --- Put a restored window back where it was.
---- Best effort throughout: every one of these can fail on a window that is
---- closing, and none of them is worth losing a restore over.
----@param gui_window any GuiWindow
+---
+--- Handed back to Windows through SetWindowPlacement rather than applied with
+--- WezTerm's own set_position and maximize. Mixing the two does not work: the
+--- rect came out of GetWindowPlacement in Windows' coordinates, and feeding
+--- those to set_position -- which has its own idea of scaling -- lands the
+--- window near the right monitor but offset across it, and a maximize that
+--- follows a position it disagrees with does not snap to the screen. Giving
+--- Windows back the exact struct it produced sidesteps the whole question of
+--- virtual desktop coordinates and per-monitor DPI.
+---
+--- Best effort: a window can be closing, and none of this is worth losing a
+--- restore over.
+---@param gui_window any GuiWindow, unused on Windows but kept for other platforms
 ---@param geometry table|nil
 function pub.apply(gui_window, geometry)
 	if not geometry then
@@ -206,19 +239,29 @@ function pub.apply(gui_window, geometry)
 	-- Seed what we know from what we just restored, so the saves before the
 	-- first capture of this process carry it forward rather than dropping it.
 	last_known = geometry
-	if not gui_window then
+
+	if not pub.enabled or not utils.is_windows then
 		return
 	end
-	if geometry.x and geometry.y then
-		pcall(function()
-			gui_window:set_position(geometry.x, geometry.y)
-		end)
+	if not (geometry.x and geometry.y and geometry.outer_width and geometry.outer_height) then
+		return
 	end
-	if geometry.maximized then
-		pcall(function()
-			gui_window:maximize()
-		end)
+
+	local script_path, assembly_path = ensure_script()
+	if not script_path then
+		return
 	end
+
+	pcall(utils.exec, {
+		"powershell.exe", "-NoProfile", "-NoLogo", "-File", script_path,
+		"-AssemblyPath", assembly_path,
+		"-Apply",
+		"-Left", tostring(geometry.x),
+		"-Top", tostring(geometry.y),
+		"-Right", tostring(geometry.x + geometry.outer_width),
+		"-Bottom", tostring(geometry.y + geometry.outer_height),
+		"-ShowCmd", geometry.maximized and "3" or "1",
+	})
 end
 
 -- Expose internals for unit testing only

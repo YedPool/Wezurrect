@@ -33,8 +33,10 @@ function pub.restore_workspace(workspace_state, opts)
 			if resize == nil then
 				resize = pub.resize_window_default
 			end
-			-- inner size is in pixels
-			if resize and not (geometry and geometry.maximized) then
+			-- inner size is in pixels. Skipped entirely when we have geometry:
+			-- that restores the outer rect the window actually had, so letting
+			-- this run first would only resize it twice.
+			if resize and not geometry then
 				opts.window:gui_window():set_inner_size(window_state.size.pixel_width, window_state.size.pixel_height)
 			end
 			require("resurrect.window_geometry").apply(opts.window:gui_window(), geometry)
