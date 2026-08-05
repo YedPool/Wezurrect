@@ -155,12 +155,8 @@ equivalent for `"latest"`. If you set both, `auto_restore` wins.
 
 Every WezTerm window follows `auto_restore`, with one exception: under
 `"latest"`, a WezTerm launched while another is already open shows the selector
-instead of restoring. Auto-restoring there would reopen the session already on
-screen in the first window, which is never what you want; the selector lets you
-pick something else, or dismiss it with `Esc` for a fresh terminal. `false` still
-means no prompt anywhere. Whether another WezTerm is running is detected by
-counting `wezterm-gui` processes; with a mux server configured, a second launch
-attaches to the existing process and none of this runs at all.
+instead of restoring, so you do not get a second copy of the session already on
+screen.
 
 ### WSL panes (Windows)
 

@@ -9,6 +9,15 @@ local pub = {}
 -- when sending cd commands via send_text().
 local is_safe_cwd = utils.is_safe_cwd
 
+-- What "press Enter" is when typing into a pane: a bare carriage return.
+--
+-- Not "\r\n". PSReadLine submits the line on CR and then takes the LF as a
+-- second keypress meaning "insert a newline in the buffer", which leaves
+-- PowerShell sitting at its `>>` continuation prompt. The command does run, but
+-- the shell is left mid-command, and the next thing typed there is swallowed
+-- into that continuation instead of being executed.
+local SUBMIT = "\r"
+
 --- Fill in the domain and cwd of spawn/split arguments for a pane.
 ---
 --- WSL panes deliberately omit cwd. WezTerm resolves a spawn cwd in Windows
@@ -276,22 +285,48 @@ local function build_cd_command(pane_tree)
 		wezterm.log_error("resurrect: rejected suspicious CWD: " .. tostring(cwd))
 		return nil
 	end
-	return "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n"
+	return "cd " .. wezterm.shell_join_args({ cwd }) .. SUBMIT
 end
 
--- Scroll a restored pane back a page so the history it was given is on screen,
--- instead of leaving the user looking at an apparently fresh prompt with no clue
--- that anything was restored. Set to false to keep restored panes at the prompt.
+-- Scroll a restored pane back so the history it was given is on screen, instead
+-- of leaving the user looking at an apparently fresh prompt with no clue that
+-- anything was restored. Set to false to keep restored panes at the prompt.
 pub.scroll_to_restored_history = true
 
---- Park a restored pane one page up, where the last rows of its restored
---- history are. Typing scrolls back to the prompt, so this costs nothing.
+-- Rows of the live screen to keep in view when parking a pane on its history.
+-- Enough for a shell's opening banner and the prompt beneath it, so the pane
+-- still shows where typing will go.
+local LIVE_ROWS_IN_VIEW = 6
+
+--- How far to scroll a restored pane back, in rows.
+---
+--- Not a whole page: a page puts the last row of history on the bottom edge of
+--- the screen and the live prompt one row past it, out of sight, which reads as
+--- a pane with no prompt at all. Stopping LIVE_ROWS_IN_VIEW short leaves the
+--- prompt visible under the history.
+---
+--- Never further than the history is long, either, or a pane restored with only
+--- a few lines scrolls past all of them to the top of the buffer.
+---@param history_rows number rows of scrollback that were injected
+---@param viewport_rows number
+---@return number rows to scroll back, 0 for none
+function pub.history_scroll_rows(history_rows, viewport_rows)
+	local page = viewport_rows - LIVE_ROWS_IN_VIEW
+	if page < 1 or history_rows < 1 then
+		return 0
+	end
+	return math.min(page, history_rows)
+end
+
+--- Park a restored pane on the last rows of its restored history. Typing
+--- scrolls back to the prompt, so this costs nothing.
 ---
 --- Scheduled after the restore keystrokes rather than alongside the injection:
 --- output arriving in a scrolled-back pane snaps it to the bottom again, and the
 --- shell's reply to the cd lands a moment after we send it.
 ---@param pane_id number
-local function park_pane_on_history(pane_id)
+---@param history_rows number
+local function park_pane_on_history(pane_id, history_rows)
 	if not pub.scroll_to_restored_history then
 		return
 	end
@@ -303,7 +338,11 @@ local function park_pane_on_history(pane_id)
 		-- Best effort: a GUI window may not exist yet (or at all, under the
 		-- mux server), and a pane can be closed between scheduling and firing.
 		pcall(function()
-			pane:window():gui_window():perform_action(wezterm.action.ScrollByPage(-1), pane)
+			local dims = pane:get_dimensions()
+			local rows = pub.history_scroll_rows(history_rows, (dims and dims.viewport_rows) or 24)
+			if rows > 0 then
+				pane:window():gui_window():perform_action(wezterm.action.ScrollByLine(-rows), pane)
+			end
 		end)
 	end)
 end
@@ -361,7 +400,8 @@ function pub.default_on_pane_restore(pane_tree)
 	-- is not ready to read them yet.
 	if text and text ~= "" then
 		inject_scrollback(pane_tree.pane, text)
-		park_pane_on_history(pane_id)
+		local _, newlines = text:gsub("\n", "")
+		park_pane_on_history(pane_id, newlines + 1)
 	end
 
 	if not (restore_cmd or cd_cmd) then
@@ -381,7 +421,7 @@ function pub.default_on_pane_restore(pane_tree)
 			pane:send_text(cd_cmd)
 		end
 		if restore_cmd then
-			pane:send_text(restore_cmd .. "\r\n")
+			pane:send_text(restore_cmd .. SUBMIT)
 		end
 	end)
 end

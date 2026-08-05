@@ -176,6 +176,29 @@ check("padding tracks viewport size", ts.scrollback_padding_rows("a\nb", 12), 12
 check("padding empty", ts.scrollback_padding_rows("", 40), 0)
 check("padding nil", ts.scrollback_padding_rows(nil, 40), 0)
 
+-- Parking must stop short of a full page, or the last history row lands on the
+-- bottom edge and the live prompt sits one row past it, out of sight.
+check("park keeps the prompt in view", ts.history_scroll_rows(500, 40), 34)
+-- ...and never scroll past the history into the empty buffer above it.
+check("park stops at the history top", ts.history_scroll_rows(5, 40), 5)
+check("park with no history", ts.history_scroll_rows(0, 40), 0)
+check("park in a tiny pane", ts.history_scroll_rows(500, 4), 0)
+
+-- ------------------------------------------------------- instance_manager
+local im = resurrect.instance_manager
+-- The snapshot a restore adopts must not alias the state being restored:
+-- restoring hangs live Pane objects off those tables, and json_encode throws on
+-- the first one it meets, taking the adoption down with it.
+local source = { workspace = "default", window_states = { { tabs = { { pane_tree = { cwd = "/a" } } } } } }
+local snapshot = im._test.accumulate_adoption(nil, source)
+check("adoption copies the workspace", snapshot.workspace, "default")
+check("adoption copies the windows", #snapshot.window_states, 1)
+source.window_states[1].tabs[1].pane_tree.pane = print
+source.window_states[1].tabs[1].pane_tree.cwd = "/mutated"
+check("adoption is not aliased", snapshot.window_states[1].tabs[1].pane_tree.cwd, "/a")
+truthy("adoption stays serialisable", pcall(wezterm.json_encode, snapshot))
+truthy("...unlike the state it copied", not pcall(wezterm.json_encode, source))
+
 -------------------------------------------------------- wsl_integration
 local wi = resurrect.wsl_integration
 local cands = wi._test.unc_candidates("Ubuntu-22.04", "/home/me/.bashrc")

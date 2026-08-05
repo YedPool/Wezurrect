@@ -684,6 +684,23 @@ end
 ---@param window table GuiWindow whose MuxWindow to reuse for the first restore
 ---@param pane table Pane in that window
 ---@param restore_opts table options passed to restore_workspace
+--- Fold a workspace state about to be restored into the snapshot this process
+--- will adopt as its own instance state.
+---
+--- The copy is the point. Restoring mutates the state it is given -- notably by
+--- storing live Pane objects on each pane_tree node -- and those cannot be
+--- serialised, so a snapshot that aliases them cannot be saved at all.
+---@param adopted table|nil accumulator, nil on the first call
+---@param workspace_state table state about to be restored
+---@return table adopted
+local function accumulate_adoption(adopted, workspace_state)
+	adopted = adopted or { workspace = workspace_state.workspace, window_states = {} }
+	for _, window_state in ipairs(workspace_state.window_states or {}) do
+		table.insert(adopted.window_states, utils.deepcopy(window_state))
+	end
+	return adopted
+end
+
 local function restore_instances(instance_ids, window, pane, restore_opts)
 	local adopted = nil
 
@@ -692,12 +709,11 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 		local workspace_state = pub.load_instance(id)
 		if workspace_state then
 			-- Collected so this process can adopt what it restored; see below.
-			if adopted == nil then
-				adopted = { workspace = workspace_state.workspace, window_states = {} }
-			end
-			for _, window_state in ipairs(workspace_state.window_states or {}) do
-				table.insert(adopted.window_states, window_state)
-			end
+			-- Deep-copied *before* restoring, because restoring hangs live Pane
+			-- objects off these very tables -- and json_encode throws on the
+			-- first one it meets, which would take the adoption, the save that
+			-- follows it, and any remaining instances down with it.
+			adopted = accumulate_adoption(adopted, workspace_state)
 			-- First instance reuses the current window to avoid extra blank shell
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
 			if i == 1 then
@@ -733,7 +749,10 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 	-- or whenever the tab structure next changes -- and that blank window is the
 	-- newest instance there is, so the next launch restores an empty terminal
 	-- and the real session is gone.
-	pub.save_instance(adopted)
+	local saved, err = pcall(pub.save_instance, adopted)
+	if not saved then
+		wezterm.log_error("resurrect: could not adopt the restored session: " .. tostring(err))
+	end
 
 	-- Then save again once the restore has settled, so the state reflects what
 	-- is actually on screen rather than what was on screen when it was saved.
@@ -1057,6 +1076,7 @@ end
 
 -- Expose internals for unit testing only
 pub._test = {
+	accumulate_adoption = accumulate_adoption,
 	count_panes_in_tree = count_panes_in_tree,
 	count_panes = count_panes,
 	extract_project_name = extract_project_name,
