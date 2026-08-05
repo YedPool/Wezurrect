@@ -207,6 +207,21 @@ check("unc fallback", cands[2], "\\\\wsl$\\Ubuntu-22.04\\home\\me\\.bashrc")
 truthy("snippet has osc7", wi._test.INTEGRATION_SCRIPT:find("]7;file://") ~= nil)
 truthy("snippet publishes shell id", wi._test.INTEGRATION_SCRIPT:find("SetUserVar=resurrect_shell_id") ~= nil)
 
+-------------------------------------------------------- window_geometry
+local geom = resurrect.window_geometry
+check("geometry is opt-in", geom.enabled, false)
+check("geometry capture is a no-op when off", geom.capture(), nil)
+truthy("geometry script reads placement", geom._test.SCRIPT:find("GetWindowPlacement") ~= nil)
+truthy("geometry script caches its assembly", geom._test.SCRIPT:find("OutputAssembly") ~= nil)
+-- The rect Windows reports is the outer window; set_inner_size takes the inner
+-- one. Feeding the first into the second would grow the window by its frame on
+-- every save/restore cycle, so apply() must not touch the size at all.
+truthy("geometry never sets a size", not geom._test.SCRIPT:find("set_inner_size"))
+
+-- apply() is all best-effort: none of it should throw on a window that has gone.
+truthy("apply tolerates nil geometry", pcall(geom.apply, nil, nil))
+truthy("apply tolerates a dead window", pcall(geom.apply, nil, { x = 1, y = 2, maximized = true }))
+
 -------------------------------------------------- powershell_integration
 local psi = resurrect.powershell_integration
 truthy("ps snippet emits osc7", psi._test.INTEGRATION_SCRIPT:find("%]7;file://") ~= nil)

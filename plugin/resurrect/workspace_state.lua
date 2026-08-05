@@ -19,10 +19,15 @@ function pub.restore_workspace(workspace_state, opts)
 
 	for i, window_state in ipairs(workspace_state.window_states) do
 		if i == 1 and opts.window then
+			-- Geometry first, and before any tab is restored: scrollback is
+			-- injected to fill the pane it lands in, so the window has to be the
+			-- size it will end up at before that happens.
+			local geometry = window_state.geometry
 			-- inner size is in pixels
-			if opts.resize_window == true or opts.resize_window == nil then
+			if (opts.resize_window == true or opts.resize_window == nil) and not (geometry and geometry.maximized) then
 				opts.window:gui_window():set_inner_size(window_state.size.pixel_width, window_state.size.pixel_height)
 			end
+			require("resurrect.window_geometry").apply(opts.window:gui_window(), geometry)
 			if not opts.close_open_tabs then
 				opts.tab = opts.window:active_tab()
 				if not opts.close_open_panes then
@@ -59,15 +64,16 @@ function pub.restore_workspace(workspace_state, opts)
 end
 
 ---Returns the state of the current workspace
+---@param opts? {capture_geometry: boolean?} forwarded to get_window_state
 ---@return workspace_state
-function pub.get_workspace_state()
+function pub.get_workspace_state(opts)
 	local workspace_state = {
 		workspace = wezterm.mux.get_active_workspace(),
 		window_states = {},
 	}
 	for _, mux_win in ipairs(wezterm.mux.all_windows()) do
 		if mux_win:get_workspace() == workspace_state.workspace then
-			table.insert(workspace_state.window_states, window_state_mod.get_window_state(mux_win))
+			table.insert(workspace_state.window_states, window_state_mod.get_window_state(mux_win, opts))
 		end
 	end
 	return workspace_state

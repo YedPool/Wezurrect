@@ -6,12 +6,18 @@ local pub = {}
 
 ---Returns the state of the window
 ---@param window MuxWindow
+---@param opts? {capture_geometry: boolean?} capture_geometry costs a subprocess,
+---       so only the periodic and manual saves ask for it
 ---@return window_state
-function pub.get_window_state(window)
+function pub.get_window_state(window, opts)
 	local window_state = {
 		title = window:get_title(),
 		tabs = {},
 	}
+
+	if opts and opts.capture_geometry then
+		window_state.geometry = require("resurrect.window_geometry").capture()
+	end
 
 	local tabs = window:tabs_with_info()
 
