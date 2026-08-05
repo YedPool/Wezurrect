@@ -237,6 +237,32 @@ local function inject_scrollback(pane, text)
 	pane:inject_output(text .. string.rep("\r\n", pub.scrollback_padding_rows(text, viewport_rows)) .. "\27[H")
 end
 
+--- Strip trailing whitespace from restored scrollback.
+---
+--- A byte loop rather than gsub("%s+$", ""). Lua patterns have no anchor
+--- optimisation, so `%s+$` is retried at every position in the string, and each
+--- retry walks the whitespace run it finds there before discovering it is not at
+--- the end. Captured scrollback is the worst possible input for that: every line
+--- is padded to the pane width, so it is mostly whitespace runs. Measured on a
+--- real 534 KB capture, the pattern took 15.1 seconds and this takes 0 -- for
+--- byte-identical output. It ran once per restored pane, on the GUI thread,
+--- which is what froze the window for half a minute on startup.
+---@param text string
+---@return string
+function pub.trim_trailing_whitespace(text)
+	local last = #text
+	while last > 0 do
+		local byte = text:byte(last)
+		-- space, tab, newline, carriage return, vertical tab, form feed
+		if byte == 32 or byte == 9 or byte == 10 or byte == 13 or byte == 11 or byte == 12 then
+			last = last - 1
+		else
+			break
+		end
+	end
+	return text:sub(1, last)
+end
+
 --- How many newlines must follow injected scrollback to lift its last row above
 --- the top of the viewport.
 ---
@@ -387,7 +413,7 @@ function pub.default_on_pane_restore(pane_tree)
 	local restore_cmd = build_restore_command(pane_tree)
 	-- A process restore command carries its own cd, so don't send a second one.
 	local cd_cmd = restore_cmd == nil and build_cd_command(pane_tree) or nil
-	local text = (restore_cmd == nil and pane_tree.text) and pane_tree.text:gsub("%s+$", "") or nil
+	local text = (restore_cmd == nil and pane_tree.text) and pub.trim_trailing_whitespace(pane_tree.text) or nil
 
 	if not (restore_cmd or cd_cmd or text) then
 		return

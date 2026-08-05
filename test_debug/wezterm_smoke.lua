@@ -173,6 +173,24 @@ check("padding three lines", ts.scrollback_padding_rows("a\nb\nc", 40), 40)
 check("padding exactly viewport", ts.scrollback_padding_rows(string.rep("x\n", 39) .. "x", 40), 40)
 check("padding longer than viewport", ts.scrollback_padding_rows(string.rep("x\n", 500) .. "x", 40), 40)
 check("padding tracks viewport size", ts.scrollback_padding_rows("a\nb", 12), 12)
+-- Restored scrollback is mostly whitespace: every line is padded to the pane
+-- width. gsub("%s+$") retries at every position and walks each run it finds, so
+-- on a real capture it took 15 seconds -- once per pane, on the GUI thread.
+check("trim strips trailing spaces", ts.trim_trailing_whitespace("abc   "), "abc")
+check("trim strips mixed trailing", ts.trim_trailing_whitespace("abc \t\r\n "), "abc")
+check("trim keeps inner whitespace", ts.trim_trailing_whitespace("a  b  "), "a  b")
+check("trim leaves clean text", ts.trim_trailing_whitespace("abc"), "abc")
+check("trim handles empty", ts.trim_trailing_whitespace(""), "")
+check("trim handles all whitespace", ts.trim_trailing_whitespace("   \n  "), "")
+-- Padded like the real thing, and large enough that a backtracking pattern
+-- would take seconds: this must stay instant.
+local padded = string.rep("PS C:\\Users\\me>" .. string.rep(" ", 170) .. "\r\n", 3000)
+local trim_started = os.clock()
+local trimmed = ts.trim_trailing_whitespace(padded)
+local trim_ms = math.floor((os.clock() - trim_started) * 1000)
+check("trim of a real-sized capture is exact", #trimmed, #padded - 172)
+truthy("trim of a real-sized capture is fast (" .. trim_ms .. "ms)", trim_ms < 100)
+
 check("padding empty", ts.scrollback_padding_rows("", 40), 0)
 check("padding nil", ts.scrollback_padding_rows(nil, 40), 0)
 

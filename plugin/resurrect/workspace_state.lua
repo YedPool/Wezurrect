@@ -4,6 +4,12 @@ local utils = require("resurrect.utils")
 
 local pub = {}
 
+-- Whether restoring a window resizes it to the size it was saved at. This is
+-- WezTerm-side sizing that has always happened, independently of
+-- restore_window_geometry; set resize_window = false in setup() to leave the
+-- window alone entirely. A per-call opts.resize_window still wins.
+pub.resize_window_default = true
+
 ---restore workspace state
 ---@param workspace_state workspace_state
 ---@param opts? restore_opts
@@ -23,8 +29,12 @@ function pub.restore_workspace(workspace_state, opts)
 			-- injected to fill the pane it lands in, so the window has to be the
 			-- size it will end up at before that happens.
 			local geometry = window_state.geometry
+			local resize = opts.resize_window
+			if resize == nil then
+				resize = pub.resize_window_default
+			end
 			-- inner size is in pixels
-			if (opts.resize_window == true or opts.resize_window == nil) and not (geometry and geometry.maximized) then
+			if resize and not (geometry and geometry.maximized) then
 				opts.window:gui_window():set_inner_size(window_state.size.pixel_width, window_state.size.pixel_height)
 			end
 			require("resurrect.window_geometry").apply(opts.window:gui_window(), geometry)

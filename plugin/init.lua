@@ -49,6 +49,7 @@ init()
 ---   periodic_interval    = 300    -- seconds between periodic saves
 ---   restore_delay        = 3      -- seconds to wait before sending restore commands
 ---   scroll_to_history    = true   -- park restored panes on their restored scrollback
+---   resize_window        = true   -- resize a restored window to its saved size
 ---   restore_window_geometry = false -- save/restore window position + maximized (Windows)
 ---   save_workspaces      = true
 ---   save_windows         = true
@@ -102,6 +103,10 @@ function pub.setup(config, opts)
 	-- on Windows with a single window open.
 	local state_dir = pub.state_manager.save_state_dir:gsub("[/\\]+$", "")
 	pub.window_geometry.enabled = opts.restore_window_geometry == true
+	-- Resizing a restored window to its saved size is separate, older behaviour
+	-- than restore_window_geometry, and on by default. Turn it off to have a
+	-- restore leave the window entirely alone.
+	pub.workspace_state.resize_window_default = opts.resize_window ~= false
 	pub.window_geometry.cache_dir = state_dir .. require("resurrect.utils").separator .. "window-geometry"
 
 	-- Deferred housekeeping. Both of these shell out, so they must stay off the
