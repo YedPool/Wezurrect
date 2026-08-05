@@ -53,7 +53,6 @@ init()
 ---   keybindings          = true   -- add Alt+S/R/W/Shift+W/Shift+T + Ctrl+Shift+B bindings
 ---   status_bar           = true   -- show save time + tab titles in right status
 ---   claude_hooks         = true   -- auto-configure Claude Code SessionStart hook
----   command_palette      = true   -- add labelled entries to the command palette
 ---   auto_restore         = "prompt" -- "prompt" | "latest" | false, see below
 ---   auto_restore_prompt  = true   -- older spelling of auto_restore = false
 ---   retention_days       = 7      -- auto-delete instance states older than this
@@ -212,70 +211,65 @@ function pub.setup(config, opts)
 			on_pane_restore = pub.tab_state.default_on_pane_restore,
 		}
 
-		-- Each command is a named event rather than a wezterm.action_callback.
-		-- The command palette derives its label from the action, and for an
-		-- action_callback that reads "Emit event `user-defined-3`" -- a number
-		-- that depends on registration order and says nothing about what the
-		-- command does. A named event at least reads as itself, and the
-		-- augment-command-palette entries below give each one a real label.
+		-- The event name IS the command palette label, because WezTerm gives us
+		-- no other way to write one.
+		--
+		-- The palette derives an entry from every key assignment, labelled from
+		-- its action. For a wezterm.action_callback that reads "Emit event
+		-- `user-defined-3`" -- a number that depends on registration order and
+		-- says nothing about what the command does. For EmitEvent it reads
+		-- "Emit event `<name>`", so a descriptive name is the whole fix.
+		--
+		-- augment-command-palette can contribute a properly labelled entry, but
+		-- it cannot replace the derived one (both appear) and entries added that
+		-- way never show their key binding. One readable entry that shows its
+		-- shortcut beats two entries where only the redundant one does.
 		local commands = {
 			{
-				event = "resurrect.save-workspace",
+				event = "Resurrect: Save workspace",
 				key = "w",
 				mods = "ALT",
-				brief = "Resurrect: Save workspace",
-				icon = "md_content_save",
 				run = function()
 					pub.state_manager.save_state(pub.workspace_state.get_workspace_state())
 				end,
 			},
 			{
-				event = "resurrect.save-window",
+				event = "Resurrect: Save window under a name",
 				key = "W",
 				mods = "ALT|SHIFT",
-				brief = "Resurrect: Save window (prompts for a name)",
-				icon = "md_window_restore",
 				run = function(win, pane)
 					win:perform_action(pub.window_state.save_window_action(), pane)
 				end,
 			},
 			{
-				event = "resurrect.save-tab",
+				event = "Resurrect: Save tab under a name",
 				key = "T",
 				mods = "ALT|SHIFT",
-				brief = "Resurrect: Save tab (prompts for a name)",
-				icon = "md_tab",
 				run = function(win, pane)
 					win:perform_action(pub.tab_state.save_tab_action(), pane)
 				end,
 			},
 			{
-				event = "resurrect.save-all",
+				event = "Resurrect: Save everything now",
 				key = "s",
 				mods = "ALT",
-				brief = "Resurrect: Save everything now",
-				icon = "md_content_save_all",
 				run = function()
 					pub.state_manager.save_workspace_full()
 					wezterm.emit("resurrect.save.finished")
 				end,
 			},
 			{
-				event = "resurrect.restore",
+				event = "Resurrect: Restore a saved session",
 				key = "r",
 				mods = "ALT",
-				brief = "Resurrect: Restore a saved session",
-				icon = "md_restore",
 				run = function(win, pane)
 					pub.instance_manager.show_instance_selector(win, pane, restore_opts)
 				end,
 			},
 			{
-				event = "resurrect.break-pane-into-window",
+				event = "Resurrect: Move pane into its own window",
 				key = "b",
 				mods = "CTRL|SHIFT",
-				brief = "Resurrect: Move pane into its own window",
-				icon = "md_open_in_new",
 				run = function(_, pane)
 					pane:move_to_new_window()
 				end,
@@ -298,20 +292,6 @@ function pub.setup(config, opts)
 			_commands_registered = true
 			for _, command in ipairs(commands) do
 				wezterm.on(command.event, command.run)
-			end
-
-			if opts.command_palette ~= false then
-				wezterm.on("augment-command-palette", function()
-					local entries = {}
-					for _, command in ipairs(commands) do
-						table.insert(entries, {
-							brief = command.brief,
-							icon = command.icon,
-							action = wezterm.action.EmitEvent(command.event),
-						})
-					end
-					return entries
-				end)
 			end
 		end
 	end

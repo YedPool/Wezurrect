@@ -120,9 +120,9 @@ resurrect.setup(config, {
   keybindings          = true,  -- add Alt+S/R/W/Shift+W/Shift+T + Ctrl+Shift+B bindings
   status_bar           = true,  -- show save time + tab titles in right status
   claude_hooks         = true,  -- auto-configure Claude Code SessionStart hook
-  command_palette      = true,  -- add labelled entries to the command palette
-  auto_restore         = "prompt", -- "prompt" | "latest" | false (see below)
-  auto_restore_prompt  = true,  -- older spelling of auto_restore = false
+  auto_restore         = "prompt", -- what the first window restores (see below)
+  auto_restore_prompt  = true,  -- show instance selector on startup if saved instances
+                                -- exist (deprecated; superseded by auto_restore)
   retention_days       = 7,     -- auto-delete instance states older than this many days
   wsl_integration      = true,  -- auto-install cwd + Claude reporting into WSL distros (Windows)
   wsl_integration_delay = 10,   -- seconds after startup before doing so
@@ -140,7 +140,8 @@ config.keys = { ... }
 
 ### Restoring on startup
 
-`auto_restore` decides what the first window does when saved instances exist:
+`auto_restore` decides what happens when WezTerm starts and saved instances
+exist:
 
 | Value | Behaviour |
 | --- | --- |
@@ -148,16 +149,18 @@ config.keys = { ... }
 | `"latest"` | Restore the most recent instance without asking. |
 | `false` | Do nothing. `Alt+R` still opens the selector. |
 
-`"latest"` skips the instance this WezTerm is itself writing. That matters more
-than it sounds: by the time the startup restore runs, event-driven save has
-already recorded the new window's single blank tab, and it sorts to the top as
-the most recently saved thing there is.
+`auto_restore_prompt` is the older spelling and still works: `true` (or unset)
+means `auto_restore = "prompt"`, `false` means `auto_restore = false`. It has no
+equivalent for `"latest"`. If you set both, `auto_restore` wins.
 
-Only the first WezTerm restores automatically. Launching a second one while the
-first is open would otherwise duplicate the session already on screen, so it
-gets the selector instead. This is detected by counting `wezterm-gui` processes;
-with a mux server a second launch attaches to the existing one and never reaches
-this code at all.
+Every WezTerm window follows `auto_restore`, with one exception: under
+`"latest"`, a WezTerm launched while another is already open shows the selector
+instead of restoring. Auto-restoring there would reopen the session already on
+screen in the first window, which is never what you want; the selector lets you
+pick something else, or dismiss it with `Esc` for a fresh terminal. `false` still
+means no prompt anywhere. Whether another WezTerm is running is detected by
+counting `wezterm-gui` processes; with a mux server configured, a second launch
+attaches to the existing process and none of this runs at all.
 
 ### WSL panes (Windows)
 

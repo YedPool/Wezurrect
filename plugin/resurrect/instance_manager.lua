@@ -685,10 +685,19 @@ end
 ---@param pane table Pane in that window
 ---@param restore_opts table options passed to restore_workspace
 local function restore_instances(instance_ids, window, pane, restore_opts)
+	local adopted = nil
+
 	for i, id in ipairs(instance_ids) do
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
 		if workspace_state then
+			-- Collected so this process can adopt what it restored; see below.
+			if adopted == nil then
+				adopted = { workspace = workspace_state.workspace, window_states = {} }
+			end
+			for _, window_state in ipairs(workspace_state.window_states or {}) do
+				table.insert(adopted.window_states, window_state)
+			end
 			-- First instance reuses the current window to avoid extra blank shell
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
 			if i == 1 then
@@ -710,6 +719,36 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 			pub.tombstone_instance(id)
 		end
 	end
+
+	if not adopted then
+		return
+	end
+
+	-- Adopt what we just restored as this process's own instance state.
+	--
+	-- Without this, restoring loses the session it just restored. The instance
+	-- we read from has been tombstoned, and the only thing saved under our own
+	-- id is the blank window that event-driven save recorded a second earlier at
+	-- startup. Close WezTerm before the next save -- 5 minutes later by default,
+	-- or whenever the tab structure next changes -- and that blank window is the
+	-- newest instance there is, so the next launch restores an empty terminal
+	-- and the real session is gone.
+	pub.save_instance(adopted)
+
+	-- Then save again once the restore has settled, so the state reflects what
+	-- is actually on screen rather than what was on screen when it was saved.
+	-- The delay has to clear the restore commands (which are themselves delayed)
+	-- and give any Claude Code being resumed time to start and report its
+	-- session, or this save would record those panes as plain scrollback.
+	local settle = require("resurrect.tab_state").process_restore_delay_seconds + 10
+	wezterm.time.call_after(settle, function()
+		local ok, err = pcall(function()
+			get_state_manager().save_workspace_full()
+		end)
+		if not ok then
+			wezterm.log_error("resurrect: post-restore save failed: " .. tostring(err))
+		end
+	end)
 end
 
 --- Show the main instance selector with multi-select support.
