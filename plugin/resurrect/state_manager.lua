@@ -140,8 +140,10 @@ end
 --- Full workspace save: saves workspace state, current_state, and instance state.
 --- Single entry point for the complete save operation, used by periodic_save,
 --- event_driven_save, and the Alt+S keybinding to avoid duplication.
-function pub.save_workspace_full()
-	local workspace_state = require("resurrect.workspace_state").get_workspace_state()
+---@param opts? {capture_geometry: boolean?} capture_geometry costs a subprocess,
+---       so the event-driven saves that fire on every tab change leave it off
+function pub.save_workspace_full(opts)
+	local workspace_state = require("resurrect.workspace_state").get_workspace_state(opts)
 	pub.save_state(workspace_state)
 
 	-- Save per-instance state if instance manager is active
@@ -179,7 +181,10 @@ function pub.periodic_save(opts)
 		local ok, err = pcall(function()
 			wezterm.emit("resurrect.state_manager.periodic_save.start", opts)
 			if opts.save_workspaces then
-				pub.save_workspace_full()
+				-- The slow path: this is the only save that runs on a timer
+				-- rather than in response to the user, so it is where the
+				-- subprocess that reads the window's position belongs.
+				pub.save_workspace_full({ capture_geometry = true })
 			end
 
 			if opts.save_windows then

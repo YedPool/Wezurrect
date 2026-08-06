@@ -139,19 +139,51 @@ end
 -- Use shared CWD validation from utils to prevent command injection.
 local is_safe_cwd = utils.is_safe_cwd
 
+-- Identifies this WezTerm process in pane-session file names. Set by setup()
+-- from the instance id, and exported to child processes as RESURRECT_INSTANCE so
+-- Claude Code's hook can build the same key.
+--
+-- Pane ids restart from 0 in every WezTerm process, so without this a fresh
+-- pane 0 reads the session file left behind by a previous run's pane 0 and gets
+-- saved as a Claude pane running a conversation from days ago. It also keeps two
+-- WezTerm processes running side by side from overwriting each other's files.
+pub.pane_session_prefix = nil
+
+-- Used when no prefix has been set, on both sides of the boundary, so the Lua
+-- and the shell hook still agree on the key.
+local NO_INSTANCE = "noinstance"
+
+--- The pane-session key for a pane in a local domain.
+---@param pane_id number|string
+---@return string
+function pub.local_pane_session_key(pane_id)
+	return (pub.pane_session_prefix or NO_INSTANCE) .. "-" .. tostring(pane_id)
+end
+
+--- The shell expression Claude Code's hook uses to build the same key.
+---@return string
+function pub.local_pane_session_key_expr()
+	return "${RESURRECT_INSTANCE:-" .. NO_INSTANCE .. "}-${WEZTERM_PANE:-unknown}"
+end
+
 -- Read session data from Claude Code's pane-sessions directory.
--- The SessionStart hook writes JSON to ~/.claude/pane-sessions/<pane_id>.json
+-- The SessionStart hook writes JSON to ~/.claude/pane-sessions/<key>.json
 -- containing { session_id, transcript_path, cwd, hook_event_name, source }.
----@param pane_id number|string WezTerm pane ID
+--
+-- The key is WezTerm's numeric pane id for local panes, or the per-shell UUID
+-- published by the WSL shell integration for panes inside a WSL distro (see
+-- resurrect.wsl_integration for why WEZTERM_PANE cannot be used there).
+---@param pane_id number|string WezTerm pane ID or WSL shell id
 ---@return table|nil session_data parsed JSON or nil on failure
 function pub.read_pane_session(pane_id)
 	if not pane_id then
 		return nil
 	end
-	-- Validate pane_id is numeric to prevent path traversal
+	-- Restrict the key to alphanumerics, dashes and underscores so it cannot
+	-- escape the pane-sessions directory via path traversal.
 	local id_str = tostring(pane_id)
-	if not id_str:match("^%d+$") then
-		wezterm.log_error("resurrect: read_pane_session rejected non-numeric pane_id: " .. id_str)
+	if #id_str > 64 or not id_str:match("^[%w][%w%-_]*$") then
+		wezterm.log_error("resurrect: read_pane_session rejected malformed key: " .. id_str)
 		return nil
 	end
 	local home = os.getenv("HOME") or os.getenv("USERPROFILE")
@@ -248,11 +280,13 @@ pub.register({
 		-- Claude Code must be started from the original working directory
 		-- for proper context loading and session restoration. Prepend a cd
 		-- command as a separate line so the shell changes directory before
-		-- launching Claude. Using \r\n between commands instead of && for
-		-- cross-shell compatibility (PowerShell 5.x does not support &&).
+		-- launching Claude. Two commands separated by a carriage return rather
+		-- than && for cross-shell compatibility (PowerShell 5.x has no &&); a
+		-- bare CR, because the LF of a "\r\n" is a second keypress that leaves
+		-- PowerShell at its `>>` continuation prompt.
 		local cwd = process_info.cwd or (pane_tree and pane_tree.cwd)
 		if cwd and is_safe_cwd(cwd) then
-			cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n" .. cmd
+			cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. "\r" .. cmd
 		elseif cwd then
 			wezterm.log_warn("resurrect: rejected unsafe CWD for Claude restore: " .. tostring(cwd))
 		end
@@ -320,12 +354,123 @@ pub.register({
 	end,
 })
 
--- Configure the SessionStart hook in a single Claude Code settings file.
--- Returns true if hook is already present or was successfully added.
+--- Build the Claude Code hook command that records a pane's session.
+---
+--- Claude Code sends the session JSON on stdin for every hook event; we write it
+--- to a file named after whichever environment variable identifies the pane.
+--- The key is validated against a strict character class so a crafted value
+--- (e.g. "../../.bashrc") cannot escape the pane-sessions directory.
+--- All Claude instances write to the same directory so the restore logic finds
+--- session data regardless of which binary, or which distro, ran.
+---@param pane_sessions_dir string directory to write session files into
+---@param key_expr string shell expression producing the pane key
+---@return string hook_command
+function pub.build_pane_session_hook_command(pane_sessions_dir, key_expr)
+	local safe_dir = pane_sessions_dir:gsub("\\", "/"):gsub("'", "'\\''")
+	return "bash -c '"
+		.. 'key="' .. key_expr .. '"; '
+		.. 'if [[ "$key" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then '
+		.. 'cat > "' .. safe_dir .. '/${key}.json"; '
+		.. 'else echo "resurrect: invalid pane session key: $key" >&2; cat > /dev/null; fi\''
+end
+
+--- Build the Claude Code hook command that forgets a pane's session.
+---
+--- Without this a pane stays marked as a Claude pane for as long as it lives:
+--- the session file is written when Claude starts and never removed, so a pane
+--- where Claude was closed hours ago is still saved as `claude --resume <old>`
+--- and comes back running Claude, its real scrollback discarded.
+---@param pane_sessions_dir string
+---@param key_expr string shell expression producing the pane key
+---@return string hook_command
+function pub.build_pane_session_cleanup_command(pane_sessions_dir, key_expr)
+	local safe_dir = pane_sessions_dir:gsub("\\", "/"):gsub("'", "'\\''")
+	return "bash -c '"
+		.. 'key="' .. key_expr .. '"; '
+		.. "cat > /dev/null; "
+		.. 'if [[ "$key" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then '
+		.. 'rm -f "' .. safe_dir .. '/${key}.json"; fi\''
+end
+
+-- Which SessionEnd reasons mean the pane has stopped running Claude. The
+-- reasons left out -- clear, resume -- end one session only to start another
+-- immediately, and deleting the file on those would race the SessionStart that
+-- follows.
+local SESSION_END_MATCHER = "prompt_input_exit|logout|bypass_permissions_disabled|other"
+
+--- Strip the pane-session hooks this plugin previously installed, leaving every
+--- other hook the user has configured untouched.
+---
+--- Removing and re-adding, rather than adding only when absent, is what lets the
+--- hook command change between plugin versions. The key expression is part of
+--- the command, so a stale hook writing under an old key would silently stop
+--- matching what the save path looks for.
+--- Every pane-session hook currently configured, as a sorted, comparable list.
+--- Used to skip the write when nothing would change: setup() runs on every
+--- WezTerm launch and config reload, and rewriting settings.json each time would
+--- eventually clobber an edit Claude Code made to it in the meantime.
+---@param settings table parsed settings.json
+---@return string[] sorted signatures
+local function pane_session_hook_signatures(settings)
+	local found = {}
+	if type(settings.hooks) == "table" then
+		for event_name, entries in pairs(settings.hooks) do
+			if type(entries) == "table" then
+				for _, entry in ipairs(entries) do
+					for _, hook in ipairs(entry.hooks or {}) do
+						if hook.command and hook.command:find("pane%-sessions") then
+							table.insert(found, event_name .. "\0" .. tostring(entry.matcher) .. "\0" .. hook.command)
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(found)
+	return found
+end
+
+---@param settings table parsed settings.json, mutated in place
+local function strip_pane_session_hooks(settings)
+	if type(settings.hooks) ~= "table" then
+		return
+	end
+	for event_name, entries in pairs(settings.hooks) do
+		if type(entries) == "table" then
+			local kept_entries = {}
+			for _, entry in ipairs(entries) do
+				local kept_hooks = {}
+				for _, hook in ipairs(entry.hooks or {}) do
+					if not (hook.command and hook.command:find("pane%-sessions")) then
+						table.insert(kept_hooks, hook)
+					end
+				end
+				-- Drop entries we emptied; keep ones that never had our hooks
+				-- (entry.hooks absent) exactly as they were.
+				if entry.hooks == nil then
+					table.insert(kept_entries, entry)
+				elseif #kept_hooks > 0 then
+					entry.hooks = kept_hooks
+					table.insert(kept_entries, entry)
+				end
+			end
+			settings.hooks[event_name] = kept_entries
+		end
+	end
+end
+
+--- Configure the pane-session hooks in a single Claude Code settings file.
+--- Returns true if the hooks are already present or were successfully added.
+---
+--- The hook command is supplied by the caller because it differs per platform:
+--- a Windows Claude writes to the pane-sessions directory keyed by WEZTERM_PANE,
+--- while a Claude running inside WSL writes to the same directory through its
+--- /mnt mount, keyed by the shell id from our WSL shell integration.
 ---@param target_settings_path string path to settings.json
----@param pane_sessions_dir string path to pane-sessions directory
+---@param hook_command string command to run for SessionStart and Stop
+---@param cleanup_command string command to run for SessionEnd
 ---@return boolean success
-local function configure_hook_in_settings(target_settings_path, pane_sessions_dir)
+function pub.configure_pane_session_hooks(target_settings_path, hook_command, cleanup_command)
 	-- Read existing settings (or start fresh)
 	local settings = {}
 	local f = io.open(target_settings_path, "r")
@@ -337,85 +482,54 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 			if ok and parsed then
 				settings = parsed
 			else
-				wezterm.log_warn("resurrect: could not parse " .. target_settings_path .. ", will add hooks to fresh object")
+				-- Bail out rather than start from a fresh object: this function
+				-- rewrites the whole file, so treating an unparseable settings.json
+				-- as empty would silently discard everything in it.
+				wezterm.log_error(
+					"resurrect: refusing to rewrite unparseable Claude settings at " .. target_settings_path
+				)
+				return false
 			end
 		end
 	end
 
-	-- Check if our hooks are already present (idempotency check).
-	-- We look for pane-sessions hooks on both SessionStart and Stop.
-	-- If both exist, nothing to do.
-	local has_session_start = false
-	local has_stop = false
-	if settings.hooks then
-		for _, event_name in ipairs({ "SessionStart", "Stop" }) do
-			if settings.hooks[event_name] then
-				for _, entry in ipairs(settings.hooks[event_name]) do
-					if entry.hooks then
-						for _, hook in ipairs(entry.hooks) do
-							if hook.command and hook.command:find("pane%-sessions") then
-								if event_name == "SessionStart" then
-									has_session_start = true
-								else
-									has_stop = true
-								end
-							end
-						end
-					end
-				end
-			end
-		end
-	end
-	if has_session_start and has_stop then
-		return true
-	end
+	local before = table.concat(pane_session_hook_signatures(settings), "\1")
 
-	-- Build the hook structure
+	-- Replace rather than append: see strip_pane_session_hooks for why.
+	strip_pane_session_hooks(settings)
+
 	if not settings.hooks then
 		settings.hooks = {}
 	end
 
-	-- The hook command: Claude Code sends session JSON on stdin for every
-	-- hook event. We write it to a file keyed by WEZTERM_PANE env var.
-	-- WEZTERM_PANE is set by WezTerm in child shells and inherited by Claude.
-	-- The pane ID is validated as numeric to prevent path traversal via
-	-- crafted WEZTERM_PANE values (e.g., "../../.bashrc").
-	-- All instances write to the same pane-sessions dir (~/.claude/pane-sessions/)
-	-- so the restore logic can find session data regardless of which binary ran.
-	local safe_dir = pane_sessions_dir:gsub("\\", "/"):gsub("'", "'\\''")
-	local hook_command = "bash -c '"
-		.. 'pane_id="${WEZTERM_PANE:-unknown}"; '
-		.. 'if [[ "$pane_id" =~ ^[0-9]+$ ]]; then '
-		.. 'cat > "' .. safe_dir .. '/${pane_id}.json"; '
-		.. "else echo \"resurrect: invalid WEZTERM_PANE: $pane_id\" >&2; cat > /dev/null; fi'"
-
-	local hook_entry = {
-		matcher = "",
-		hooks = {
-			{
-				type = "command",
-				command = hook_command,
-			},
-		},
-	}
+	local function add(event_name, matcher, command)
+		if not settings.hooks[event_name] then
+			settings.hooks[event_name] = {}
+		end
+		table.insert(settings.hooks[event_name], {
+			matcher = matcher,
+			hooks = { { type = "command", command = command } },
+		})
+	end
 
 	-- SessionStart: captures session ID when Claude starts or resumes.
-	if not has_session_start then
-		if not settings.hooks.SessionStart then
-			settings.hooks.SessionStart = {}
-		end
-		table.insert(settings.hooks.SessionStart, hook_entry)
-	end
+	add("SessionStart", "", hook_command)
 
 	-- Stop: refreshes session ID after every Claude response. This keeps
 	-- the pane-session file current even if the session ID changes mid-
 	-- conversation (e.g., during context compaction). Every hook event
 	-- includes session_id in its stdin payload, so the same command works.
-	if not has_stop then
-		if not settings.hooks.Stop then
-			settings.hooks.Stop = {}
-		end
-		table.insert(settings.hooks.Stop, hook_entry)
+	add("Stop", "", hook_command)
+
+	-- SessionEnd: forgets the pane so a closed Claude is not resurrected.
+	if cleanup_command then
+		add("SessionEnd", SESSION_END_MATCHER, cleanup_command)
+	end
+
+	-- Already exactly right: leave the file alone rather than rewrite it on
+	-- every launch, where a stale read could undo a change made meanwhile.
+	if before == table.concat(pane_session_hook_signatures(settings), "\1") then
+		return true
 	end
 
 	-- Write directly (not atomic rename -- os.rename fails on Windows
@@ -471,13 +585,17 @@ function pub.setup_claude_session_hooks(settings_path)
 		return false
 	end
 
+	local key_expr = pub.local_pane_session_key_expr()
+	local hook_command = pub.build_pane_session_hook_command(pane_sessions_dir, key_expr)
+	local cleanup_command = pub.build_pane_session_cleanup_command(pane_sessions_dir, key_expr)
+
 	-- Configure the primary settings file
 	if settings_path then
-		return configure_hook_in_settings(settings_path, pane_sessions_dir)
+		return pub.configure_pane_session_hooks(settings_path, hook_command, cleanup_command)
 	end
 
 	local primary_path = claude_dir .. sep .. "settings.json"
-	local primary_ok = configure_hook_in_settings(primary_path, pane_sessions_dir)
+	local primary_ok = pub.configure_pane_session_hooks(primary_path, hook_command, cleanup_command)
 
 	-- Also configure alternate Claude config directories (e.g., .claude-alt for
 	-- claude2 multi-account setups). Only if the directory already exists --
@@ -487,10 +605,47 @@ function pub.setup_claude_session_hooks(settings_path)
 	local alt_f = io.open(alt_settings, "r")
 	if alt_f then
 		alt_f:close()
-		configure_hook_in_settings(alt_settings, pane_sessions_dir)
+		pub.configure_pane_session_hooks(alt_settings, hook_command, cleanup_command)
 	end
 
 	return primary_ok
+end
+
+--- Delete pane-session files older than `days`.
+---
+--- SessionEnd removes a pane's file when Claude exits cleanly, and the instance
+--- prefix makes leftovers harmless, but a crash still strands one -- and the
+--- directory is shared by every WezTerm process, so "not mine" is not a safe
+--- thing to delete. Age is.
+---
+--- Uses run_child_process, so it must not be called during config evaluation.
+---@param days number
+---@return boolean success
+function pub.sweep_pane_sessions(days)
+	local home = os.getenv("HOME") or os.getenv("USERPROFILE")
+	if not home or not days or days <= 0 then
+		return false
+	end
+	local dir = home .. utils.separator .. ".claude" .. utils.separator .. "pane-sessions"
+
+	local ok
+	if utils.is_windows then
+		ok = utils.exec({
+			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
+			string.format(
+				"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue"
+					.. " | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-%d) } | Remove-Item -Force",
+				dir:gsub("'", "''"),
+				days
+			),
+		})
+	else
+		ok = utils.exec({
+			"sh", "-c",
+			"find '" .. dir:gsub("'", "'\\''") .. "' -maxdepth 1 -name '*.json' -mtime +" .. days .. " -delete 2>/dev/null",
+		})
+	end
+	return ok and true or false
 end
 
 return pub

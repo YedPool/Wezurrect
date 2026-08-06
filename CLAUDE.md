@@ -30,6 +30,9 @@ Fork of MLFlexer/resurrect.wezterm with Windows fixes, security hardening, and C
 - Run `bash test_debug/verify.sh` for luacheck + busted tests
 - Always verify cached plugin matches source repo before testing
 - No Lua runtime installed on system -- tests use bundled tools in `test_debug/tools/`
+- When those tools are unavailable, `wezterm --config-file test_debug/wezterm_smoke.lua show-keys`
+  runs assertions inside WezTerm's own Lua and exits; it also parses every module the plugin
+  loads, so it doubles as a syntax check. Grep the output for `TESTSUMMARY`.
 
 ## Multi-Instance State Management
 

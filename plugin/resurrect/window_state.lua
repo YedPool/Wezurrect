@@ -6,12 +6,24 @@ local pub = {}
 
 ---Returns the state of the window
 ---@param window MuxWindow
+---@param opts? {capture_geometry: boolean?} capture_geometry costs a subprocess,
+---       so only the periodic and manual saves ask for it
 ---@return window_state
-function pub.get_window_state(window)
+function pub.get_window_state(window, opts)
 	local window_state = {
 		title = window:get_title(),
 		tabs = {},
 	}
+
+	-- Every save carries geometry, but only the ones that ask for it pay to read
+	-- it fresh. The rest reuse the last value seen, so a save triggered by
+	-- opening a tab does not erase the position a periodic save recorded.
+	local window_geometry = require("resurrect.window_geometry")
+	if opts and opts.capture_geometry then
+		window_state.geometry = window_geometry.capture()
+	else
+		window_state.geometry = window_geometry.last_known()
+	end
 
 	local tabs = window:tabs_with_info()
 
@@ -60,10 +72,7 @@ function pub.restore_window(window, window_state, opts)
 		if i == 1 and opts.tab then
 			tab = opts.tab
 		else
-			local spawn_tab_args = { cwd = tab_state.pane_tree.cwd }
-			if tab_state.pane_tree.domain then
-				spawn_tab_args.domain = { DomainName = tab_state.pane_tree.domain }
-			end
+			local spawn_tab_args = tab_state_mod.apply_spawn_target({}, tab_state.pane_tree)
 			tab, opts.pane, _ = window:spawn_tab(spawn_tab_args)
 		end
 
