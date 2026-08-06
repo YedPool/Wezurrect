@@ -8,6 +8,7 @@ Resurrect your terminal environment!⚰️ A plugin to save the state of your wi
 
 - Restore your windows, tabs and panes with the layout and text from a saved state.
 - Restore shell output from a saved session.
+- Restore each pane's working directory, including PowerShell, cmd and WSL panes on Windows.
 - Save the state of your current window, with every window, tab and pane state stored in a `json` file.
 - Restore the save from a `json` file.
 - Re-attach to remote domains (e.g. SSH, SSHMUX, WSL, Docker, ect.).
@@ -100,6 +101,7 @@ return config
 - **Instance selector on startup** -- if saved instances exist, shows a selector to restore/delete/rename them
 - **Claude Code session restoration** -- detects Claude Code processes and resumes them via `--resume <session-id>`
 - **Claude Code SessionStart hook** in `~/.claude/settings.json` (and `~/.claude-alt/settings.json` for multi-account `claude2` setups)
+- **Shell integration so panes report their working directory** (Windows) -- adds a line to your PowerShell profile, and to `~/.bashrc` and `~/.claude/settings.json` inside each WSL distribution. Turn off with `powershell_integration = false` / `wsl_integration = false`
 - **Status bar** showing last save time and tab titles
 - **Keybindings**: Alt+S (full save), Alt+R (instance selector / restore), Alt+W (save workspace), Alt+Shift+W (save window), Alt+Shift+T (save tab), Ctrl+Shift+B (break active pane into a new window)
 
@@ -186,69 +188,6 @@ Window *size* is a separate setting, `resize_window`. It is on by default, works
 on every platform, and set to `false` a restore leaves the window's size alone.
 With `restore_window_geometry` on, size comes back together with the position
 either way.
-
-### Working directories (Windows)
-
-A pane is restored into the directory it was saved in, which requires the shell
-to have told WezTerm where it was. Neither of the shells Windows users get does
-that by default:
-
-- **PowerShell** `Set-Location` moves only PowerShell's own provider location.
-  The process working directory -- the one Windows reports, and all WezTerm can
-  read unaided -- never leaves the directory the shell started in.
-- **WSL** shells run inside the VM, which Windows cannot see into at all.
-
-Both are fixed the same way, by [OSC 7][osc7], and `setup()` installs it for you
-ten seconds after startup:
-
-- `~/.config/wezterm-resurrect/integration.ps1`, dot-sourced from a guarded
-  block at the end of `$PROFILE.CurrentUserAllHosts`, for each PowerShell found.
-  It wraps whatever prompt function is already defined rather than replacing it.
-- The equivalent inside each WSL distribution — see below.
-
-Both are idempotent and run once per profile or distro. They apply to **newly
-opened** panes; a shell already running has not loaded them. Set
-`powershell_integration = false` or `wsl_integration = false` to opt out, or if
-you already have shell integration configured.
-
-The symptom, if this is missing, is a restored session where every tab lands
-correctly except the first, which snaps back to the default directory. Panes a
-restore spawns are launched in the right directory by WezTerm itself; the one it
-reuses has to be told, and it can only be told what was recorded.
-
-[osc7]: https://gitlab.freedesktop.org/Per_Bothner/specifications/blob/master/proposals/prompts.md
-
-### WSL panes (Windows)
-
-WSL tabs restore their scrollback, working directory and Claude Code sessions
-just like local tabs do, with no setup beyond installing the plugin.
-
-Getting there needs one thing Windows cannot do on its own. A pane in a `WSL:*`
-domain runs `wsl.exe`, and Windows cannot see the process inside the VM: the
-working directory WezTerm reports is the Windows directory `wsl.exe` was
-launched from, not the shell's actual `$PWD`. Restoring from that value used to
-type a Windows path into `bash`, which always failed.
-
-So, ten seconds after startup, `setup()` installs a small shell snippet into
-every WSL distribution it finds:
-
-- `~/.config/wezterm-resurrect/integration.sh` — emits [OSC 7][osc7] on each
-  prompt, which is how a shell tells the terminal its real working directory,
-  and publishes a per-shell id as the `resurrect_shell_id` user var.
-- `~/.bashrc` — one guarded line sourcing the snippet.
-- `~/.claude/settings.json` inside the distro — the same pane-session hook that
-  `claude_hooks` installs on the Windows side, keyed by that shell id.
-
-The shell id exists because `WEZTERM_PANE` does not cross the WSL boundary:
-WezTerm's `WSLENV` forwards only `TERM`, `COLORTERM`, `TERM_PROGRAM` and
-`TERM_PROGRAM_VERSION`.
-
-Installation is idempotent and runs once per distro (a marker is kept under
-`state/wsl-integration/`). It takes effect in **newly opened** WSL tabs; shells
-already running have not sourced it. Pass `wsl_integration = false` to opt out —
-WSL scrollback still restores, but the working directory falls back to whatever
-Windows can see.
-
 
 ## Advanced Setup (Manual Configuration)
 
@@ -784,9 +723,9 @@ end)
 If your pane CWD is incorrect then it might be a problem with the shell
 integration and OSC 7. See [Wezterm documentation](https://wezfurlong.org/wezterm/shell-integration.html).
 
-For panes in a `WSL:*` domain this is installed for you — see
-[WSL panes (Windows)](#wsl-panes-windows). It applies to newly opened WSL tabs,
-so restart the tab if an existing one still reports a Windows path.
+On Windows `setup()` installs this for you, for PowerShell and for each WSL
+distribution. It only applies to panes opened afterwards, so open a new tab if an
+existing one still reports the wrong directory.
 
 ### How do I keep my plugins up to date?
 
