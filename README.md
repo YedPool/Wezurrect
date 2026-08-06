@@ -117,7 +117,7 @@ resurrect.setup(config, {
   restore_delay        = 3,     -- seconds to wait before sending restore commands
   scroll_to_history    = true,  -- park restored panes on their restored scrollback
   resize_window        = true,  -- resize a restored window to its saved size
-  restore_window_geometry = false, -- save/restore window position + maximized (see below)
+  restore_window_geometry = false, -- save/restore window position + maximized (Windows; see below)
   save_workspaces      = true,  -- save workspace state
   save_windows         = true,  -- save window state
   save_tabs            = true,  -- save tab state
@@ -718,15 +718,6 @@ end)
 
 ## FAQ
 
-### Pane CWD is not correct on Windows
-
-If your pane CWD is incorrect then it might be a problem with the shell
-integration and OSC 7. See [Wezterm documentation](https://wezfurlong.org/wezterm/shell-integration.html).
-
-On Windows `setup()` installs this for you, for PowerShell and for each WSL
-distribution. It only applies to panes opened afterwards, so open a new tab if an
-existing one still reports the wrong directory.
-
 ### How do I keep my plugins up to date?
 
 #### Manually
@@ -738,6 +729,15 @@ to see where they are stored. You can then update them individually using git pu
 #### Automatically
 
 Add `wezterm.plugin.update_all()` to your Wezterm config.
+
+### Pane CWD is not correct on Windows
+
+If your pane CWD is incorrect then it might be a problem with the shell
+integration and OSC 7. See [Wezterm documentation](https://wezfurlong.org/wezterm/shell-integration.html).
+
+On Windows `setup()` installs this for you, for PowerShell and for each WSL
+distribution. It only applies to panes opened afterwards, so open a new tab if an
+existing one still reports the wrong directory.
 
 ## Testing
 
