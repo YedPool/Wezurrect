@@ -114,6 +114,7 @@ resurrect.setup(config, {
   periodic_interval    = 300,   -- seconds between periodic saves (default: 5 min)
   restore_delay        = 3,     -- seconds to wait before sending restore commands
   scroll_to_history    = true,  -- park restored panes on their restored scrollback
+  resize_window        = true,  -- resize a restored window to its saved size
   restore_window_geometry = false, -- save/restore window position + maximized (see below)
   save_workspaces      = true,  -- save workspace state
   save_windows         = true,  -- save window state
@@ -162,27 +163,29 @@ screen.
 
 ### Window position and maximized state
 
-Off by default. Turn it on with `restore_window_geometry = true`, and a restored
-window comes back where it was, maximized if it was.
+**Windows only**, and off by default. Turn it on with:
 
-WezTerm can *set* both — `set_position`, `maximize` — but can read neither: a
-window reports `pixel_width`, `pixel_height`, `dpi` and `is_full_screen`, and
-there is no way to ask where it is. The values therefore come from Windows
-itself, through `GetWindowPlacement`, which costs a subprocess. That is why it is
-opt-in, and why it is captured only on the periodic save and on `Alt+S`, never on
-the event-driven saves that fire every time a tab opens.
+```lua
+resurrect.setup(config, { restore_window_geometry = true })
+```
 
-Three limits worth knowing before you turn it on:
+A restored window then comes back on the monitor it was on, at the position it
+was at, and maximized if it was maximized.
 
-- **Windows only.** Elsewhere it is a no-op.
-- **One window.** Windows exposes a process's main window; WezTerm gives Lua no
-  way to say which of its windows that is. With more than one open, geometry is
-  skipped rather than guessed at.
-- **Up to `periodic_interval` stale.** Move the window and close WezTerm before
-  the next periodic save and it reopens where it last saved.
+What it does not do:
 
-Size is restored regardless of this setting, and always before any tab is
-restored, so scrollback is injected into a pane that is already its final size.
+- **Only one window.** With two or more WezTerm windows open, position is left
+  alone.
+- **A minimized window comes back normal**, not minimized.
+- **A move can be missed.** Position is recorded on the periodic save (every
+  `periodic_interval`, 5 minutes by default) and whenever you press `Alt+S`. Move
+  the window and quit before either happens, and it reopens where it last
+  recorded.
+
+Window *size* is a separate setting, `resize_window`. It is on by default, works
+on every platform, and set to `false` a restore leaves the window's size alone.
+With `restore_window_geometry` on, size comes back together with the position
+either way.
 
 ### Working directories (Windows)
 
