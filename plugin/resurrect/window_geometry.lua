@@ -246,6 +246,14 @@ function pub.apply(gui_window, geometry)
 	if not (geometry.x and geometry.y and geometry.outer_width and geometry.outer_height) then
 		return
 	end
+	-- Same guard capture uses, and for the same reason: the helper acts on
+	-- whichever window Windows considers this process's main one. With no window
+	-- of our own, or more than one, that is not a window we can claim -- and in a
+	-- headless run it would be some other WezTerm's.
+	local ok, windows = pcall(wezterm.gui.gui_windows)
+	if not ok or not windows or #windows ~= 1 then
+		return
+	end
 
 	local script_path, assembly_path = ensure_script()
 	if not script_path then

@@ -257,8 +257,15 @@ truthy("geometry script caches its assembly", geom._test.SCRIPT:find("OutputAsse
 truthy("geometry never sets a size", not geom._test.SCRIPT:find("set_inner_size"))
 
 -- apply() is all best-effort: none of it should throw on a window that has gone.
+-- It is also safe to call from here: these run with no GUI window of their own,
+-- and apply() declines unless this process owns exactly one -- so a test can
+-- never reposition a WezTerm window belonging to somebody else.
 truthy("apply tolerates nil geometry", pcall(geom.apply, nil, nil))
 truthy("apply tolerates a dead window", pcall(geom.apply, nil, { x = 1, y = 2, maximized = true }))
+truthy(
+	"apply is inert without a window of our own",
+	pcall(geom.apply, nil, { x = 1, y = 2, outer_width = 800, outer_height = 600, maximized = true })
+)
 
 -- Saves that do not pay for a capture must still carry the last geometry seen,
 -- or opening a tab would erase the position the last periodic save recorded.
