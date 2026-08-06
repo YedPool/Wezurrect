@@ -739,6 +739,13 @@ On Windows `setup()` installs this for you, for PowerShell and for each WSL
 distribution. It only applies to panes opened afterwards, so open a new tab if an
 existing one still reports the wrong directory.
 
+`cmd.exe` needs none of this and is unaffected — and it is what WezTerm runs on
+Windows by default. PowerShell is opt-in, via your own config:
+
+```lua
+config.default_prog = { "powershell" }
+```
+
 ## Testing
 
 Tests are run with Busted via LuaRocks.
