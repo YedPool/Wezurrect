@@ -83,8 +83,14 @@ local function find_json_files(base_path)
 	if utils.is_windows then
 		-- Use PowerShell via run_child_process -- no visible window, no VBS temp files.
 		-- PowerShell Get-ChildItem is available on all modern Windows.
+		-- Test-Path guard: with -ErrorAction SilentlyContinue a missing directory
+		-- produces no error record but still leaves $? false, so powershell exits
+		-- non-zero and the caller reports a failed scan. A state directory that
+		-- does not exist yet is normal (nothing has been saved of that type), so
+		-- it must contribute nothing quietly rather than raise resurrect.error.
 		local ps_cmd = string.format(
-			"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | "
+			"if (Test-Path -LiteralPath '%s') { "
+				.. "Get-ChildItem -LiteralPath '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | "
 				.. "ForEach-Object { "
 				-- The cast must be parenthesised before .ToString(). Without the
 				-- outer parens "[int][double]::Parse(x).ToString() + ' ' + y"
@@ -94,7 +100,8 @@ local function find_json_files(base_path)
 				-- the command exit non-zero, so the scan silently returns
 				-- nothing and the picker reports "no existing state files".
 				.. "([int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds))"
-				.. ".ToString() + ' ' + $_.FullName }",
+				.. ".ToString() + ' ' + $_.FullName } }",
+			base_path:gsub("'", "''"),
 			base_path:gsub("'", "''")
 		)
 		success, stdout, stderr = wezterm.run_child_process({
