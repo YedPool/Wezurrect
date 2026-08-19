@@ -51,7 +51,15 @@ local function list_dated_backups(backups_dir, basename)
 		local ok, output = wezterm.run_child_process({
 			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
 			string.format(
-				"Get-ChildItem -Path '%s' -Filter '%s' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }",
+				-- Force UTF-8 on stdout. powershell.exe otherwise uses the OEM
+				-- code page and replaces every non-ASCII byte with "?". The
+				-- caller matches these names against the save's base name, so
+				-- corrupted output matches nothing, the prune list comes back
+				-- empty, and backups accumulate without bound -- observed at
+				-- 2,979 files for a single base against a retention of 10.
+				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+					.. "Get-ChildItem -Path '%s' -Filter '%s' -File -ErrorAction SilentlyContinue "
+					.. "| ForEach-Object { $_.Name }",
 				backups_dir:gsub("'", "''"), pattern:gsub("'", "''")
 			),
 		})

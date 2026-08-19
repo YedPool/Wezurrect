@@ -436,7 +436,13 @@ function pub.list_instances()
 		local success, output = wezterm.run_child_process({
 			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
 			string.format(
-				"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName }",
+				-- Force UTF-8 on stdout; powershell.exe otherwise emits the OEM
+				-- code page and turns every non-ASCII byte into "?". Instance
+				-- ids are numeric so they cannot be corrupted today, but the
+				-- same helper shape is used for name-bearing directories.
+				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+					.. "Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue "
+					.. "| ForEach-Object { $_.BaseName }",
 				instances_dir:gsub("'", "''")
 			),
 		})
@@ -554,7 +560,13 @@ local function list_ids_in_dir(dir)
 		local ok, output = wezterm.run_child_process({
 			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
 			string.format(
-				"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName }",
+				-- Force UTF-8 on stdout; powershell.exe otherwise emits the OEM
+				-- code page and turns every non-ASCII byte into "?". Instance
+				-- ids are numeric so they cannot be corrupted today, but the
+				-- same helper shape is used for name-bearing directories.
+				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+					.. "Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue "
+					.. "| ForEach-Object { $_.BaseName }",
 				dir:gsub("'", "''")
 			),
 		})

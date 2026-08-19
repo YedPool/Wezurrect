@@ -89,7 +89,13 @@ local function find_json_files(base_path)
 		-- does not exist yet is normal (nothing has been saved of that type), so
 		-- it must contribute nothing quietly rather than raise resurrect.error.
 		local ps_cmd = string.format(
-			"if (Test-Path -LiteralPath '%s') { "
+			-- Force UTF-8 on stdout. powershell.exe otherwise encodes output in
+			-- the OEM code page, which replaces every non-ASCII byte with "?".
+			-- Save names routinely contain non-ASCII (status glyphs, Hebrew,
+			-- CJK), so without this the scan returns corrupted paths: the picker
+			-- displays "?" and the id it hands back does not name a real file.
+			"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+				.. "if (Test-Path -LiteralPath '%s') { "
 				.. "Get-ChildItem -LiteralPath '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | "
 				.. "ForEach-Object { "
 				-- The cast must be parenthesised before .ToString(). Without the
