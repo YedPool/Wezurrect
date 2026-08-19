@@ -86,7 +86,14 @@ local function find_json_files(base_path)
 		local ps_cmd = string.format(
 			"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | "
 				.. "ForEach-Object { "
-				.. "[int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds) "
+				-- The cast must be parenthesised before .ToString(). Without the
+				-- outer parens "[int][double]::Parse(x).ToString() + ' ' + y"
+				-- applies the [int] cast to the whole concatenated expression;
+				-- and a space before .ToString() is a hard parse error in both
+				-- Windows PowerShell 5.1 and PowerShell 7. Either mistake makes
+				-- the command exit non-zero, so the scan silently returns
+				-- nothing and the picker reports "no existing state files".
+				.. "([int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds))"
 				.. ".ToString() + ' ' + $_.FullName }",
 			base_path:gsub("'", "''")
 		)
