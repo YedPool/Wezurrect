@@ -5,8 +5,9 @@ local pub = {}
 
 ---@alias fmt_fun fun(label: string): string
 ---@alias fuzzy_load_opts {title: string, description: string, fuzzy_description: string, is_fuzzy: boolean,
----ignore_workspaces: boolean, ignore_tabs: boolean, ignore_windows: boolean, fmt_window: fmt_fun, fmt_workspace: fmt_fun,
----fmt_tab: fmt_fun, fmt_date: fmt_fun, show_state_with_date: boolean, date_format: string, ignore_screen_width: boolean,
+---ignore_workspaces: boolean, ignore_tabs: boolean, ignore_windows: boolean, ignore_shelfs: boolean,
+---fmt_window: fmt_fun, fmt_workspace: fmt_fun, fmt_tab: fmt_fun, fmt_shelf: fmt_fun,
+---fmt_date: fmt_fun, show_state_with_date: boolean, date_format: string, ignore_screen_width: boolean,
 ---name_truncature: string, min_filename_size: number}
 
 ---Default fuzzy loading options
@@ -19,6 +20,8 @@ pub.default_fuzzy_load_opts = {
 	ignore_workspaces = false,
 	ignore_windows = false,
 	ignore_tabs = false,
+	-- Not a typo: the ignore flag is looked up as "ignore_" .. type .. "s".
+	ignore_shelfs = false,
 	ignore_instances = true,
 	ignore_screen_width = true,
 	date_format = "%d-%m-%Y %H:%M:%S",
@@ -49,20 +52,39 @@ pub.default_fuzzy_load_opts = {
 			{ Text = "󰓩 : " .. label:gsub("(.*)%.json(.*)", "%1%2") },
 		})
 	end,
+	fmt_shelf = function(label)
+		return wezterm.format({
+			{ Foreground = { AnsiColor = "Fuchsia" } },
+			{ Text = wezterm.nerdfonts.md_pin .. " : " .. label:gsub("(.*)%.json(.*)", "%1%2") },
+		})
+	end,
 }
 
--- Recursive JSON file finder using wezterm.run_child_process (no os.execute, no VBS).
--- Returns lines of "epoch filepath" for each .json file found.
----@param base_path string starting path from which the recursive search takes place
+-- State directories scanned by the loader, relative to save_state_dir.
+-- insert_choices derives a file's state type from its immediate parent
+-- directory, so "window/shelf" correctly yields the type "shelf".
+local STATE_SUBDIRS = { "workspace", "window", "window/shelf", "tab", "instances" }
+
+-- Non-recursive JSON file finder using wezterm.run_child_process (no os.execute,
+-- no VBS). Returns lines of "epoch filepath" for each .json file directly inside
+-- base_path.
+--
+-- This deliberately does NOT recurse. Recursing from save_state_dir also swept
+-- .backups/ (which rotate_backup fills with a dated copy per save, unbounded
+-- across base names), .trash/ and instances/restored/. Those parent directory
+-- names became state "types" that insert_choices has no formatting entry for,
+-- which crashed the picker -- and on a well-used store they outnumber real saves
+-- by more than 100:1.
+---@param base_path string directory to list (non-recursively)
 ---@return string|nil
-local function find_json_files_recursive(base_path)
+local function find_json_files(base_path)
 	local success, stdout, stderr
 
 	if utils.is_windows then
 		-- Use PowerShell via run_child_process -- no visible window, no VBS temp files.
 		-- PowerShell Get-ChildItem is available on all modern Windows.
 		local ps_cmd = string.format(
-			"Get-ChildItem -Path '%s' -Recurse -Filter '*.json' -File | "
+			"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | "
 				.. "ForEach-Object { "
 				.. "[int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds) "
 				.. ".ToString() + ' ' + $_.FullName }",
@@ -81,7 +103,8 @@ local function find_json_files_recursive(base_path)
 		success, stdout, stderr = wezterm.run_child_process({
 			"sh",
 			"-c",
-			"find '" .. safe_path .. "' -type f -name '*.json' -print0 | xargs -0 stat -f '%m %N'",
+			"find '" .. safe_path .. "' -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null"
+				.. " | xargs -0 stat -f '%m %N'",
 		})
 	else
 		-- Use single-quote escaping to prevent shell injection via $() and backticks
@@ -89,7 +112,8 @@ local function find_json_files_recursive(base_path)
 		success, stdout, stderr = wezterm.run_child_process({
 			"sh",
 			"-c",
-			"find '" .. safe_path .. "' -type f -name '*.json' -printf '%T@ %p\\n' | awk '{split($1, a, \".\"); print a[1], $2}'",
+			"find '" .. safe_path .. "' -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\\n' 2>/dev/null"
+				.. " | awk '{split($1, a, \".\"); print a[1], $2}'",
 		})
 	end
 
@@ -101,6 +125,23 @@ local function find_json_files_recursive(base_path)
 	end
 end
 
+-- List every state file across STATE_SUBDIRS, concatenated into one blob in the
+-- same "epoch filepath" line format insert_choices expects. A missing
+-- subdirectory contributes nothing rather than failing the whole scan.
+---@param base_path string save_state_dir (with trailing separator)
+---@return string
+local function find_state_files(base_path)
+	local parts = {}
+	for _, subdir in ipairs(STATE_SUBDIRS) do
+		local dir = base_path .. (subdir:gsub("/", utils.separator))
+		local out = find_json_files(dir)
+		if out and out ~= "" then
+			table.insert(parts, (out:gsub("%s+$", "")))
+		end
+	end
+	return table.concat(parts, "\n")
+end
+
 -- build a table with the output of the file finder function
 ---@param stdout string|nil
 ---@param opts table
@@ -109,11 +150,12 @@ local function insert_choices(stdout, opts)
 	-- this structure will contain the formatting costs for each elements
 	local fmt_cost = {}
 	-- pre-calculation of formatting cost
-	local types = { "workspace", "window", "tab" }
+	local types = { "workspace", "window", "shelf", "tab" }
 	local state_files = {}
 	local files = {
 		workspace = {},
 		window = {},
+		shelf = {},
 		tab = {},
 	}
 	local max_length = 0
@@ -133,7 +175,13 @@ local function insert_choices(stdout, opts)
 		-- Skip instance files when ignore_instances is set (they use their own selector)
 		if type == "instances" and opts.ignore_instances then
 			-- fall through: do not add instance files to the fuzzy loader
-		elseif epoch and file and type and not opts[string.format("ignore_%ss", type)] then
+		elseif type == nil or files[type] == nil then
+			-- Unknown state type: skip it. `files` and `fmt_cost` are keyed by
+			-- the supported types only, so anything else (a .backups/, .trash/
+			-- or restored/ directory, or a future subdirectory) would index
+			-- them as nil and raise an arithmetic error below, taking the whole
+			-- picker down. Skipping keeps the loader forward-compatible.
+		elseif epoch and file and not opts[string.format("ignore_%ss", type)] then
 			-- consider the "cost" of the formatting of the filename, i.e., if the format function adds characters
 			-- to the visible part of the file section, we test the three possible formatter to get the highest cost
 			-- we use a real entry instead of an empty string to prevent formatting error if the format function has
@@ -273,8 +321,8 @@ function pub.fuzzy_load(window, pane, callback, opts)
 
 	local folder = require("resurrect.state_manager").save_state_dir
 
-	-- Always use the recursive search function
-	local stdout = find_json_files_recursive(folder)
+	-- Scan each state directory rather than recursing the whole tree
+	local stdout = find_state_files(folder)
 
 	-- build the choice list for the InputSelector
 	local state_files = insert_choices(stdout, opts)
@@ -301,5 +349,12 @@ function pub.fuzzy_load(window, pane, callback, opts)
 		pane
 	)
 end
+
+-- Expose internals for unit testing only
+pub._test = {
+	insert_choices = insert_choices,
+	find_state_files = find_state_files,
+	STATE_SUBDIRS = STATE_SUBDIRS,
+}
 
 return pub
