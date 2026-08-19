@@ -132,7 +132,13 @@ local function find_json_files(base_path)
 	end
 
 	if success then
-		return stdout
+		-- Normalise line endings. powershell.exe emits CRLF, and insert_choices
+		-- splits on "[^\n]+" while anchoring its filename pattern with "%.json$",
+		-- so a surviving CR makes every line fail to match. The failure is nearly
+		-- invisible: the only lines that still parse are those whose CR happened
+		-- to be trimmed, so the picker silently shows a handful of entries
+		-- instead of erroring.
+		return (stdout or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
 	else
 		wezterm.emit("resurrect.error", stderr or "Failed to list state files")
 		return nil
@@ -180,6 +186,11 @@ local function insert_choices(stdout, opts)
 
 	-- Parse the stdout and construct the file table
 	for line in stdout:gmatch("[^\n]+") do
+		-- Trim a trailing CR: the pattern below is anchored with "$", so a CRLF
+		-- source would otherwise fail to match every single line. Handled here as
+		-- well as at the scan, because this parser must not depend on which
+		-- platform's line endings its caller happens to hand it.
+		line = line:gsub("\r+$", "")
 		local epoch, type, file = line:match("%s*(%d+)%s+.+[/\\]([^/\\]+)[/\\]([^/\\]+%.json)$")
 		-- epoch in this case represents the last modified date/time according to the OS
 		-- For Unix/POSIX Epoch is counted from January 1st, 1970 0 UTC

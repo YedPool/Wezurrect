@@ -200,6 +200,28 @@ describe("fuzzy_loader.insert_choices", function()
 		assert.equals("tab" .. utils.separator .. "one+bug.json", result[1].id)
 	end)
 
+	-- powershell.exe emits CRLF. insert_choices splits on "[^\n]+" and anchors
+	-- its pattern with "%.json$", so a surviving CR makes every line fail to
+	-- parse. This silently shrank a 156-entry picker to 3 -- one per directory,
+	-- being the only lines whose CR had been trimmed -- with no error raised.
+	it("parses CRLF output, not just LF", function()
+		local stdout = table.concat({
+			line(1700000000, "workspace", "default.json"),
+			line(1700000001, "window", "One.json"),
+			line(1700000002, "window", "Two.json"),
+			line(1700000003, "tab", "Three.json"),
+		}, "\r\n") .. "\r\n"
+
+		local result = insert_choices(stdout, opts())
+
+		assert.equals(4, #result)
+	end)
+
+	it("parses a lone trailing CR without dropping the last entry", function()
+		local stdout = line(1700000000, "window", "Only.json") .. "\r\n"
+		assert.equals(1, #insert_choices(stdout, opts()))
+	end)
+
 	it("returns an empty list for nil stdout", function()
 		assert.same({}, insert_choices(nil, opts()))
 	end)
