@@ -684,11 +684,36 @@ end
 ---@param window table GuiWindow whose MuxWindow to reuse for the first restore
 ---@param pane table Pane in that window
 ---@param restore_opts table options passed to restore_workspace
+--- Fold a workspace state about to be restored into the snapshot this process
+--- will adopt as its own instance state.
+---
+--- The copy is the point. Restoring mutates the state it is given -- notably by
+--- storing live Pane objects on each pane_tree node -- and those cannot be
+--- serialised, so a snapshot that aliases them cannot be saved at all.
+---@param adopted table|nil accumulator, nil on the first call
+---@param workspace_state table state about to be restored
+---@return table adopted
+local function accumulate_adoption(adopted, workspace_state)
+	adopted = adopted or { workspace = workspace_state.workspace, window_states = {} }
+	for _, window_state in ipairs(workspace_state.window_states or {}) do
+		table.insert(adopted.window_states, utils.deepcopy(window_state))
+	end
+	return adopted
+end
+
 local function restore_instances(instance_ids, window, pane, restore_opts)
+	local adopted = nil
+
 	for i, id in ipairs(instance_ids) do
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
 		if workspace_state then
+			-- Collected so this process can adopt what it restored; see below.
+			-- Deep-copied *before* restoring, because restoring hangs live Pane
+			-- objects off these very tables -- and json_encode throws on the
+			-- first one it meets, which would take the adoption, the save that
+			-- follows it, and any remaining instances down with it.
+			adopted = accumulate_adoption(adopted, workspace_state)
 			-- First instance reuses the current window to avoid extra blank shell
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
 			if i == 1 then
@@ -710,6 +735,39 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 			pub.tombstone_instance(id)
 		end
 	end
+
+	if not adopted then
+		return
+	end
+
+	-- Adopt what we just restored as this process's own instance state.
+	--
+	-- Without this, restoring loses the session it just restored. The instance
+	-- we read from has been tombstoned, and the only thing saved under our own
+	-- id is the blank window that event-driven save recorded a second earlier at
+	-- startup. Close WezTerm before the next save -- 5 minutes later by default,
+	-- or whenever the tab structure next changes -- and that blank window is the
+	-- newest instance there is, so the next launch restores an empty terminal
+	-- and the real session is gone.
+	local saved, err = pcall(pub.save_instance, adopted)
+	if not saved then
+		wezterm.log_error("resurrect: could not adopt the restored session: " .. tostring(err))
+	end
+
+	-- Then save again once the restore has settled, so the state reflects what
+	-- is actually on screen rather than what was on screen when it was saved.
+	-- The delay has to clear the restore commands (which are themselves delayed)
+	-- and give any Claude Code being resumed time to start and report its
+	-- session, or this save would record those panes as plain scrollback.
+	local settle = require("resurrect.tab_state").process_restore_delay_seconds + 10
+	wezterm.time.call_after(settle, function()
+		local ok, err = pcall(function()
+			get_state_manager().save_workspace_full()
+		end)
+		if not ok then
+			wezterm.log_error("resurrect: post-restore save failed: " .. tostring(err))
+		end
+	end)
 end
 
 --- Show the main instance selector with multi-select support.
@@ -911,10 +969,57 @@ end
 -- Startup integration
 -- ---------------------------------------------------------------------------
 
+-- What to do at gui-startup when saved instances exist:
+--   "prompt"  show the instance selector (default)
+--   "latest"  restore the newest instance that is not this process's own
+--   false     do nothing; Alt+R still works
+pub.auto_restore_mode = "prompt"
+
+--- Is another WezTerm GUI already running?
+---
+--- Without a mux server each `wezterm` launch is its own GUI process with its
+--- own gui-startup, so "latest" would otherwise reopen, in the second window,
+--- the very session already on screen in the first. Counting GUI processes is
+--- the signal available at startup: the state files cannot tell a running
+--- instance apart from one that crashed.
+---@return boolean
+function pub.another_gui_is_running()
+	local ok, out
+	if utils.is_windows then
+		ok, out = utils.exec({
+			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
+			"(Get-Process wezterm-gui -ErrorAction SilentlyContinue | Measure-Object).Count",
+		})
+	else
+		ok, out = utils.exec({ "sh", "-c", "pgrep -c wezterm-gui 2>/dev/null || echo 0" })
+	end
+	if not ok or not out then
+		return false
+	end
+	local count = tonumber(out:match("%d+"))
+	-- One of them is us. Anything more means a WezTerm was already open.
+	return count ~= nil and count > 1
+end
+
+--- The newest saved instance that is not the one this process is writing.
+---
+--- The exclusion matters: by the time the startup restore runs, event-driven
+--- save has already written this process's own instance -- a single blank tab --
+--- and it sorts to the top as the most recently saved thing there is.
+---@return table|nil entry
+function pub.latest_other_instance()
+	for _, entry in ipairs(pub.list_instances()) do
+		if entry.instance_id ~= pub.instance_id then
+			return entry
+		end
+	end
+	return nil
+end
+
 --- Auto-restore callback for gui-startup.
 --- 1. Cleans up old instances
---- 2. If instances exist and auto_restore_prompt: spawns window + shows selector
---- 3. If no instances: falls back to state_manager.resurrect_on_gui_startup()
+--- 2. If no instances: falls back to state_manager.resurrect_on_gui_startup()
+--- 3. Otherwise honours auto_restore_mode: restore the latest, or prompt
 function pub.auto_restore_on_startup()
 	pub.cleanup_old_instances()
 
@@ -926,8 +1031,13 @@ function pub.auto_restore_on_startup()
 		return
 	end
 
-	if not pub.auto_restore_prompt then
-		-- User disabled auto-prompt; they can use Alt+R manually
+	-- Legacy switch, still honoured for configs that set it directly
+	if pub.auto_restore_prompt == false then
+		return
+	end
+	local mode = pub.auto_restore_mode
+	if mode == false or mode == nil then
+		-- User disabled startup restore; they can use Alt+R manually
 		return
 	end
 
@@ -938,21 +1048,35 @@ function pub.auto_restore_on_startup()
 
 	wezterm.time.call_after(1, function()
 		local gui_windows = wezterm.gui.gui_windows()
-		if #gui_windows > 0 then
-			local gui_win = gui_windows[1]
-			local active_pane = gui_win:active_pane()
-			local restore_opts = {
-				relative = true,
-				restore_text = true,
-				on_pane_restore = require("resurrect.tab_state").default_on_pane_restore,
-			}
-			pub.show_instance_selector(gui_win, active_pane, restore_opts)
+		if #gui_windows == 0 then
+			return
 		end
+		local gui_win = gui_windows[1]
+		local active_pane = gui_win:active_pane()
+		local restore_opts = {
+			relative = true,
+			restore_text = true,
+			on_pane_restore = require("resurrect.tab_state").default_on_pane_restore,
+		}
+
+		-- Only the first WezTerm restores automatically. A second one would
+		-- duplicate the session already open in the first, so it gets the
+		-- selector instead and the user picks what they actually want.
+		if mode == "latest" and not pub.another_gui_is_running() then
+			local target = pub.latest_other_instance()
+			if target then
+				restore_instances({ target.instance_id }, gui_win, active_pane, restore_opts)
+				return
+			end
+		end
+
+		pub.show_instance_selector(gui_win, active_pane, restore_opts)
 	end)
 end
 
 -- Expose internals for unit testing only
 pub._test = {
+	accumulate_adoption = accumulate_adoption,
 	count_panes_in_tree = count_panes_in_tree,
 	count_panes = count_panes,
 	extract_project_name = extract_project_name,

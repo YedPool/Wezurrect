@@ -8,6 +8,7 @@ Resurrect your terminal environment!⚰️ A plugin to save the state of your wi
 
 - Restore your windows, tabs and panes with the layout and text from a saved state.
 - Restore shell output from a saved session.
+- Restore each pane's working directory, including PowerShell, cmd and WSL panes on Windows.
 - Save the state of your current window, with every window, tab and pane state stored in a `json` file.
 - Restore the save from a `json` file.
 - Re-attach to remote domains (e.g. SSH, SSHMUX, WSL, Docker, ect.).
@@ -100,6 +101,7 @@ return config
 - **Instance selector on startup** -- if saved instances exist, shows a selector to restore/delete/rename them
 - **Claude Code session restoration** -- detects Claude Code processes and resumes them via `--resume <session-id>`
 - **Claude Code SessionStart hook** in `~/.claude/settings.json` (and `~/.claude-alt/settings.json` for multi-account `claude2` setups)
+- **Shell integration so panes report their working directory** (Windows) -- adds a line to your PowerShell profile, and to `~/.bashrc` and `~/.claude/settings.json` inside each WSL distribution. Turn off with `powershell_integration = false` / `wsl_integration = false`
 - **Status bar** showing last save time and tab titles
 - **Keybindings**: Alt+S (full save), Alt+R (instance selector / restore), Alt+W (save workspace), Alt+Shift+W (save window), Alt+Shift+T (save tab), Ctrl+Shift+B (break active pane into a new window)
 
@@ -113,14 +115,22 @@ All options are optional. Defaults are shown below:
 resurrect.setup(config, {
   periodic_interval    = 300,   -- seconds between periodic saves (default: 5 min)
   restore_delay        = 3,     -- seconds to wait before sending restore commands
+  scroll_to_history    = true,  -- park restored panes on their restored scrollback
+  resize_window        = true,  -- resize a restored window to its saved size
+  restore_window_geometry = false, -- save/restore window position + maximized (Windows; see below)
   save_workspaces      = true,  -- save workspace state
   save_windows         = true,  -- save window state
   save_tabs            = true,  -- save tab state
   keybindings          = true,  -- add Alt+S/R/W/Shift+W/Shift+T + Ctrl+Shift+B bindings
   status_bar           = true,  -- show save time + tab titles in right status
   claude_hooks         = true,  -- auto-configure Claude Code SessionStart hook
-  auto_restore_prompt  = true,  -- show instance selector on startup if saved instances exist
+  auto_restore         = "prompt", -- what the first window restores (see below)
+  auto_restore_prompt  = true,  -- show instance selector on startup if saved instances
+                                -- exist (deprecated; superseded by auto_restore)
   retention_days       = 7,     -- auto-delete instance states older than this many days
+  powershell_integration = true, -- auto-install cwd reporting into PowerShell profiles (Windows)
+  wsl_integration      = true,  -- auto-install cwd + Claude reporting into WSL distros (Windows)
+  wsl_integration_delay = 10,   -- seconds after startup before either
 })
 ```
 
@@ -132,6 +142,52 @@ resurrect.setup(config, { keybindings = false })
 -- Add your own custom bindings here
 config.keys = { ... }
 ```
+
+### Restoring on startup
+
+`auto_restore` decides what happens when WezTerm starts and saved instances
+exist:
+
+| Value | Behaviour |
+| --- | --- |
+| `"prompt"` (default) | Show the instance selector and let you choose. |
+| `"latest"` | Restore the most recent instance without asking. |
+| `false` | Do nothing. `Alt+R` still opens the selector. |
+
+`auto_restore_prompt` is the older spelling and still works: `true` (or unset)
+means `auto_restore = "prompt"`, `false` means `auto_restore = false`. It has no
+equivalent for `"latest"`. If you set both, `auto_restore` wins.
+
+Every WezTerm window follows `auto_restore`, with one exception: under
+`"latest"`, a WezTerm launched while another is already open shows the selector
+instead of restoring, so you do not get a second copy of the session already on
+screen.
+
+### Window position and maximized state
+
+**Windows only**, and off by default. Turn it on with:
+
+```lua
+resurrect.setup(config, { restore_window_geometry = true })
+```
+
+A restored window then comes back on the monitor it was on, at the position it
+was at, and maximized if it was maximized.
+
+What it does not do:
+
+- **Only one window.** With two or more WezTerm windows open, position is left
+  alone.
+- **A minimized window comes back normal**, not minimized.
+- **A move can be missed.** Position is recorded on the periodic save (every
+  `periodic_interval`, 5 minutes by default) and whenever you press `Alt+S`. Move
+  the window and quit before either happens, and it reopens where it last
+  recorded.
+
+Window *size* is a separate setting, `resize_window`. It is on by default, works
+on every platform, and set to `false` a restore leaves the window's size alone.
+With `restore_window_geometry` on, size comes back together with the position
+either way.
 
 ## Advanced Setup (Manual Configuration)
 
@@ -662,11 +718,6 @@ end)
 
 ## FAQ
 
-### Pane CWD is not correct on Windows
-
-If your pane CWD is incorrect then it might be a problem with the shell
-integration and OSC 7. See [Wezterm documentation](https://wezfurlong.org/wezterm/shell-integration.html).
-
 ### How do I keep my plugins up to date?
 
 #### Manually
@@ -678,6 +729,22 @@ to see where they are stored. You can then update them individually using git pu
 #### Automatically
 
 Add `wezterm.plugin.update_all()` to your Wezterm config.
+
+### Pane CWD is not correct on Windows
+
+If your pane CWD is incorrect then it might be a problem with the shell
+integration and OSC 7. See [Wezterm documentation](https://wezfurlong.org/wezterm/shell-integration.html).
+
+On Windows `setup()` installs this for you, for PowerShell and for each WSL
+distribution. It only applies to panes opened afterwards, so open a new tab if an
+existing one still reports the wrong directory.
+
+`cmd.exe` needs none of this and is unaffected — and it is what WezTerm runs on
+Windows by default. PowerShell is opt-in, via your own config:
+
+```lua
+config.default_prog = { "powershell" }
+```
 
 ## Testing
 

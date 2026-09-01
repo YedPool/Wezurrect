@@ -6,6 +6,100 @@ utils.is_windows = wezterm.target_triple == "x86_64-pc-windows-msvc"
 utils.is_mac = (wezterm.target_triple == "x86_64-apple-darwin" or wezterm.target_triple == "aarch64-apple-darwin")
 utils.separator = utils.is_windows and "\\" or "/"
 
+---------------------------------------------------------------
+-- WSL domain + path helpers
+--
+-- WezTerm names WSL domains "WSL:<distro>". Those panes are local ptys (so
+-- inject_output/get_lines_as_escapes work on them), but the process running
+-- inside them lives in the WSL VM, which Windows cannot introspect. Paths
+-- therefore have to be translated at both the save and restore boundary:
+-- WezTerm reports Windows paths for WSL panes until the distro emits OSC 7,
+-- and typing a Windows path into bash is always wrong.
+---------------------------------------------------------------
+
+--- True when a WezTerm domain name refers to a WSL distribution.
+---@param domain string|nil
+---@return boolean
+function utils.is_wsl_domain(domain)
+	return type(domain) == "string" and domain:match("^WSL:") ~= nil
+end
+
+--- Extract the distribution name from a "WSL:<distro>" domain name.
+---@param domain string|nil
+---@return string|nil distro
+function utils.wsl_distro(domain)
+	if type(domain) ~= "string" then
+		return nil
+	end
+	return domain:match("^WSL:(.+)$")
+end
+
+--- Convert any path spelling WezTerm might hand us into a POSIX path usable
+--- inside WSL. Handles "/C:/Users/x", "C:/Users/x" and "C:\Users\x"; leaves
+--- paths that are already POSIX ("/home/x", "/mnt/c/x") untouched.
+---@param path string|nil
+---@return string|nil
+function utils.to_wsl_path(path)
+	if not path or path == "" then
+		return path
+	end
+	local p = path:gsub("\\", "/")
+	-- WezTerm's file:// URLs render Windows paths as "/C:/Users/x".
+	p = p:gsub("^/(%a:)", "%1")
+	local drive, rest = p:match("^(%a):(/.*)$")
+	if drive then
+		return "/mnt/" .. drive:lower() .. rest
+	end
+	drive = p:match("^(%a):$")
+	if drive then
+		return "/mnt/" .. drive:lower()
+	end
+	return p
+end
+
+--- Convert a WSL mount path back to its Windows spelling. Paths outside
+--- /mnt/<drive> have no Windows equivalent and are returned unchanged.
+---@param path string|nil
+---@return string|nil
+function utils.to_windows_path(path)
+	if not path or path == "" then
+		return path
+	end
+	local drive, rest = path:match("^/mnt/(%a)(/.*)$")
+	if drive then
+		return drive:upper() .. ":" .. rest:gsub("/", "\\")
+	end
+	drive = path:match("^/mnt/(%a)$")
+	if drive then
+		return drive:upper() .. ":\\"
+	end
+	return (path:gsub("^/(%a:)", "%1"))
+end
+
+--- Normalise the CWD reported by pane:get_current_working_dir() into the
+--- spelling we want to persist for that pane's domain.
+---@param file_path string|nil raw file_path from the pane's cwd URL
+---@param domain string|nil the pane's WezTerm domain name
+---@return string
+function utils.normalize_saved_cwd(file_path, domain)
+	if not file_path or file_path == "" then
+		return ""
+	end
+	if utils.is_wsl_domain(domain) then
+		return utils.to_wsl_path(file_path)
+	end
+	if utils.is_windows then
+		-- WezTerm returns file_path as /C:/... on Windows; strip the leading slash.
+		file_path = file_path:gsub("^/([a-zA-Z]):", "%1:")
+		-- WSL mounts Windows drives at /mnt/c/...; convert to C:\... so that
+		-- WezTerm's mux can validate the path in Windows context before spawning.
+		file_path = file_path:gsub("^/mnt/([a-zA-Z])(.*)", function(drive, rest)
+			return drive:upper() .. ":" .. rest:gsub("/", "\\")
+		end)
+	end
+	return file_path
+end
+
 -- Helper function to remove formatting esc sequences in the string
 ---@param str string
 ---@return string
