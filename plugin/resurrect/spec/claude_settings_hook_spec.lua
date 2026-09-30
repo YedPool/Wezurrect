@@ -282,6 +282,23 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.is_true(#logged.error > 0)
   end)
 
+  -- Windows PowerShell 5.1 "Set-Content -Encoding utf8" writes a UTF-8 BOM.
+  -- WezTerm's json_parse rejects it ("expected value at line 1 column 1").
+  it("adds both hooks to a BOM-prefixed settings.json and keeps the BOM", function()
+    local bom = "\239\187\191"
+    write_bytes(settings_path, bom .. '{ "model": "opus" }')
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local after = read_bytes(settings_path)
+    assert.are.equal(bom, after:sub(1, 3))
+    local settings = dkjson.decode(after:sub(4))
+    assert.are.equal("opus", settings.model)
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
   it("control: an empty settings.json gets both hooks", function()
     write_bytes(settings_path, "")
 

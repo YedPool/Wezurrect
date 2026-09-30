@@ -325,6 +325,11 @@ pub.register({
 -- to preserve"; any other failure means the file may exist.
 local ENOENT = 2
 
+-- UTF-8 byte-order mark. Windows PowerShell 5.1 "Set-Content -Encoding utf8"
+-- writes one, and WezTerm's json_parse rejects it (measured: "expected value
+-- at line 1 column 1").
+local UTF8_BOM = "\239\187\191"
+
 -- Load a Claude settings file for modification.
 --
 -- The caller rewrites the WHOLE file from the table returned here, so this
@@ -333,13 +338,16 @@ local ENOENT = 2
 -- cannot be opened, read, or parsed as a JSON object. Starting from {} in
 -- that case (the previous behaviour) overwrote a user's entire settings.json
 -- with just our hooks whenever it had a syntax error or was locked.
+-- A leading UTF-8 BOM is set aside before parsing and returned separately,
+-- so the caller can write it back and leave the encoding as it found it.
 ---@param path string
 ---@return table|nil settings
+---@return string bom UTF8_BOM or ""
 local function load_settings_for_update(path)
 	local f, open_err, errno = io.open(path, "r")
 	if not f then
 		if errno == ENOENT then
-			return {} -- no file yet: nothing to lose
+			return {}, "" -- no file yet: nothing to lose
 		end
 		wezterm.log_warn("resurrect: cannot open " .. path .. " (" .. tostring(open_err)
 			.. "); leaving it untouched, Claude hooks not configured")
@@ -351,8 +359,13 @@ local function load_settings_for_update(path)
 		wezterm.log_warn("resurrect: cannot read " .. path .. "; leaving it untouched, Claude hooks not configured")
 		return nil
 	end
+	local bom = ""
+	if content:sub(1, #UTF8_BOM) == UTF8_BOM then
+		bom = UTF8_BOM
+		content = content:sub(#UTF8_BOM + 1)
+	end
 	if content == "" then
-		return {} -- empty file: nothing to lose
+		return {}, bom -- empty file: nothing to lose
 	end
 	-- Only a JSON object is a settings file. An array parses to a Lua table
 	-- too, and "[]" is then indistinguishable from "{}", so decide on the
@@ -369,7 +382,7 @@ local function load_settings_for_update(path)
 			.. "); leaving it untouched, Claude hooks not configured")
 		return nil
 	end
-	return parsed
+	return parsed, bom
 end
 
 -- True when t is a table decoded from a JSON array (or an empty table,
@@ -449,7 +462,7 @@ end
 ---@param pane_sessions_dir string path to pane-sessions directory
 ---@return boolean success
 local function configure_hook_in_settings(target_settings_path, pane_sessions_dir)
-	local settings = load_settings_for_update(target_settings_path)
+	local settings, bom = load_settings_for_update(target_settings_path)
 	if not settings then
 		return false
 	end
@@ -519,7 +532,7 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 
 	-- Write directly (not atomic rename -- os.rename fails on Windows
 	-- when the target file already exists, causing silent failures).
-	local json_str = wezterm.json_encode(settings)
+	local json_str = bom .. wezterm.json_encode(settings)
 	local wf = io.open(target_settings_path, "w")
 	if not wf then
 		wezterm.log_error("resurrect: cannot write Claude settings to " .. target_settings_path)
