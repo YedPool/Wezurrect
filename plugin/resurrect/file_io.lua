@@ -36,6 +36,55 @@ function pub.write_file(file_path, str)
 	return suc, err
 end
 
+-- Check whether a file exists and is readable.
+---@param file_path string
+---@return boolean
+function pub.file_exists(file_path)
+	local handle = io.open(file_path, "rb")
+	if handle then
+		handle:close()
+		return true
+	end
+	return false
+end
+
+-- Move a file. Works on Windows, where os.rename fails if the destination
+-- already exists (POSIX silently overwrites). Falls back to remove-then-rename.
+-- The 1-instruction race between remove and rename can lose the destination
+-- on a crash, but for our save-flow callers the destination is the .bak we
+-- just wrote, not the canonical file -- so worst case is losing one backup.
+---@param src string
+---@param dst string
+---@return boolean success
+---@return string|nil error
+function pub.move_file(src, dst)
+	local ok = os.rename(src, dst)
+	if ok then
+		return true, nil
+	end
+	os.remove(dst)
+	local ok2, err = os.rename(src, dst)
+	if not ok2 then
+		return false, err
+	end
+	return true, nil
+end
+
+-- Copy a file by read + write. Not atomic; intended for state-backup snapshots
+-- where the source is the authoritative copy and a partial write is acceptable
+-- (the next backup pass will overwrite it).
+---@param src string
+---@param dst string
+---@return boolean success
+---@return string|nil error
+function pub.copy_file(src, dst)
+	local rok, content = pub.read_file(src)
+	if not rok then
+		return false, content
+	end
+	return pub.write_file(dst, content)
+end
+
 -- Read a file and return its content
 ---@param file_path string full filename
 ---@return boolean success result
