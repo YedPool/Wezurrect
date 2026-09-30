@@ -369,7 +369,9 @@ local function load_settings_for_update(path)
 		content = content:sub(#UTF8_BOM + 1)
 	end
 	if content == "" then
-		return {}, bom, original -- empty file: nothing to lose
+		-- Empty: nothing in it to lose. The caller still checks whether an
+		-- interrupted write of ours is why it is empty.
+		return {}, bom, original
 	end
 	-- Only a JSON object is a settings file. An array parses to a Lua table
 	-- too, and "[]" is then indistinguishable from "{}", so decide on the
@@ -525,6 +527,27 @@ local function read_file_bytes(path)
 	return content
 end
 
+-- What an interrupted write of ours left next to path, if anything: the
+-- staging file, the previous file, or a non-empty backup. Any of them beside
+-- an EMPTY settings.json is the signature of a crash inside the final write
+-- (which truncates first), not of a fresh install.
+---@param path string
+---@return string|nil leftover path of the first one found
+local function interrupted_write_evidence(path)
+	local files = sidecar_paths(path)
+	if read_file_bytes(files.staging) ~= nil then
+		return files.staging
+	end
+	if read_file_bytes(files.previous) ~= nil then
+		return files.previous
+	end
+	local backup = read_file_bytes(files.backup)
+	if backup ~= nil and backup ~= "" then
+		return files.backup
+	end
+	return nil
+end
+
 -- Replace a settings file's contents with new_bytes without ever leaving
 -- the user's settings only in memory.
 --
@@ -544,7 +567,9 @@ end
 --   * WezTerm dies, or the disk fills, after io.open(path, "wb") truncates
 --     and before the write completes: settings.json is empty or partial.
 --     The backup or the previous file holds the verified original; the
---     staging file holds the verified new content.
+--     staging file holds the verified new content. On the next start a
+--     partial file fails to parse and an empty one is refused while those
+--     copies exist, so neither is mistaken for a fresh install.
 --   * Two WezTerm processes start together: both read the same original and
 --     compute the same new bytes, so each copy they write is identical and
 --     either order ends in the same file. A read-back that sees the other's
@@ -680,6 +705,18 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 	local settings, bom, original = load_settings_for_update(target_settings_path)
 	if not settings then
 		return false
+	end
+	-- An empty file is only a fresh start when nothing of ours is beside it.
+	-- Otherwise treating it as fresh would write just our hooks and bury the
+	-- user's settings in a copy nobody looks at.
+	if original ~= nil and original:sub(#bom + 1) == "" then
+		local leftover = interrupted_write_evidence(target_settings_path)
+		if leftover then
+			wezterm.log_warn("resurrect: " .. target_settings_path .. " is empty but " .. leftover
+				.. " exists, which is what an interrupted write leaves behind; restore the settings"
+				.. " from it (or delete it) and restart. Leaving it untouched, Claude hooks not configured")
+			return false
+		end
 	end
 
 	-- Check if our hooks are already present (idempotency check).

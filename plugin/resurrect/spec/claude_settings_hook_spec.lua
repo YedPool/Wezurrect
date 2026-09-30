@@ -507,6 +507,36 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.is_true(#logged.warn > 0)
   end)
 
+  -- From the review's bakclobber.lua: a settings.json that a crash inside the
+  -- final write left at 0 bytes was treated as a fresh install, and the next
+  -- start replaced the user's settings with just our hooks.
+  it("refuses an emptied settings.json when a backup of it exists", function()
+    local user = '{"model":"opus","permissions":{"allow":["Bash(git:*)"]}}'
+    write_bytes(settings_path, user)
+    assert.is_true(process_handlers.setup_claude_session_hooks())
+    assert.are.equal(user, read_bytes(settings_path .. ".resurrect.bak"))
+    write_bytes(settings_path, "") -- the crash
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal("", read_bytes(settings_path))
+    assert.are.equal(user, read_bytes(settings_path .. ".resurrect.bak"))
+    assert.is_true(#logged.warn > 0)
+  end)
+
+  it("refuses an empty settings.json when a staging file was left behind", function()
+    write_bytes(settings_path, "")
+    write_bytes(settings_path .. ".resurrect.tmp", '{"model":"opus"}')
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal("", read_bytes(settings_path))
+    assert.are.equal('{"model":"opus"}', read_bytes(settings_path .. ".resurrect.tmp"))
+    assert.is_true(#logged.warn > 0)
+  end)
+
   it("control: an empty settings.json gets both hooks", function()
     write_bytes(settings_path, "")
 
