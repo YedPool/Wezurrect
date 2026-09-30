@@ -13,6 +13,13 @@
 -- JSON parser. The scanner only matches brackets and skips strings; it does
 -- not validate. Callers must re-parse the result before trusting it.
 --
+-- Keys are compared as raw text, without decoding escapes. A key written
+-- with an escape, such as "hook\u0073", is "hooks" to the parser but not to
+-- find_member, so a caller adding "hooks" can produce a duplicate key; the
+-- parser then keeps the last one. That is safe only because the caller
+-- re-parses the result and refuses when its meaning changed (see
+-- process_handlers: splice_hooks and the deep_equal check after it).
+--
 -- Positions are 1-based byte indexes into the text.
 
 local pub = {}
