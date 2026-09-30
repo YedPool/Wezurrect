@@ -8,7 +8,11 @@ Fork of MLFlexer/resurrect.wezterm with Windows fixes, security hardening, and C
 - All feature/fix work happens on branches in worktrees
 - Worktrees live at `Documents/Code/wezterm-resurrect Worktrees/<branch-name>`
 - Before creating a new worktree, update local main with latest from remote main
-- PRs merge to main with squash via `gh pr merge --squash`
+- Create a worktree from an updated main, from the main repo:
+  `git fetch origin main; git worktree add -b <branch> "../wezterm-resurrect Worktrees/<name>" origin/main`
+- PRs merge to main with a regular merge commit via `gh pr merge --merge`. Never squash:
+  squashing drops the branch commits' ancestry, which breaks `git branch --contains`,
+  bisect and cherry-pick provenance. Use `git log --first-parent` for a linear view.
 - Main repo at `Documents/Code/wezterm-resurrect` stays on `main` as the clean reference
 
 ## Plugin Architecture
