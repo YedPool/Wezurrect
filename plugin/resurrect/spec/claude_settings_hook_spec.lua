@@ -537,6 +537,45 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.is_true(#logged.warn > 0)
   end)
 
+  -- An empty object takes the new member with no separating comma. Driven
+  -- through the whole write path, so a wrong comma is caught here and not
+  -- only by json_text's unit test.
+  local empty_objects = {
+    { "{}", "{", "}" },
+    { "{ }", "{", " }" },
+    { "{CRLF}", "{", "\r\n}" },
+  }
+  for _, case in ipairs(empty_objects) do
+    local label, head, tail = case[1], case[2], case[3]
+    it("adds the hooks to the empty object " .. label .. " through the full write path", function()
+      write_bytes(settings_path, head .. tail)
+
+      local ok = process_handlers.setup_claude_session_hooks()
+
+      assert.is_true(ok)
+      local after = read_bytes(settings_path)
+      assert.are.equal(head .. '"hooks":', after:sub(1, #head + 8))
+      assert.are.equal(tail, after:sub(-#tail))
+      local settings = dkjson.decode(after)
+      assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+      assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+    end)
+  end
+
+  -- "hooks" is "hooks" to the parser but not to the text scanner, so the
+  -- splice adds a second "hooks" key. The parser keeps the last one, which
+  -- would silently drop the user's Stop hook; the re-parse check must refuse.
+  it("refuses a splice that would hide an escaped hooks key", function()
+    local original = '{"hook' .. string.char(92) .. 'u0073":{"Stop":[{"hooks":[{"type":"command","command":"echo keep"}]}]}}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.warn > 0)
+  end)
+
   it("control: an empty settings.json gets both hooks", function()
     write_bytes(settings_path, "")
 
