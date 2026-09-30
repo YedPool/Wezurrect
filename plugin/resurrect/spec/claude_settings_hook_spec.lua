@@ -331,25 +331,56 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
   end)
 
-  it("copies the original bytes to settings.json.bak before overwriting", function()
+  it("copies the original bytes to settings.json.resurrect.bak before overwriting", function()
     local original = '{ "model": "opus" }\r\n'
     write_bytes(settings_path, original)
 
     local ok = process_handlers.setup_claude_session_hooks()
 
     assert.is_true(ok)
-    assert.are.equal(original, read_bytes(settings_path .. ".bak"))
+    assert.are.equal(original, read_bytes(settings_path .. ".resurrect.bak"))
     local settings = dkjson.decode(read_bytes(settings_path))
     assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
     -- The staging file is gone once the replace succeeded.
-    assert.are.same({ "settings.json", "settings.json.bak" }, list_dir(claude_dir, "^settings"))
+    assert.are.same({ "settings.json", "settings.json.resurrect.bak" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  it("leaves a settings.json.bak the user made alone", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    write_bytes(settings_path .. ".bak", "the user's own backup")
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal("the user's own backup", read_bytes(settings_path .. ".bak"))
+    assert.are.equal(original, read_bytes(settings_path .. ".resurrect.bak"))
+  end)
+
+  -- The first backup is the file as it was before the plugin ever touched
+  -- it, which is the copy worth keeping; a later write keeps it.
+  it("keeps the first backup when it writes again later", function()
+    local first = '{ "model": "opus" }'
+    write_bytes(settings_path, first)
+    assert.is_true(process_handlers.setup_claude_session_hooks())
+    -- The user later replaces the file, dropping our hooks.
+    write_bytes(settings_path, '{ "model": "sonnet" }')
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal(first, read_bytes(settings_path .. ".resurrect.bak"))
+    local settings = dkjson.decode(read_bytes(settings_path))
+    assert.are.equal("sonnet", settings.model)
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+    assert.are.same({ "settings.json", "settings.json.resurrect.bak" }, list_dir(claude_dir, "^settings"))
   end)
 
   it("does not overwrite settings.json when the backup cannot be written", function()
     local original = '{ "model": "opus" }'
     write_bytes(settings_path, original)
     -- A directory where the backup should go makes the backup write fail.
-    assert.is_true(utils.ensure_folder_exists(settings_path .. ".bak"))
+    assert.is_true(utils.ensure_folder_exists(settings_path .. ".resurrect.bak"))
 
     local ok = process_handlers.setup_claude_session_hooks()
 
@@ -381,7 +412,7 @@ describe("process_handlers.setup_claude_session_hooks", function()
 
     assert.is_false(ok)
     assert.are.equal(original, read_bytes(settings_path))
-    assert.are.same({ "settings.json", "settings.json.bak" }, list_dir(claude_dir, "^settings"))
+    assert.are.same({ "settings.json", "settings.json.resurrect.bak" }, list_dir(claude_dir, "^settings"))
   end)
 
   it("control: makes no backup when there was no settings.json", function()
@@ -442,13 +473,13 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.is_true(process_handlers.setup_claude_session_hooks())
     local configured = read_bytes(settings_path) .. "\n"
     write_bytes(settings_path, configured)
-    os.remove(settings_path .. ".bak")
+    os.remove(settings_path .. ".resurrect.bak")
 
     local ok = process_handlers.setup_claude_session_hooks()
 
     assert.is_true(ok)
     assert.are.equal(configured, read_bytes(settings_path))
-    assert.is_nil(read_bytes(settings_path .. ".bak"))
+    assert.is_nil(read_bytes(settings_path .. ".resurrect.bak"))
   end)
 
   -- Only the text can tell "hooks":[] from "hooks":{} -- both parse to {}.

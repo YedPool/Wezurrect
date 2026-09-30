@@ -491,13 +491,50 @@ local function parses(bytes)
 	return (pcall(wezterm.json_parse, bytes))
 end
 
+-- The files the writer keeps next to a settings file. The names carry the
+-- plugin's name so they never collide with a settings.json.bak the user made.
+--   backup   the file as it was before the plugin first changed it. Written
+--            once and then kept: it is the one copy that predates the plugin,
+--            and later writes are rare (only when our hooks went missing),
+--            so replacing it would trade the most valuable copy for a newer
+--            one that the user still has in settings.json itself.
+--   previous this write's original, when it differs from the backup. Removed
+--            once the write has succeeded.
+--   staging  the new content, verified before settings.json is touched.
+--            Removed once the write has succeeded.
+-- Fixed names rather than per-process ones, so that the next start can see
+-- what an interrupted write left behind.
+---@param path string
+---@return table
+local function sidecar_paths(path)
+	return {
+		backup = path .. ".resurrect.bak",
+		previous = path .. ".resurrect.orig.tmp",
+		staging = path .. ".resurrect.tmp",
+	}
+end
+
+-- The bytes of a file, or nil when it cannot be opened or read.
+local function read_file_bytes(path)
+	local f = io.open(path, "rb")
+	if not f then
+		return nil
+	end
+	local content = f:read("a")
+	f:close()
+	return content
+end
+
 -- Replace a settings file's contents with new_bytes without ever leaving
 -- the user's settings only in memory.
 --
---   1. The original bytes are copied to <path>.bak and read back. If that
---      copy fails, nothing is overwritten.
---   2. new_bytes are written to a staging file next to it, read back, and
---      must re-parse as JSON. If not, nothing is overwritten.
+--   1. A non-empty original is copied aside and read back: to the backup if
+--      there is none yet, otherwise (when it differs from the backup) to the
+--      previous file. If that copy fails, nothing is overwritten. An empty
+--      original has nothing to lose and is never copied, so it can never
+--      replace a good backup.
+--   2. new_bytes are written to the staging file, read back, and must
+--      re-parse as JSON. If not, nothing is overwritten.
 --   3. Only then is <path> itself rewritten, and read back.
 --
 -- Step 3 is not atomic. Pure Lua has no atomic replace on Windows: os.rename
@@ -506,41 +543,56 @@ end
 -- file). So these windows remain, and what covers each:
 --   * WezTerm dies, or the disk fills, after io.open(path, "wb") truncates
 --     and before the write completes: settings.json is empty or partial.
---     <path>.bak holds the verified original; the staging file holds the
---     verified new content.
+--     The backup or the previous file holds the verified original; the
+--     staging file holds the verified new content.
 --   * Two WezTerm processes start together: both read the same original and
---     compute the same new bytes, so either order ends in the same file. A
---     read-back that sees the other's half-written bytes fails verification
---     and that process stops without touching settings.json.
+--     compute the same new bytes, so each copy they write is identical and
+--     either order ends in the same file. A read-back that sees the other's
+--     half-written bytes fails verification and that process stops.
 --   * Claude Code (or anything else) changes settings.json between our read
---     and our write: that change is lost, and the backup does not have it
---     because it holds what we read. The window is the few milliseconds
---     between the read above and step 3.
+--     and our write: that change is lost, and no copy has it because they
+--     hold what we read. The window is the few milliseconds between the read
+--     above and step 3.
 ---@param path string
 ---@param original string|nil the bytes being replaced; nil when there is no file
 ---@param new_bytes string
 ---@return boolean
 local function replace_settings_file(path, original, new_bytes)
-	if original ~= nil and not write_verified(path .. ".bak", original) then
-		wezterm.log_warn("resurrect: could not back up " .. path .. " to " .. path
-			.. ".bak; leaving it untouched, Claude hooks not configured")
-		return false
+	local files = sidecar_paths(path)
+	local used_previous = false
+	if original ~= nil and original ~= "" then
+		local backup = read_file_bytes(files.backup)
+		local target = files.backup
+		if backup ~= nil and backup ~= "" then
+			target = backup ~= original and files.previous or nil
+		end
+		if target and not write_verified(target, original) then
+			wezterm.log_warn("resurrect: could not back up " .. path .. " to " .. target
+				.. "; leaving it untouched, Claude hooks not configured")
+			return false
+		end
+		used_previous = target == files.previous
 	end
-	-- Unique per process so two WezTerm instances never share a staging file.
-	local staging = path .. "." .. tostring({}):gsub("[^%w]", "") .. ".tmp"
-	if not write_verified(staging, new_bytes) or not parses(new_bytes) then
-		os.remove(staging)
+	if not write_verified(files.staging, new_bytes) or not parses(new_bytes) then
+		os.remove(files.staging)
+		if used_previous then
+			os.remove(files.previous)
+		end
 		wezterm.log_warn("resurrect: could not stage new settings for " .. path
 			.. "; leaving it untouched, Claude hooks not configured")
 		return false
 	end
 	if not write_verified(path, new_bytes) then
-		-- Keep the staging file: with the backup it is the way back.
+		-- Keep every copy: they are the way back.
 		wezterm.log_error("resurrect: writing " .. path .. " failed part way; the original is in "
-			.. path .. ".bak and the intended content in " .. staging)
+			.. (used_previous and files.previous or files.backup)
+			.. " and the intended content in " .. files.staging)
 		return false
 	end
-	os.remove(staging)
+	os.remove(files.staging)
+	if used_previous then
+		os.remove(files.previous)
+	end
 	return true
 end
 
