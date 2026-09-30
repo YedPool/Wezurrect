@@ -589,22 +589,29 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 		.. 'cat > "' .. safe_dir .. '/${pane_id}.json"; '
 		.. "else echo \"resurrect: invalid WEZTERM_PANE: $pane_id\" >&2; cat > /dev/null; fi'"
 
-	local hook_entry = {
-		matcher = "",
-		hooks = {
-			{
-				type = "command",
-				command = hook_command,
+	-- A new table for each event. WezTerm's json_encode writes a table it has
+	-- already written as null, even when the repeat is a sibling rather than a
+	-- cycle (measured with WezTerm's own Lua): one shared entry under both
+	-- events came out as "Stop":[null], so the Stop hook was never installed
+	-- on the first run and Claude Code was handed a null hook entry.
+	local function new_hook_entry()
+		return {
+			matcher = "",
+			hooks = {
+				{
+					type = "command",
+					command = hook_command,
+				},
 			},
-		},
-	}
+		}
+	end
 
 	-- SessionStart: captures session ID when Claude starts or resumes.
 	if not has_session_start then
 		if not settings.hooks.SessionStart then
 			settings.hooks.SessionStart = {}
 		end
-		table.insert(settings.hooks.SessionStart, hook_entry)
+		table.insert(settings.hooks.SessionStart, new_hook_entry())
 	end
 
 	-- Stop: refreshes session ID after every Claude response. This keeps
@@ -615,7 +622,7 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 		if not settings.hooks.Stop then
 			settings.hooks.Stop = {}
 		end
-		table.insert(settings.hooks.Stop, hook_entry)
+		table.insert(settings.hooks.Stop, new_hook_entry())
 	end
 
 	local json_str = bom .. wezterm.json_encode(settings)

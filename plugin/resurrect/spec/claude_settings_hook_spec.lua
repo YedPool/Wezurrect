@@ -21,6 +21,10 @@ local logged = { warn = {}, error = {}, info = {} }
 --   * json_encode emits object keys sorted, turns an empty table into {},
 --     and raises "Unexpected key ... for array style table" on a table that
 --     mixes integer and string keys (e.g. [1,2] after .hooks was set on it).
+--   * json_encode writes a table that it has already written once as null,
+--     even when the second reference is a sibling and not a cycle: one entry
+--     table placed under both hooks.SessionStart and hooks.Stop came out as
+--     "SessionStart":[{...}],"Stop":[null].
 local function strip_array_marks(value)
   if type(value) == "table" then
     setmetatable(value, nil)
@@ -31,9 +35,14 @@ local function strip_array_marks(value)
   return value
 end
 
-local function wez_encode(value)
+local function wez_encode(value, seen)
+  seen = seen or {}
   local t = type(value)
   if t == "table" then
+    if seen[value] then
+      return "null"
+    end
+    seen[value] = true
     local has_num, has_str = false, false
     for k in pairs(value) do
       if type(k) == "number" then
@@ -48,7 +57,7 @@ local function wez_encode(value)
     local parts = {}
     if has_num then
       for i = 1, #value do
-        parts[i] = wez_encode(value[i])
+        parts[i] = wez_encode(value[i], seen)
       end
       return "[" .. table.concat(parts, ",") .. "]"
     end
@@ -58,7 +67,7 @@ local function wez_encode(value)
     end
     table.sort(keys)
     for i, k in ipairs(keys) do
-      parts[i] = dkjson.quotestring(k) .. ":" .. wez_encode(value[k])
+      parts[i] = dkjson.quotestring(k) .. ":" .. wez_encode(value[k], seen)
     end
     return "{" .. table.concat(parts, ",") .. "}"
   elseif t == "string" then
@@ -89,7 +98,9 @@ local wezterm_stub = {
     end
     return strip_array_marks(value)
   end,
-  json_encode = wez_encode,
+  json_encode = function(value)
+    return wez_encode(value)
+  end,
 }
 _G.wezterm = wezterm_stub
 package.preload["wezterm"] = function()
