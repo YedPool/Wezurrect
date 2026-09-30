@@ -13,22 +13,83 @@ end
 
 local logged = { warn = {}, error = {}, info = {} }
 
+-- The stub mirrors what WezTerm's own json_parse/json_encode do, as measured
+-- by running WezTerm's Lua (wezterm --config-file probe.lua ls-fonts):
+--   * json_parse raises on malformed input, on a leading UTF-8 BOM and on
+--     trailing characters, and returns plain tables: an array and an object
+--     are indistinguishable afterwards, and a null member simply vanishes.
+--   * json_encode emits object keys sorted, turns an empty table into {},
+--     and raises "Unexpected key ... for array style table" on a table that
+--     mixes integer and string keys (e.g. [1,2] after .hooks was set on it).
+local function strip_array_marks(value)
+  if type(value) == "table" then
+    setmetatable(value, nil)
+    for _, v in pairs(value) do
+      strip_array_marks(v)
+    end
+  end
+  return value
+end
+
+local function wez_encode(value)
+  local t = type(value)
+  if t == "table" then
+    local has_num, has_str = false, false
+    for k in pairs(value) do
+      if type(k) == "number" then
+        has_num = true
+      else
+        has_str = true
+      end
+    end
+    if has_num and has_str then
+      error("error converting Lua string to numeric array index (Unexpected key for array style table)")
+    end
+    local parts = {}
+    if has_num then
+      for i = 1, #value do
+        parts[i] = wez_encode(value[i])
+      end
+      return "[" .. table.concat(parts, ",") .. "]"
+    end
+    local keys = {}
+    for k in pairs(value) do
+      keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    for i, k in ipairs(keys) do
+      parts[i] = dkjson.quotestring(k) .. ":" .. wez_encode(value[k])
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+  elseif t == "string" then
+    return dkjson.quotestring(value)
+  elseif t == "number" then
+    if math.type(value) == "integer" then
+      return tostring(value)
+    end
+    return string.format("%.17g", value)
+  elseif t == "boolean" then
+    return tostring(value)
+  end
+  error("cannot encode a " .. t)
+end
+
 local wezterm_stub = {
   target_triple = is_windows() and "x86_64-pc-windows-msvc" or "x86_64-unknown-linux-gnu",
   log_warn = function(msg) table.insert(logged.warn, msg) end,
   log_error = function(msg) table.insert(logged.error, msg) end,
   log_info = function(msg) table.insert(logged.info, msg) end,
-  -- wezterm.json_parse raises on malformed input; mirror that.
   json_parse = function(str)
-    local value, _, err = dkjson.decode(str)
+    local value, pos, err = dkjson.decode(str)
     if err then
       error(err)
     end
-    return value
+    if str:find("%S", pos) then
+      error("trailing characters")
+    end
+    return strip_array_marks(value)
   end,
-  json_encode = function(value)
-    return dkjson.encode(value)
-  end,
+  json_encode = wez_encode,
 }
 _G.wezterm = wezterm_stub
 package.preload["wezterm"] = function()
