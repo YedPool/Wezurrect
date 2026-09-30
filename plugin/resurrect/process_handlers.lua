@@ -320,26 +320,60 @@ pub.register({
 	end,
 })
 
+-- errno for "No such file or directory" (the same value in POSIX libc and the
+-- Windows CRT). It is the only io.open failure that means "there is nothing
+-- to preserve"; any other failure means the file may exist.
+local ENOENT = 2
+
+-- Load a Claude settings file for modification.
+--
+-- The caller rewrites the WHOLE file from the table returned here, so this
+-- must only return a table that holds everything the file holds. It returns
+-- nil -- and the caller must not write -- whenever the file exists but
+-- cannot be opened, read, or parsed as a JSON object. Starting from {} in
+-- that case (the previous behaviour) overwrote a user's entire settings.json
+-- with just our hooks whenever it had a syntax error or was locked.
+---@param path string
+---@return table|nil settings
+local function load_settings_for_update(path)
+	local f, open_err, errno = io.open(path, "r")
+	if not f then
+		if errno == ENOENT then
+			return {} -- no file yet: nothing to lose
+		end
+		wezterm.log_warn("resurrect: cannot open " .. path .. " (" .. tostring(open_err)
+			.. "); leaving it untouched, Claude hooks not configured")
+		return nil
+	end
+	local content = f:read("*a")
+	f:close()
+	if content == nil then
+		wezterm.log_warn("resurrect: cannot read " .. path .. "; leaving it untouched, Claude hooks not configured")
+		return nil
+	end
+	if content == "" then
+		return {} -- empty file: nothing to lose
+	end
+	local ok, parsed = pcall(wezterm.json_parse, content)
+	if not ok or type(parsed) ~= "table" then
+		wezterm.log_warn("resurrect: could not parse " .. path .. " as a JSON object ("
+			.. tostring(ok and type(parsed) or parsed)
+			.. "); leaving it untouched, Claude hooks not configured")
+		return nil
+	end
+	return parsed
+end
+
 -- Configure the SessionStart hook in a single Claude Code settings file.
 -- Returns true if hook is already present or was successfully added.
+-- Returns false, without writing, if the existing file cannot be loaded.
 ---@param target_settings_path string path to settings.json
 ---@param pane_sessions_dir string path to pane-sessions directory
 ---@return boolean success
 local function configure_hook_in_settings(target_settings_path, pane_sessions_dir)
-	-- Read existing settings (or start fresh)
-	local settings = {}
-	local f = io.open(target_settings_path, "r")
-	if f then
-		local content = f:read("*a")
-		f:close()
-		if content and content ~= "" then
-			local ok, parsed = pcall(wezterm.json_parse, content)
-			if ok and parsed then
-				settings = parsed
-			else
-				wezterm.log_warn("resurrect: could not parse " .. target_settings_path .. ", will add hooks to fresh object")
-			end
-		end
+	local settings = load_settings_for_update(target_settings_path)
+	if not settings then
+		return false
 	end
 
 	-- Check if our hooks are already present (idempotency check).
