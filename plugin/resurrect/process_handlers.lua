@@ -343,11 +343,13 @@ local UTF8_BOM = "\239\187\191"
 ---@param path string
 ---@return table|nil settings
 ---@return string bom UTF8_BOM or ""
+---@return string|nil original the file's exact bytes; nil when there was no file
 local function load_settings_for_update(path)
-	local f, open_err, errno = io.open(path, "r")
+	-- Binary mode: the bytes read are the bytes backed up, byte for byte.
+	local f, open_err, errno = io.open(path, "rb")
 	if not f then
 		if errno == ENOENT then
-			return {}, "" -- no file yet: nothing to lose
+			return {}, "", nil -- no file yet: nothing to lose
 		end
 		wezterm.log_warn("resurrect: cannot open " .. path .. " (" .. tostring(open_err)
 			.. "); leaving it untouched, Claude hooks not configured")
@@ -359,13 +361,14 @@ local function load_settings_for_update(path)
 		wezterm.log_warn("resurrect: cannot read " .. path .. "; leaving it untouched, Claude hooks not configured")
 		return nil
 	end
+	local original = content
 	local bom = ""
 	if content:sub(1, #UTF8_BOM) == UTF8_BOM then
 		bom = UTF8_BOM
 		content = content:sub(#UTF8_BOM + 1)
 	end
 	if content == "" then
-		return {}, bom -- empty file: nothing to lose
+		return {}, bom, original -- empty file: nothing to lose
 	end
 	-- Only a JSON object is a settings file. An array parses to a Lua table
 	-- too, and "[]" is then indistinguishable from "{}", so decide on the
@@ -382,7 +385,7 @@ local function load_settings_for_update(path)
 			.. "); leaving it untouched, Claude hooks not configured")
 		return nil
 	end
-	return parsed, bom
+	return parsed, bom, original
 end
 
 -- True when t is a table decoded from a JSON array (or an empty table,
@@ -455,6 +458,91 @@ local function find_pane_session_hooks(settings)
 	return found.SessionStart == true, found.Stop == true
 end
 
+-- Write bytes to path, then read the file back. True only when the file on
+-- disk now holds exactly those bytes.
+---@param path string
+---@param bytes string
+---@return boolean
+local function write_verified(path, bytes)
+	local f = io.open(path, "wb")
+	if not f then
+		return false
+	end
+	local wrote = f:write(bytes)
+	local closed = f:close()
+	if not wrote or not closed then
+		return false
+	end
+	local r = io.open(path, "rb")
+	if not r then
+		return false
+	end
+	local back = r:read("a")
+	r:close()
+	return back == bytes
+end
+
+-- True when bytes (after an optional BOM) parse as JSON.
+local function parses(bytes)
+	if bytes:sub(1, #UTF8_BOM) == UTF8_BOM then
+		bytes = bytes:sub(#UTF8_BOM + 1)
+	end
+	return (pcall(wezterm.json_parse, bytes))
+end
+
+-- Replace a settings file's contents with new_bytes without ever leaving
+-- the user's settings only in memory.
+--
+--   1. The original bytes are copied to <path>.bak and read back. If that
+--      copy fails, nothing is overwritten.
+--   2. new_bytes are written to a staging file next to it, read back, and
+--      must re-parse as JSON. If not, nothing is overwritten.
+--   3. Only then is <path> itself rewritten, and read back.
+--
+-- Step 3 is not atomic. Pure Lua has no atomic replace on Windows: os.rename
+-- fails there when the target exists, and remove-then-rename leaves a moment
+-- with no file at all (and would turn a symlinked settings.json into a plain
+-- file). So these windows remain, and what covers each:
+--   * WezTerm dies, or the disk fills, after io.open(path, "wb") truncates
+--     and before the write completes: settings.json is empty or partial.
+--     <path>.bak holds the verified original; the staging file holds the
+--     verified new content.
+--   * Two WezTerm processes start together: both read the same original and
+--     compute the same new bytes, so either order ends in the same file. A
+--     read-back that sees the other's half-written bytes fails verification
+--     and that process stops without touching settings.json.
+--   * Claude Code (or anything else) changes settings.json between our read
+--     and our write: that change is lost, and the backup does not have it
+--     because it holds what we read. The window is the few milliseconds
+--     between the read above and step 3.
+---@param path string
+---@param original string|nil the bytes being replaced; nil when there is no file
+---@param new_bytes string
+---@return boolean
+local function replace_settings_file(path, original, new_bytes)
+	if original ~= nil and not write_verified(path .. ".bak", original) then
+		wezterm.log_warn("resurrect: could not back up " .. path .. " to " .. path
+			.. ".bak; leaving it untouched, Claude hooks not configured")
+		return false
+	end
+	-- Unique per process so two WezTerm instances never share a staging file.
+	local staging = path .. "." .. tostring({}):gsub("[^%w]", "") .. ".tmp"
+	if not write_verified(staging, new_bytes) or not parses(new_bytes) then
+		os.remove(staging)
+		wezterm.log_warn("resurrect: could not stage new settings for " .. path
+			.. "; leaving it untouched, Claude hooks not configured")
+		return false
+	end
+	if not write_verified(path, new_bytes) then
+		-- Keep the staging file: with the backup it is the way back.
+		wezterm.log_error("resurrect: writing " .. path .. " failed part way; the original is in "
+			.. path .. ".bak and the intended content in " .. staging)
+		return false
+	end
+	os.remove(staging)
+	return true
+end
+
 -- Configure the SessionStart hook in a single Claude Code settings file.
 -- Returns true if hook is already present or was successfully added.
 -- Returns false, without writing, if the existing file cannot be loaded.
@@ -462,7 +550,7 @@ end
 ---@param pane_sessions_dir string path to pane-sessions directory
 ---@return boolean success
 local function configure_hook_in_settings(target_settings_path, pane_sessions_dir)
-	local settings, bom = load_settings_for_update(target_settings_path)
+	local settings, bom, original = load_settings_for_update(target_settings_path)
 	if not settings then
 		return false
 	end
@@ -530,17 +618,10 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 		table.insert(settings.hooks.Stop, hook_entry)
 	end
 
-	-- Write directly (not atomic rename -- os.rename fails on Windows
-	-- when the target file already exists, causing silent failures).
 	local json_str = bom .. wezterm.json_encode(settings)
-	local wf = io.open(target_settings_path, "w")
-	if not wf then
-		wezterm.log_error("resurrect: cannot write Claude settings to " .. target_settings_path)
+	if not replace_settings_file(target_settings_path, original, json_str) then
 		return false
 	end
-	wf:write(json_str)
-	wf:flush()
-	wf:close()
 
 	wezterm.log_info("resurrect: Claude Code hooks configured at " .. target_settings_path)
 	return true

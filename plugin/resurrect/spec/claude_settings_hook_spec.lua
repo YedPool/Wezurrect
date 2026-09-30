@@ -143,6 +143,27 @@ local function write_bytes(path, content)
   f:close()
 end
 
+-- Sorted names in dir that match pattern.
+local function list_dir(dir, pattern)
+  local cmd
+  if utils.is_windows then
+    cmd = 'dir /b /a "' .. dir .. '" 2>nul'
+  else
+    cmd = "ls -A '" .. dir .. "'"
+  end
+  local names = {}
+  local p = assert(io.popen(cmd))
+  for line in p:lines() do
+    line = line:gsub("\r$", "")
+    if line:find(pattern) then
+      names[#names + 1] = line
+    end
+  end
+  p:close()
+  table.sort(names)
+  return names
+end
+
 local function count_pane_session_hooks(settings, event_name)
   local n = 0
   for _, entry in ipairs((settings.hooks or {})[event_name] or {}) do
@@ -297,6 +318,61 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.are.equal("opus", settings.model)
     assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
     assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
+  it("copies the original bytes to settings.json.bak before overwriting", function()
+    local original = '{ "model": "opus" }\r\n'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal(original, read_bytes(settings_path .. ".bak"))
+    local settings = dkjson.decode(read_bytes(settings_path))
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    -- The staging file is gone once the replace succeeded.
+    assert.are.same({ "settings.json", "settings.json.bak" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  it("does not overwrite settings.json when the backup cannot be written", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    -- A directory where the backup should go makes the backup write fail.
+    assert.is_true(utils.ensure_folder_exists(settings_path .. ".bak"))
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.warn + #logged.error > 0)
+  end)
+
+  it("does not overwrite settings.json when the new content does not re-parse", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    -- Accept the original; reject anything that already carries our hook,
+    -- which is only ever the staged new content.
+    local real_parse = wezterm_stub.json_parse
+    wezterm_stub.json_parse = function(str)
+      if str:find("pane%-sessions") then
+        error("simulated parse failure")
+      end
+      return real_parse(str)
+    end
+
+    local ok = process_handlers.setup_claude_session_hooks()
+    wezterm_stub.json_parse = real_parse
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.are.same({ "settings.json", "settings.json.bak" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  it("control: makes no backup when there was no settings.json", function()
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.same({ "settings.json" }, list_dir(claude_dir, "^settings"))
   end)
 
   it("control: an empty settings.json gets both hooks", function()
