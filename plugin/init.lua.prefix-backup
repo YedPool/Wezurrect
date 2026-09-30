@@ -7,13 +7,7 @@ local function init()
 	-- enable_sub_modules()
 	local opts = {
 		auto = true,
-		-- Substring(s) present in the encoded plugin path. wezterm caches by the
-		-- URL the user supplied (NOT the redirect target), so paths can be
-		-- "...sZsYedPoolsZsWezurrect" (canonical URL) OR
-		-- "...sZsYedPoolsZsresurrectsDswezterm" (README's redirected URL).
-		-- "YedPool" is the only substring common to both forms; it also
-		-- correctly excludes the upstream MLFlexer fork.
-		keywords = { "YedPool" },
+		keywords = { "resurrect", "wezterm" },
 	}
 	local plugin_path = dev.setup(opts)
 
@@ -28,8 +22,6 @@ local function init()
 	pub.state_manager = require("resurrect.state_manager")
 	pub.process_handlers = require("resurrect.process_handlers")
 	pub.instance_manager = require("resurrect.instance_manager")
-	pub.save_index = require("resurrect.save_index")
-	pub.cleanup = require("resurrect.cleanup")
 end
 
 init()
@@ -46,7 +38,7 @@ init()
 ---   save_workspaces      = true
 ---   save_windows         = true
 ---   save_tabs            = true
----   keybindings          = true   -- add Alt+S/R/W/Shift+W/Shift+T + Ctrl+Shift+B bindings
+---   keybindings          = true   -- add Alt+S/R/W/Shift+W/Shift+T bindings
 ---   status_bar           = true   -- show save time + tab titles in right status
 ---   claude_hooks         = true   -- auto-configure Claude Code SessionStart hook
 ---   auto_restore_prompt  = true   -- show instance selector on startup if saved instances exist
@@ -199,15 +191,6 @@ function pub.setup(config, opts)
 			mods = "ALT",
 			action = wezterm.action_callback(function(win, pane)
 				pub.instance_manager.show_instance_selector(win, pane, restore_opts)
-			end),
-		})
-
-		-- Ctrl+Shift+B: break the active pane out into a new window
-		table.insert(config.keys, {
-			key = "b",
-			mods = "CTRL|SHIFT",
-			action = wezterm.action_callback(function(win, pane)
-				pane:move_to_new_window()
 			end),
 		})
 	end

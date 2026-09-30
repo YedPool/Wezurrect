@@ -712,27 +712,6 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 	end
 end
 
---- Options for the "browse named saves" listing.
----
---- Named saves are keyed by window title, and titles are not stable: Claude
---- Code prefixes a spinner glyph that ticks between frames and renames a
---- session as its topic evolves, so one conversation accumulates many saves
---- under different names. dedupe_sessions collapses those to the newest save
---- per conversation, which also keeps the list short enough to be usable as a
---- plain arrow-key list rather than a search prompt.
----@return table fuzzy_load_opts overrides
-function pub.browse_named_saves_opts()
-	return {
-		ignore_instances = true,
-		dedupe_sessions = true,
-		sort_by_date = true,
-		show_state_with_date = true,
-		is_fuzzy = false,
-		title = "Restore a saved session",
-		description = "Newest first, one entry per conversation. Enter = restore, Esc = cancel, / = filter",
-	}
-end
-
 --- Show the main instance selector with multi-select support.
 --- Space (Enter) toggles selection, then pick "Restore selected" to restore all.
 --- Esc dismisses to start a fresh terminal session.
@@ -747,12 +726,7 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 	-- If no instances, fall through to fuzzy_load for named saves
 	if #instances == 0 then
 		local fuzzy_loader = require("resurrect.fuzzy_loader")
-		fuzzy_loader.fuzzy_load(
-			window,
-			pane,
-			make_fuzzy_restore_callback(restore_opts, pane),
-			pub.browse_named_saves_opts()
-		)
+		fuzzy_loader.fuzzy_load(window, pane, make_fuzzy_restore_callback(restore_opts, pane))
 		return
 	end
 
@@ -784,7 +758,6 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 	table.insert(choices, { id = "__BROWSE_NAMED__", label = "[Browse named saves]" })
 	table.insert(choices, { id = "__RENAME_MODE__", label = "[Rename an instance]" })
 	table.insert(choices, { id = "__DELETE_MODE__", label = "[Delete saved instances]" })
-	table.insert(choices, { id = "__CLEANUP_MODE__", label = "[Clean up duplicate saves]" })
 
 	window:perform_action(
 		wezterm.action.InputSelector({
@@ -806,17 +779,12 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 					return
 				end
 
-				if id == "__CLEANUP_MODE__" then
-					require("resurrect.cleanup").show_cleanup_selector(inner_win, inner_pane)
-					return
-				end
-
 				if id == "__BROWSE_NAMED__" then
 					local fuzzy_loader = require("resurrect.fuzzy_loader")
 					fuzzy_loader.fuzzy_load(
 						inner_win, inner_pane,
 						make_fuzzy_restore_callback(restore_opts, inner_pane),
-						pub.browse_named_saves_opts()
+						{ ignore_instances = true }
 					)
 					return
 				end

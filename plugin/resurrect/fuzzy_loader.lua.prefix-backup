@@ -1,12 +1,13 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local utils = require("resurrect.utils")
+local file_io = require("resurrect.file_io")
 local pub = {}
 
 ---@alias fmt_fun fun(label: string): string
 ---@alias fuzzy_load_opts {title: string, description: string, fuzzy_description: string, is_fuzzy: boolean,
 ---ignore_workspaces: boolean, ignore_tabs: boolean, ignore_windows: boolean, fmt_window: fmt_fun, fmt_workspace: fmt_fun,
 ---fmt_tab: fmt_fun, fmt_date: fmt_fun, show_state_with_date: boolean, date_format: string, ignore_screen_width: boolean,
----name_truncature: string, min_filename_size: number, dedupe_sessions: boolean, sort_by_date: boolean}
+---name_truncature: string, min_filename_size: number}
 
 ---Default fuzzy loading options
 ---@type fuzzy_load_opts
@@ -22,10 +23,6 @@ pub.default_fuzzy_load_opts = {
 	ignore_screen_width = true,
 	date_format = "%d-%m-%Y %H:%M:%S",
 	show_state_with_date = false,
-	-- Off by default so existing callers keep their exact behaviour; the
-	-- browse-named-saves flow turns both on.
-	dedupe_sessions = false,
-	sort_by_date = false,
 	name_truncature = " " .. wezterm.nerdfonts.cod_ellipsis .. "  ",
 	min_filename_size = 10,
 	fmt_date = function(date)
@@ -54,132 +51,46 @@ pub.default_fuzzy_load_opts = {
 	end,
 }
 
--- Save types the fuzzy loader understands, and the only sub-folders of the
--- state dir that are scanned. Everything else under state/ (instances/,
--- instances/restored/, and the .backups/ folders that rotate_backup creates)
--- is deliberately skipped: those parent-folder names would flow into
--- fmt_cost[type]/files[type] as unknown keys and crash insert_choices, and
--- .backups grows without bound (200k+ files on a long-lived install, which
--- made a recursive scan take minutes). Instance files have their own selector.
-local SAVE_TYPES = { "workspace", "window", "tab" }
-local VALID_TYPES = {}
-for _, save_type in ipairs(SAVE_TYPES) do
-	VALID_TYPES[save_type] = true
-end
-
--- Build the Windows listing command. Kept pure so specs can pin the exact
--- shape. Two properties matter and are both regression-tested:
---   1. It must not emit "...) .ToString()" - whitespace before a member
---      accessor is a PowerShell parser error, which made every enumeration
---      fail with exit code 1 (the reason browse-named-saves was always empty).
---   2. It must batch output through a StringBuilder and a single
---      [Console]::Out.Write. Emitting one object per file through the
---      PowerShell pipeline costs ~7ms per file; batching keeps a ~950-save
---      listing at roughly the cost of interpreter startup alone.
----@param base_path string
----@return string[] argv for wezterm.run_child_process
-local function build_windows_list_command(base_path)
-	local quoted_types = {}
-	for _, save_type in ipairs(SAVE_TYPES) do
-		table.insert(quoted_types, "'" .. save_type .. "'")
-	end
-	local ps_cmd = string.format(
-		-- Force UTF-8 stdout. Save names routinely contain characters outside
-		-- the OEM/ANSI codepage (Claude window titles carry spinner glyphs like
-		-- U+2739 and U+2802), and PowerShell's default redirected-output
-		-- encoding would replace them with "?" - producing names that list fine
-		-- but can never be opened. wezterm-gui.exe runs with activeCodePage
-		-- UTF-8, so UTF-8 bytes are exactly what its Lua io.open expects.
-		"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-			.. "$sb = New-Object System.Text.StringBuilder; "
-			.. "foreach ($t in %s) { "
-			.. "$d = Join-Path '%s' $t; "
-			.. "if ([System.IO.Directory]::Exists($d)) { "
-			.. "$di = New-Object System.IO.DirectoryInfo $d; "
-			.. "foreach ($f in $di.EnumerateFiles('*.json')) { "
-			.. "if ($f.Name.EndsWith('.json')) { "
-			.. "[void]$sb.AppendLine("
-			.. "([long]($f.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds).ToString() "
-			.. "+ ' ' + $f.FullName) } } } }; "
-			.. "[Console]::Out.Write($sb.ToString())",
-		table.concat(quoted_types, ","),
-		base_path:gsub("'", "''")
-	)
-	return { "powershell.exe", "-NoProfile", "-NoLogo", "-Command", ps_cmd }
-end
-
--- Build the POSIX listing command. Same scoping rule as Windows: only the
--- save-type folders, never a recursive walk of the whole state tree.
----@param base_path string
----@param is_mac boolean
----@return string[] argv for wezterm.run_child_process
-local function build_posix_list_command(base_path, is_mac)
-	-- Single-quote escaping prevents shell injection via $() and backticks
-	local safe_path = base_path:gsub("'", "'\\''")
-	local stat_part = is_mac and "-exec stat -f '%m %N' {} +"
-		or "-printf '%T@ %p\\n' | awk '{split($1, a, \".\"); print a[1], $2}'"
-	local parts = {}
-	for _, save_type in ipairs(SAVE_TYPES) do
-		local dir = "'" .. safe_path .. "/" .. save_type .. "'"
-		table.insert(
-			parts,
-			string.format("if [ -d %s ]; then find %s -maxdepth 1 -type f -name '*.json' %s; fi", dir, dir, stat_part)
-		)
-	end
-	return { "sh", "-c", table.concat(parts, "; ") }
-end
-
--- Parse one "epoch <absolute path>" listing line into its parts. Tolerates
--- leading whitespace and a trailing \r (PowerShell emits CRLF). Returns nil
--- for lines that do not look like a save file or whose parent folder is not
--- a whitelisted save type.
----@param line string
----@return {epoch: number, type: string, filename: string}|nil
-local function parse_listing_line(line)
-	line = line:match("^%s*(.-)%s*$")
-	local epoch, type, file = line:match("^(%d+)%s+.+[/\\]([^/\\]+)[/\\]([^/\\]+%.json)$")
-	if not (epoch and type and file) then
-		return nil
-	end
-	if not VALID_TYPES[type] then
-		return nil
-	end
-	return { epoch = tonumber(epoch), type = type, filename = file }
-end
-
--- Parse full listing stdout into an array of entries. Splits on both \n and
--- \r\n; unparseable or non-whitelisted lines are skipped.
----@param stdout string|nil
----@return {epoch: number, type: string, filename: string}[]
-local function parse_file_listing(stdout)
-	local entries = {}
-	if stdout == nil then
-		return entries
-	end
-	for line in stdout:gmatch("[^\r\n]+") do
-		local entry = parse_listing_line(line)
-		if entry then
-			table.insert(entries, entry)
-		end
-	end
-	return entries
-end
-
--- List save files by scanning only the save-type folders directly under
--- base_path (never a recursive walk - see SAVE_TYPES).
+-- Recursive JSON file finder using wezterm.run_child_process (no os.execute, no VBS).
 -- Returns lines of "epoch filepath" for each .json file found.
----@param base_path string the state dir containing the save-type folders
+---@param base_path string starting path from which the recursive search takes place
 ---@return string|nil
-local function find_state_files(base_path)
+local function find_json_files_recursive(base_path)
 	local success, stdout, stderr
 
-	-- Uses run_child_process, so this must never be called during plugin init
-	-- or config loading (it yields). On Windows this spawns PowerShell with no
-	-- visible window and no VBS temp files.
 	if utils.is_windows then
-		success, stdout, stderr = wezterm.run_child_process(build_windows_list_command(base_path))
+		-- Use PowerShell via run_child_process -- no visible window, no VBS temp files.
+		-- PowerShell Get-ChildItem is available on all modern Windows.
+		local ps_cmd = string.format(
+			"Get-ChildItem -Path '%s' -Recurse -Filter '*.json' -File | "
+				.. "ForEach-Object { "
+				.. "[int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds) "
+				.. ".ToString() + ' ' + $_.FullName }",
+			base_path:gsub("'", "''")
+		)
+		success, stdout, stderr = wezterm.run_child_process({
+			"powershell.exe",
+			"-NoProfile",
+			"-NoLogo",
+			"-Command",
+			ps_cmd,
+		})
+	elseif utils.is_mac then
+		-- Use single-quote escaping to prevent shell injection via $() and backticks
+		local safe_path = base_path:gsub("'", "'\\''")
+		success, stdout, stderr = wezterm.run_child_process({
+			"sh",
+			"-c",
+			"find '" .. safe_path .. "' -type f -name '*.json' -print0 | xargs -0 stat -f '%m %N'",
+		})
 	else
-		success, stdout, stderr = wezterm.run_child_process(build_posix_list_command(base_path, utils.is_mac))
+		-- Use single-quote escaping to prevent shell injection via $() and backticks
+		local safe_path = base_path:gsub("'", "'\\''")
+		success, stdout, stderr = wezterm.run_child_process({
+			"sh",
+			"-c",
+			"find '" .. safe_path .. "' -type f -name '*.json' -printf '%T@ %p\\n' | awk '{split($1, a, \".\"); print a[1], $2}'",
+		})
 	end
 
 	if success then
@@ -190,11 +101,11 @@ local function find_state_files(base_path)
 	end
 end
 
--- build a table with the parsed entries of the file finder function
----@param entries {epoch: number, type: string, filename: string}[]
+-- build a table with the output of the file finder function
+---@param stdout string|nil
 ---@param opts table
 ---@return table
-local function insert_choices(entries, opts)
+local function insert_choices(stdout, opts)
 	-- this structure will contain the formatting costs for each elements
 	local fmt_cost = {}
 	-- pre-calculation of formatting cost
@@ -207,17 +118,22 @@ local function insert_choices(entries, opts)
 	}
 	local max_length = 0
 
-	-- Construct the file table from parsed entries (already whitelisted to
-	-- workspace/window/tab by parse_file_listing; instance files never reach
-	-- here - they have their own selector).
-	for _, entry in ipairs(entries) do
-		local epoch, type, file = entry.epoch, entry.type, entry.filename
+	if stdout == nil then
+		return state_files
+	end
+
+	-- Parse the stdout and construct the file table
+	for line in stdout:gmatch("[^\n]+") do
+		local epoch, type, file = line:match("%s*(%d+)%s+.+[/\\]([^/\\]+)[/\\]([^/\\]+%.json)$")
 		-- epoch in this case represents the last modified date/time according to the OS
 		-- For Unix/POSIX Epoch is counted from January 1st, 1970 0 UTC
 		-- MacOS it is from January 1st, 1904 0 UTC
 		-- Windows NTFS (up to Win 11) it is from January 1st, 1601 0 UTC
 		-- The function `os.date()` used later on will convert the date according to the host OS
-		if not opts[string.format("ignore_%ss", type)] then
+		-- Skip instance files when ignore_instances is set (they use their own selector)
+		if type == "instances" and opts.ignore_instances then
+			-- fall through: do not add instance files to the fuzzy loader
+		elseif epoch and file and type and not opts[string.format("ignore_%ss", type)] then
 			-- consider the "cost" of the formatting of the filename, i.e., if the format function adds characters
 			-- to the visible part of the file section, we test the three possible formatter to get the highest cost
 			-- we use a real entry instead of an empty string to prevent formatting error if the format function has
@@ -274,7 +190,6 @@ local function insert_choices(entries, opts)
 				date = date,
 				date_len = date_len,
 				fmt = fmt,
-				epoch = epoch,
 			})
 		end
 	end
@@ -297,29 +212,9 @@ local function insert_choices(entries, opts)
 	local pad_len = utils.utf8len(str_pad)
 	local min_filename_len = opts.min_filename_size or 10 -- minimum size of the filename to remain decypherable
 
-	-- Presentation order: grouped by save type by default, or flattened and
-	-- sorted newest-first when sort_by_date is set. Newest-first is what a
-	-- plain (non-fuzzy) list wants, since the sessions worked on most recently
-	-- are the ones most likely to be restored.
-	local ordered = {}
+	-- Add files to state_files list and apply the formatting functions
 	for _, type in ipairs(types) do
 		for _, file in ipairs(files[type]) do
-			table.insert(ordered, file)
-		end
-	end
-	if opts.sort_by_date then
-		table.sort(ordered, function(a, b)
-			if a.epoch ~= b.epoch then
-				return a.epoch > b.epoch
-			end
-			-- Stable tiebreak so menu order never jitters between opens
-			return a.id < b.id
-		end)
-	end
-
-	-- Add files to state_files list and apply the formatting functions
-	do
-		for _, file in ipairs(ordered) do
 			local label = file.filename
 			local dots = ""
 
@@ -378,16 +273,11 @@ function pub.fuzzy_load(window, pane, callback, opts)
 
 	local folder = require("resurrect.state_manager").save_state_dir
 
-	local entries = parse_file_listing(find_state_files(folder))
-
-	-- Collapse the many saves of one conversation down to its newest. Lazy
-	-- require keeps this module free of a load-time cycle.
-	if opts.dedupe_sessions then
-		entries = require("resurrect.save_index").annotate_and_dedupe(folder, entries)
-	end
+	-- Always use the recursive search function
+	local stdout = find_json_files_recursive(folder)
 
 	-- build the choice list for the InputSelector
-	local state_files = insert_choices(entries, opts)
+	local state_files = insert_choices(stdout, opts)
 
 	if #state_files == 0 then
 		wezterm.emit("resurrect.error", "No existing state files to select")
@@ -411,24 +301,5 @@ function pub.fuzzy_load(window, pane, callback, opts)
 		pane
 	)
 end
-
--- Enumerate named saves (workspace/window/tab) under base_path.
--- Returns an array of { epoch = number, type = string, filename = string },
--- or an empty array when the listing child process fails (an error event is
--- emitted by find_state_files in that case). UI-free, safe to reuse
--- from other modules (e.g. session export).
----@param base_path string
----@return {epoch: number, type: string, filename: string}[]
-function pub.list_state_files(base_path)
-	return parse_file_listing(find_state_files(base_path))
-end
-
-pub._test = {
-	build_windows_list_command = build_windows_list_command,
-	build_posix_list_command = build_posix_list_command,
-	parse_listing_line = parse_listing_line,
-	parse_file_listing = parse_file_listing,
-	insert_choices = insert_choices,
-}
 
 return pub
