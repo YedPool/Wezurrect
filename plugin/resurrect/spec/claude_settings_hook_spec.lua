@@ -236,4 +236,61 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
     assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
   end)
+  -- Shapes that parse but are not a settings object, or whose hooks section
+  -- has the wrong types. Each one used to raise out of setup (and so out of
+  -- the user's whole WezTerm config) or to replace the file.
+  local malformed = {
+    { "a top-level array", "[1,2]" },
+    { "an empty top-level array", "[]" },
+    { "hooks set to a number", '{"hooks":5}' },
+    { "a hook event set to a string", '{"hooks":{"SessionStart":"x"}}' },
+    { "a hook entry that is a number", '{"hooks":{"Stop":[5]}}' },
+    { "an entry whose hooks is a string", '{"hooks":{"Stop":[{"hooks":"x"}]}}' },
+    { "a hook command that is a number", '{"hooks":{"Stop":[{"hooks":[{"command":5}]}]}}' },
+  }
+  for _, case in ipairs(malformed) do
+    local label, original = case[1], case[2]
+    it("refuses " .. label .. " without raising and leaves the file byte-identical", function()
+      write_bytes(settings_path, original)
+
+      local ok
+      assert.has_no.errors(function()
+        ok = process_handlers.setup_claude_session_hooks()
+      end)
+
+      assert.is_false(ok)
+      assert.are.equal(original, read_bytes(settings_path))
+      assert.is_true(#logged.warn + #logged.error > 0)
+    end)
+  end
+
+  it("contains an unexpected error instead of raising it out of setup", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    local real_encode = wezterm_stub.json_encode
+    wezterm_stub.json_encode = function() error("simulated encoder failure") end
+
+    local ok, raised
+    raised = not pcall(function()
+      ok = process_handlers.setup_claude_session_hooks()
+    end)
+    wezterm_stub.json_encode = real_encode
+
+    assert.is_false(raised)
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.error > 0)
+  end)
+
+  it("control: an empty settings.json gets both hooks", function()
+    write_bytes(settings_path, "")
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local settings = dkjson.decode(read_bytes(settings_path))
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
 end)

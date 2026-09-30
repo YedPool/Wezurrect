@@ -354,6 +354,14 @@ local function load_settings_for_update(path)
 	if content == "" then
 		return {} -- empty file: nothing to lose
 	end
+	-- Only a JSON object is a settings file. An array parses to a Lua table
+	-- too, and "[]" is then indistinguishable from "{}", so decide on the
+	-- text: the first non-whitespace byte must open an object.
+	if not content:find("^%s*{") then
+		wezterm.log_warn("resurrect: " .. path .. " is not a JSON object"
+			.. "; leaving it untouched, Claude hooks not configured")
+		return nil
+	end
 	local ok, parsed = pcall(wezterm.json_parse, content)
 	if not ok or type(parsed) ~= "table" then
 		wezterm.log_warn("resurrect: could not parse " .. path .. " as a JSON object ("
@@ -362,6 +370,76 @@ local function load_settings_for_update(path)
 		return nil
 	end
 	return parsed
+end
+
+-- True when t is a table decoded from a JSON array (or an empty table,
+-- which could have been either). JSON object keys are always strings.
+local function is_list(t)
+	if type(t) ~= "table" then
+		return false
+	end
+	for k in pairs(t) do
+		if type(k) ~= "number" then
+			return false
+		end
+	end
+	return true
+end
+
+-- True when t is a table decoded from a JSON object (or an empty table).
+local function is_object(t)
+	if type(t) ~= "table" then
+		return false
+	end
+	for k in pairs(t) do
+		if type(k) ~= "string" then
+			return false
+		end
+	end
+	return true
+end
+
+-- Look for our pane-sessions hook under hooks.SessionStart and hooks.Stop,
+-- checking the type of everything on the way.
+-- Returns has_session_start, has_stop, or nil, nil, <what is wrong>.
+---@param settings table
+---@return boolean|nil has_session_start
+---@return boolean|nil has_stop
+---@return string|nil shape_err
+local function find_pane_session_hooks(settings)
+	if not is_object(settings) then
+		return nil, nil, "a top level that is not a JSON object"
+	end
+	local hooks = settings.hooks
+	if hooks == nil then
+		return false, false
+	end
+	if not is_object(hooks) then
+		return nil, nil, '"hooks" that is not a JSON object'
+	end
+	local found = {}
+	for _, event_name in ipairs({ "SessionStart", "Stop" }) do
+		local entries = hooks[event_name]
+		if entries ~= nil then
+			if not is_list(entries) then
+				return nil, nil, '"hooks.' .. event_name .. '" that is not a JSON array'
+			end
+			for _, entry in ipairs(entries) do
+				if not is_object(entry) or (entry.hooks ~= nil and not is_list(entry.hooks)) then
+					return nil, nil, 'a malformed entry in "hooks.' .. event_name .. '"'
+				end
+				for _, hook in ipairs(entry.hooks or {}) do
+					if not is_object(hook) or (hook.command ~= nil and type(hook.command) ~= "string") then
+						return nil, nil, 'a malformed hook in "hooks.' .. event_name .. '"'
+					end
+					if hook.command and hook.command:find("pane%-sessions") then
+						found[event_name] = true
+					end
+				end
+			end
+		end
+	end
+	return found.SessionStart == true, found.Stop == true
 end
 
 -- Configure the SessionStart hook in a single Claude Code settings file.
@@ -378,27 +456,14 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 
 	-- Check if our hooks are already present (idempotency check).
 	-- We look for pane-sessions hooks on both SessionStart and Stop.
-	-- If both exist, nothing to do.
-	local has_session_start = false
-	local has_stop = false
-	if settings.hooks then
-		for _, event_name in ipairs({ "SessionStart", "Stop" }) do
-			if settings.hooks[event_name] then
-				for _, entry in ipairs(settings.hooks[event_name]) do
-					if entry.hooks then
-						for _, hook in ipairs(entry.hooks) do
-							if hook.command and hook.command:find("pane%-sessions") then
-								if event_name == "SessionStart" then
-									has_session_start = true
-								else
-									has_stop = true
-								end
-							end
-						end
-					end
-				end
-			end
-		end
+	-- If both exist, nothing to do. A hooks section of the wrong shape is
+	-- refused rather than indexed, because indexing it raised out of setup()
+	-- and took the user's whole WezTerm config down with it.
+	local has_session_start, has_stop, shape_err = find_pane_session_hooks(settings)
+	if shape_err then
+		wezterm.log_warn("resurrect: " .. target_settings_path .. " has " .. shape_err
+			.. "; leaving it untouched, Claude hooks not configured")
+		return false
 	end
 	if has_session_start and has_stop then
 		return true
@@ -468,6 +533,22 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 	return true
 end
 
+-- configure_hook_in_settings, but an unexpected error is logged and turned
+-- into false instead of propagating. This runs from setup() while WezTerm is
+-- loading the user's config; an error escaping here fails the whole config.
+---@param target_settings_path string
+---@param pane_sessions_dir string
+---@return boolean success
+local function safe_configure(target_settings_path, pane_sessions_dir)
+	local ok, result = pcall(configure_hook_in_settings, target_settings_path, pane_sessions_dir)
+	if not ok then
+		wezterm.log_error("resurrect: configuring Claude hooks in " .. target_settings_path
+			.. " failed: " .. tostring(result))
+		return false
+	end
+	return result
+end
+
 --- Ensure Claude Code hooks are configured to capture session IDs per WezTerm
 --- pane. This is idempotent -- safe to call on every WezTerm startup.
 ---
@@ -507,11 +588,11 @@ function pub.setup_claude_session_hooks(settings_path)
 
 	-- Configure the primary settings file
 	if settings_path then
-		return configure_hook_in_settings(settings_path, pane_sessions_dir)
+		return safe_configure(settings_path, pane_sessions_dir)
 	end
 
 	local primary_path = claude_dir .. sep .. "settings.json"
-	local primary_ok = configure_hook_in_settings(primary_path, pane_sessions_dir)
+	local primary_ok = safe_configure(primary_path, pane_sessions_dir)
 
 	-- Also configure alternate Claude config directories (e.g., .claude-alt for
 	-- claude2 multi-account setups). Only if the directory already exists --
@@ -521,7 +602,7 @@ function pub.setup_claude_session_hooks(settings_path)
 	local alt_f = io.open(alt_settings, "r")
 	if alt_f then
 		alt_f:close()
-		configure_hook_in_settings(alt_settings, pane_sessions_dir)
+		safe_configure(alt_settings, pane_sessions_dir)
 	end
 
 	return primary_ok
