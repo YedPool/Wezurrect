@@ -13,21 +13,93 @@ end
 
 local logged = { warn = {}, error = {}, info = {} }
 
+-- The stub mirrors what WezTerm's own json_parse/json_encode do, as measured
+-- by running WezTerm's Lua (wezterm --config-file probe.lua ls-fonts):
+--   * json_parse raises on malformed input, on a leading UTF-8 BOM and on
+--     trailing characters, and returns plain tables: an array and an object
+--     are indistinguishable afterwards, and a null member simply vanishes.
+--   * json_encode emits object keys sorted, turns an empty table into {},
+--     and raises "Unexpected key ... for array style table" on a table that
+--     mixes integer and string keys (e.g. [1,2] after .hooks was set on it).
+--   * json_encode writes a table that it has already written once as null,
+--     even when the second reference is a sibling and not a cycle: one entry
+--     table placed under both hooks.SessionStart and hooks.Stop came out as
+--     "SessionStart":[{...}],"Stop":[null].
+local function strip_array_marks(value)
+  if type(value) == "table" then
+    setmetatable(value, nil)
+    for _, v in pairs(value) do
+      strip_array_marks(v)
+    end
+  end
+  return value
+end
+
+local function wez_encode(value, seen)
+  seen = seen or {}
+  local t = type(value)
+  if t == "table" then
+    if seen[value] then
+      return "null"
+    end
+    seen[value] = true
+    local has_num, has_str = false, false
+    for k in pairs(value) do
+      if type(k) == "number" then
+        has_num = true
+      else
+        has_str = true
+      end
+    end
+    if has_num and has_str then
+      error("error converting Lua string to numeric array index (Unexpected key for array style table)")
+    end
+    local parts = {}
+    if has_num then
+      for i = 1, #value do
+        parts[i] = wez_encode(value[i], seen)
+      end
+      return "[" .. table.concat(parts, ",") .. "]"
+    end
+    local keys = {}
+    for k in pairs(value) do
+      keys[#keys + 1] = k
+    end
+    table.sort(keys)
+    for i, k in ipairs(keys) do
+      parts[i] = dkjson.quotestring(k) .. ":" .. wez_encode(value[k], seen)
+    end
+    return "{" .. table.concat(parts, ",") .. "}"
+  elseif t == "string" then
+    return dkjson.quotestring(value)
+  elseif t == "number" then
+    if math.type(value) == "integer" then
+      return tostring(value)
+    end
+    return string.format("%.17g", value)
+  elseif t == "boolean" then
+    return tostring(value)
+  end
+  error("cannot encode a " .. t)
+end
+
 local wezterm_stub = {
   target_triple = is_windows() and "x86_64-pc-windows-msvc" or "x86_64-unknown-linux-gnu",
   log_warn = function(msg) table.insert(logged.warn, msg) end,
   log_error = function(msg) table.insert(logged.error, msg) end,
   log_info = function(msg) table.insert(logged.info, msg) end,
-  -- wezterm.json_parse raises on malformed input; mirror that.
   json_parse = function(str)
-    local value, _, err = dkjson.decode(str)
+    local value, pos, err = dkjson.decode(str)
     if err then
       error(err)
     end
-    return value
+    if str:find("%S", pos) then
+      error("trailing characters")
+    end
+    return strip_array_marks(value)
   end,
   json_encode = function(value)
-    return dkjson.encode(value)
+    return wez_encode(value)
   end,
 }
 _G.wezterm = wezterm_stub
@@ -80,6 +152,27 @@ local function write_bytes(path, content)
   local f = assert(io.open(path, "wb"))
   f:write(content)
   f:close()
+end
+
+-- Sorted names in dir that match pattern.
+local function list_dir(dir, pattern)
+  local cmd
+  if utils.is_windows then
+    cmd = 'dir /b /a "' .. dir .. '" 2>nul'
+  else
+    cmd = "ls -A '" .. dir .. "'"
+  end
+  local names = {}
+  local p = assert(io.popen(cmd))
+  for line in p:lines() do
+    line = line:gsub("\r$", "")
+    if line:find(pattern) then
+      names[#names + 1] = line
+    end
+  end
+  p:close()
+  table.sort(names)
+  return names
 end
 
 local function count_pane_session_hooks(settings, event_name)
@@ -175,4 +268,323 @@ describe("process_handlers.setup_claude_session_hooks", function()
     assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
     assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
   end)
+  -- Shapes that parse but are not a settings object, or whose hooks section
+  -- has the wrong types. Each one used to raise out of setup (and so out of
+  -- the user's whole WezTerm config) or to replace the file.
+  local malformed = {
+    { "a top-level array", "[1,2]" },
+    { "an empty top-level array", "[]" },
+    { "hooks set to a number", '{"hooks":5}' },
+    { "a hook event set to a string", '{"hooks":{"SessionStart":"x"}}' },
+    { "a hook entry that is a number", '{"hooks":{"Stop":[5]}}' },
+    { "an entry whose hooks is a string", '{"hooks":{"Stop":[{"hooks":"x"}]}}' },
+    { "a hook command that is a number", '{"hooks":{"Stop":[{"hooks":[{"command":5}]}]}}' },
+  }
+  for _, case in ipairs(malformed) do
+    local label, original = case[1], case[2]
+    it("refuses " .. label .. " without raising and leaves the file byte-identical", function()
+      write_bytes(settings_path, original)
+
+      local ok
+      assert.has_no.errors(function()
+        ok = process_handlers.setup_claude_session_hooks()
+      end)
+
+      assert.is_false(ok)
+      assert.are.equal(original, read_bytes(settings_path))
+      assert.is_true(#logged.warn + #logged.error > 0)
+    end)
+  end
+
+  it("contains an unexpected error instead of raising it out of setup", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    local real_encode = wezterm_stub.json_encode
+    wezterm_stub.json_encode = function() error("simulated encoder failure") end
+
+    local ok, raised
+    raised = not pcall(function()
+      ok = process_handlers.setup_claude_session_hooks()
+    end)
+    wezterm_stub.json_encode = real_encode
+
+    assert.is_false(raised)
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.error > 0)
+  end)
+
+  -- Windows PowerShell 5.1 "Set-Content -Encoding utf8" writes a UTF-8 BOM.
+  -- WezTerm's json_parse rejects it ("expected value at line 1 column 1").
+  it("adds both hooks to a BOM-prefixed settings.json and keeps the BOM", function()
+    local bom = "\239\187\191"
+    write_bytes(settings_path, bom .. '{ "model": "opus" }')
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local after = read_bytes(settings_path)
+    assert.are.equal(bom, after:sub(1, 3))
+    local settings = dkjson.decode(after:sub(4))
+    assert.are.equal("opus", settings.model)
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
+  it("copies the original bytes to settings.json.resurrect.bak before overwriting", function()
+    local original = '{ "model": "opus" }\r\n'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal(original, read_bytes(settings_path .. ".resurrect.bak"))
+    local settings = dkjson.decode(read_bytes(settings_path))
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    -- The staging file is gone once the replace succeeded.
+    assert.are.same({ "settings.json", "settings.json.resurrect.bak" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  it("leaves a settings.json.bak the user made alone", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    write_bytes(settings_path .. ".bak", "the user's own backup")
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal("the user's own backup", read_bytes(settings_path .. ".bak"))
+    assert.are.equal(original, read_bytes(settings_path .. ".resurrect.bak"))
+  end)
+
+  -- The first backup is the file as it was before the plugin ever touched
+  -- it, which is the copy worth keeping; a later write keeps it.
+  it("keeps the first backup when it writes again later", function()
+    local first = '{ "model": "opus" }'
+    write_bytes(settings_path, first)
+    assert.is_true(process_handlers.setup_claude_session_hooks())
+    -- The user later replaces the file, dropping our hooks.
+    write_bytes(settings_path, '{ "model": "sonnet" }')
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal(first, read_bytes(settings_path .. ".resurrect.bak"))
+    local settings = dkjson.decode(read_bytes(settings_path))
+    assert.are.equal("sonnet", settings.model)
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+    assert.are.same({ "settings.json", "settings.json.resurrect.bak" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  it("does not overwrite settings.json when the backup cannot be written", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    -- A directory where the backup should go makes the backup write fail.
+    assert.is_true(utils.ensure_folder_exists(settings_path .. ".resurrect.bak"))
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.warn + #logged.error > 0)
+  end)
+
+  it("does not overwrite settings.json when the new content does not re-parse", function()
+    local original = '{ "model": "opus" }'
+    write_bytes(settings_path, original)
+    -- New content is parsed twice: once to check the splice means the
+    -- intended settings, then again as read back from the staging file.
+    -- Let the first pass and fail the second.
+    local real_parse = wezterm_stub.json_parse
+    local new_content_parses = 0
+    wezterm_stub.json_parse = function(str)
+      if str:find("pane%-sessions") then
+        new_content_parses = new_content_parses + 1
+        if new_content_parses >= 2 then
+          error("simulated parse failure")
+        end
+      end
+      return real_parse(str)
+    end
+
+    local ok = process_handlers.setup_claude_session_hooks()
+    wezterm_stub.json_parse = real_parse
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.are.same({ "settings.json", "settings.json.resurrect.bak" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  it("control: makes no backup when there was no settings.json", function()
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.same({ "settings.json" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  -- WezTerm's parse/encode round trip is lossy (measured in WezTerm's own
+  -- Lua): this input came back as {"big":1.2345678901234567e19,"deny":{},
+  -- "env":{}} plus the hooks. The hooks must be added to the text instead.
+  it("adds the hooks without altering any other byte of the file", function()
+    local original = '{"env":{},"deny":[],"k":null,"big":12345678901234567890}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local after = read_bytes(settings_path)
+    local prefix = original:sub(1, -2) .. ',"hooks":'
+    assert.are.equal(prefix, after:sub(1, #prefix))
+    assert.are.equal("}", after:sub(-1))
+    local settings = dkjson.decode(after)
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
+  it("appends to existing hook arrays and keeps the user's formatting", function()
+    local original = table.concat({
+      "{",
+      '  "hooks": {',
+      '    "Stop": [',
+      '      { "matcher": "", "hooks": [{ "type": "command", "command": "echo hi" }] }',
+      "    ]",
+      "  },",
+      '  "permissions": { "deny": [] }',
+      "}",
+      "",
+    }, "\n")
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local after = read_bytes(settings_path)
+    -- Everything the user wrote is still there, verbatim, in order.
+    local user_entry = '{ "matcher": "", "hooks": [{ "type": "command", "command": "echo hi" }] }'
+    local i = assert(after:find(user_entry, 1, true))
+    assert.is_truthy(after:find('  "permissions": { "deny": [] }\n}\n', i, true))
+    local settings = dkjson.decode(after)
+    assert.are.equal("echo hi", settings.hooks.Stop[1].hooks[1].command)
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
+  it("control: a file that already has both hooks is never rewritten", function()
+    assert.is_true(process_handlers.setup_claude_session_hooks())
+    local configured = read_bytes(settings_path) .. "\n"
+    write_bytes(settings_path, configured)
+    os.remove(settings_path .. ".resurrect.bak")
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal(configured, read_bytes(settings_path))
+    assert.is_nil(read_bytes(settings_path .. ".resurrect.bak"))
+  end)
+
+  -- Only the text can tell "hooks":[] from "hooks":{} -- both parse to {}.
+  it("refuses a hooks section that is an empty array in the text", function()
+    local original = '{"hooks":[]}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+  end)
+
+  -- The splice edits the first "hooks" member; the parser keeps the last.
+  -- The result then does not match the intended settings, and the write must
+  -- be refused rather than re-encoding the whole file.
+  it("refuses when the spliced text would not mean the intended settings", function()
+    local original = '{"hooks":{"Stop":[]},"hooks":{}}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.warn > 0)
+  end)
+
+  -- From the review's bakclobber.lua: a settings.json that a crash inside the
+  -- final write left at 0 bytes was treated as a fresh install, and the next
+  -- start replaced the user's settings with just our hooks.
+  it("refuses an emptied settings.json when a backup of it exists", function()
+    local user = '{"model":"opus","permissions":{"allow":["Bash(git:*)"]}}'
+    write_bytes(settings_path, user)
+    assert.is_true(process_handlers.setup_claude_session_hooks())
+    assert.are.equal(user, read_bytes(settings_path .. ".resurrect.bak"))
+    write_bytes(settings_path, "") -- the crash
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal("", read_bytes(settings_path))
+    assert.are.equal(user, read_bytes(settings_path .. ".resurrect.bak"))
+    assert.is_true(#logged.warn > 0)
+  end)
+
+  it("refuses an empty settings.json when a staging file was left behind", function()
+    write_bytes(settings_path, "")
+    write_bytes(settings_path .. ".resurrect.tmp", '{"model":"opus"}')
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal("", read_bytes(settings_path))
+    assert.are.equal('{"model":"opus"}', read_bytes(settings_path .. ".resurrect.tmp"))
+    assert.is_true(#logged.warn > 0)
+  end)
+
+  -- An empty object takes the new member with no separating comma. Driven
+  -- through the whole write path, so a wrong comma is caught here and not
+  -- only by json_text's unit test.
+  local empty_objects = {
+    { "{}", "{", "}" },
+    { "{ }", "{", " }" },
+    { "{CRLF}", "{", "\r\n}" },
+  }
+  for _, case in ipairs(empty_objects) do
+    local label, head, tail = case[1], case[2], case[3]
+    it("adds the hooks to the empty object " .. label .. " through the full write path", function()
+      write_bytes(settings_path, head .. tail)
+
+      local ok = process_handlers.setup_claude_session_hooks()
+
+      assert.is_true(ok)
+      local after = read_bytes(settings_path)
+      assert.are.equal(head .. '"hooks":', after:sub(1, #head + 8))
+      assert.are.equal(tail, after:sub(-#tail))
+      local settings = dkjson.decode(after)
+      assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+      assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+    end)
+  end
+
+  -- "hooks" is "hooks" to the parser but not to the text scanner, so the
+  -- splice adds a second "hooks" key. The parser keeps the last one, which
+  -- would silently drop the user's Stop hook; the re-parse check must refuse.
+  it("refuses a splice that would hide an escaped hooks key", function()
+    local original = '{"hook' .. string.char(92) .. 'u0073":{"Stop":[{"hooks":[{"type":"command","command":"echo keep"}]}]}}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.warn > 0)
+  end)
+
+  it("control: an empty settings.json gets both hooks", function()
+    write_bytes(settings_path, "")
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local settings = dkjson.decode(read_bytes(settings_path))
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
 end)
