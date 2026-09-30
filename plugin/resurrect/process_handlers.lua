@@ -10,6 +10,7 @@
 --   })
 local wezterm = require("wezterm") --[[@as Wezterm]]
 local utils = require("resurrect.utils")
+local json_text = require("resurrect.json_text")
 
 local pub = {}
 
@@ -543,6 +544,80 @@ local function replace_settings_file(path, original, new_bytes)
 	return true
 end
 
+-- True when two decoded JSON values are equal: same type, same scalars, and
+-- tables with the same keys holding equal values.
+local function deep_equal(a, b)
+	if type(a) ~= type(b) then
+		return false
+	end
+	if type(a) ~= "table" then
+		return a == b
+	end
+	for k, v in pairs(a) do
+		if not deep_equal(v, b[k]) then
+			return false
+		end
+	end
+	for k in pairs(b) do
+		if a[k] == nil then
+			return false
+		end
+	end
+	return true
+end
+
+-- Add our hook entries to the settings TEXT, leaving every other byte as it
+-- was. The alternative -- json_encode of the whole decoded file -- is lossy
+-- in WezTerm (see json_text.lua): [] becomes {}, null members vanish, large
+-- integers lose precision and key order is lost.
+--
+-- Each entry is appended to the end of its container: a new "hooks" member
+-- at the end of the top-level object, a new event array at the end of
+-- "hooks", or a new element at the end of an existing event array (the same
+-- place table.insert put it before). Only these three shapes are handled;
+-- anything else returns nil and a reason, and the caller writes nothing.
+---@param text string the settings file without any BOM; a JSON object
+---@param events string[] event names that need our entry
+---@param new_entry fun(): table builds one hook entry
+---@return string|nil new_text
+---@return string|nil reason
+local function splice_hooks(text, events, new_entry)
+	local top = json_text.skip_ws(text, 1)
+	if not json_text.find_member(text, top, "hooks") then
+		local hooks = {}
+		for _, event_name in ipairs(events) do
+			hooks[event_name] = { new_entry() }
+		end
+		local spliced = json_text.append_member(text, top, "hooks", wezterm.json_encode(hooks))
+		if not spliced then
+			return nil, "could not locate the top-level object in the text"
+		end
+		return spliced
+	end
+	for _, event_name in ipairs(events) do
+		-- Positions move after every insertion, so locate afresh each time.
+		local hooks = json_text.find_member(text, top, "hooks")
+		if text:sub(hooks.value_start, hooks.value_start) ~= "{" then
+			return nil, '"hooks" is not a JSON object'
+		end
+		local entry_json = wezterm.json_encode(new_entry())
+		local event = json_text.find_member(text, hooks.value_start, event_name)
+		local new_text
+		if not event then
+			new_text = json_text.append_member(text, hooks.value_start, event_name, "[" .. entry_json .. "]")
+		elseif text:sub(event.value_start, event.value_start) == "[" then
+			new_text = json_text.append_element(text, event.value_start, entry_json)
+		else
+			return nil, '"hooks.' .. event_name .. '" is not a JSON array'
+		end
+		if not new_text then
+			return nil, 'could not locate "hooks.' .. event_name .. '" in the text'
+		end
+		text = new_text
+	end
+	return text
+end
+
 -- Configure the SessionStart hook in a single Claude Code settings file.
 -- Returns true if hook is already present or was successfully added.
 -- Returns false, without writing, if the existing file cannot be loaded.
@@ -606,8 +681,13 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 		}
 	end
 
+	-- The in-memory edit below is the specification of the change; the text
+	-- splice further down must produce a file that parses to exactly this.
+	local events_to_add = {}
+
 	-- SessionStart: captures session ID when Claude starts or resumes.
 	if not has_session_start then
+		table.insert(events_to_add, "SessionStart")
 		if not settings.hooks.SessionStart then
 			settings.hooks.SessionStart = {}
 		end
@@ -619,14 +699,39 @@ local function configure_hook_in_settings(target_settings_path, pane_sessions_di
 	-- conversation (e.g., during context compaction). Every hook event
 	-- includes session_id in its stdin payload, so the same command works.
 	if not has_stop then
+		table.insert(events_to_add, "Stop")
 		if not settings.hooks.Stop then
 			settings.hooks.Stop = {}
 		end
 		table.insert(settings.hooks.Stop, new_hook_entry())
 	end
 
-	local json_str = bom .. wezterm.json_encode(settings)
-	if not replace_settings_file(target_settings_path, original, json_str) then
+	local text = original and original:sub(#bom + 1) or ""
+	local new_text
+	if text == "" then
+		-- No file, or an empty one: there is nothing to preserve.
+		new_text = wezterm.json_encode(settings)
+	else
+		local spliced, reason = splice_hooks(text, events_to_add, new_hook_entry)
+		-- Re-parse the result and require it to mean exactly the intended
+		-- settings. This catches anything the text scanner got wrong (for
+		-- example a duplicate "hooks" key, where the parser keeps the last one
+		-- and the splice edited the first). If it does not match, refuse and
+		-- log rather than fall back to re-encoding the whole file.
+		local parsed_ok, reparsed = false, nil
+		if spliced then
+			parsed_ok, reparsed = pcall(wezterm.json_parse, spliced)
+		end
+		if not (parsed_ok and deep_equal(reparsed, settings)) then
+			wezterm.log_warn("resurrect: cannot add Claude hooks to " .. target_settings_path
+				.. " without changing the rest of it (" .. tostring(reason or "spliced text does not match")
+				.. "); leaving it untouched, Claude hooks not configured")
+			return false
+		end
+		new_text = spliced
+	end
+
+	if not replace_settings_file(target_settings_path, original, bom .. new_text) then
 		return false
 	end
 

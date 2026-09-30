@@ -361,12 +361,17 @@ describe("process_handlers.setup_claude_session_hooks", function()
   it("does not overwrite settings.json when the new content does not re-parse", function()
     local original = '{ "model": "opus" }'
     write_bytes(settings_path, original)
-    -- Accept the original; reject anything that already carries our hook,
-    -- which is only ever the staged new content.
+    -- New content is parsed twice: once to check the splice means the
+    -- intended settings, then again as read back from the staging file.
+    -- Let the first pass and fail the second.
     local real_parse = wezterm_stub.json_parse
+    local new_content_parses = 0
     wezterm_stub.json_parse = function(str)
       if str:find("pane%-sessions") then
-        error("simulated parse failure")
+        new_content_parses = new_content_parses + 1
+        if new_content_parses >= 2 then
+          error("simulated parse failure")
+        end
       end
       return real_parse(str)
     end
@@ -384,6 +389,91 @@ describe("process_handlers.setup_claude_session_hooks", function()
 
     assert.is_true(ok)
     assert.are.same({ "settings.json" }, list_dir(claude_dir, "^settings"))
+  end)
+
+  -- WezTerm's parse/encode round trip is lossy (measured in WezTerm's own
+  -- Lua): this input came back as {"big":1.2345678901234567e19,"deny":{},
+  -- "env":{}} plus the hooks. The hooks must be added to the text instead.
+  it("adds the hooks without altering any other byte of the file", function()
+    local original = '{"env":{},"deny":[],"k":null,"big":12345678901234567890}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local after = read_bytes(settings_path)
+    local prefix = original:sub(1, -2) .. ',"hooks":'
+    assert.are.equal(prefix, after:sub(1, #prefix))
+    assert.are.equal("}", after:sub(-1))
+    local settings = dkjson.decode(after)
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
+  it("appends to existing hook arrays and keeps the user's formatting", function()
+    local original = table.concat({
+      "{",
+      '  "hooks": {',
+      '    "Stop": [',
+      '      { "matcher": "", "hooks": [{ "type": "command", "command": "echo hi" }] }',
+      "    ]",
+      "  },",
+      '  "permissions": { "deny": [] }',
+      "}",
+      "",
+    }, "\n")
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    local after = read_bytes(settings_path)
+    -- Everything the user wrote is still there, verbatim, in order.
+    local user_entry = '{ "matcher": "", "hooks": [{ "type": "command", "command": "echo hi" }] }'
+    local i = assert(after:find(user_entry, 1, true))
+    assert.is_truthy(after:find('  "permissions": { "deny": [] }\n}\n', i, true))
+    local settings = dkjson.decode(after)
+    assert.are.equal("echo hi", settings.hooks.Stop[1].hooks[1].command)
+    assert.are.equal(1, count_pane_session_hooks(settings, "SessionStart"))
+    assert.are.equal(1, count_pane_session_hooks(settings, "Stop"))
+  end)
+
+  it("control: a file that already has both hooks is never rewritten", function()
+    assert.is_true(process_handlers.setup_claude_session_hooks())
+    local configured = read_bytes(settings_path) .. "\n"
+    write_bytes(settings_path, configured)
+    os.remove(settings_path .. ".bak")
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_true(ok)
+    assert.are.equal(configured, read_bytes(settings_path))
+    assert.is_nil(read_bytes(settings_path .. ".bak"))
+  end)
+
+  -- Only the text can tell "hooks":[] from "hooks":{} -- both parse to {}.
+  it("refuses a hooks section that is an empty array in the text", function()
+    local original = '{"hooks":[]}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+  end)
+
+  -- The splice edits the first "hooks" member; the parser keeps the last.
+  -- The result then does not match the intended settings, and the write must
+  -- be refused rather than re-encoding the whole file.
+  it("refuses when the spliced text would not mean the intended settings", function()
+    local original = '{"hooks":{"Stop":[]},"hooks":{}}'
+    write_bytes(settings_path, original)
+
+    local ok = process_handlers.setup_claude_session_hooks()
+
+    assert.is_false(ok)
+    assert.are.equal(original, read_bytes(settings_path))
+    assert.is_true(#logged.warn > 0)
   end)
 
   it("control: an empty settings.json gets both hooks", function()
