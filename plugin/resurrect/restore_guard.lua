@@ -121,7 +121,15 @@ end
 --- and ~/.claude-alt/sessions for the claude2 multi-account setup.
 ---@return string[]
 function pub.control_dirs()
-	local home = os.getenv("HOME") or os.getenv("USERPROFILE") or ""
+	-- On Windows Claude Code keeps its files under USERPROFILE. HOME may be
+	-- set as well (Git Bash, MSYS) and point somewhere else; a stray
+	-- .claude\sessions there would be read as "nothing is running".
+	local home
+	if utils.is_windows then
+		home = os.getenv("USERPROFILE") or os.getenv("HOME") or ""
+	else
+		home = os.getenv("HOME") or ""
+	end
 	local sep = utils.separator
 	return {
 		home .. sep .. ".claude" .. sep .. "sessions",
@@ -224,6 +232,14 @@ pub.is_session_id = is_session_id
 ---@return table snapshot
 local function build_snapshot(records)
 	local snapshot = { sessions = {}, records = records }
+	if #records == 0 then
+		-- The folder was listed and holds no control file. Where Claude
+		-- sessions run that most likely means the wrong folder was read (a
+		-- stray HOME, another CLAUDE_CONFIG_DIR), so it is not taken as
+		-- "nothing is running". The cost is only that after every session
+		-- has exited cleanly, sessions are resumed by hand.
+		snapshot.error = "no control files were found, so what is running cannot be established"
+	end
 	for _, record in ipairs(records) do
 		record.state = classify(record)
 		if not is_session_id(record.session_id) then

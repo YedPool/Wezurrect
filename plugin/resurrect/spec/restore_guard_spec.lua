@@ -1044,3 +1044,45 @@ describe("restore guard: the line that is typed", function()
         end)
     end
 end)
+-- ---------------------------------------------------------------------------
+-- Where the control files are looked for, and an empty answer
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: the control folder", function()
+    local real_getenv = os.getenv
+    before_each(reset)
+    after_each(function() rawset(os, "getenv", real_getenv) end)
+
+    it("an existing but empty control folder is unknown, not 'nothing running'", function()
+        control_files({})
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+        local line = logged("not resuming session")
+        assert.truthy(line and line:find("no control files", 1, true), line)
+    end)
+
+    it("a saved copy with resume lines cannot be restored when the control folder is empty", function()
+        control_files({})
+        instance_manager.instance_id = OWN_ID
+        save_instance_file(MIXED_ID, workspace_of(claude_pane(LIVE), claude_pane(DEAD)))
+        save_instance_file(SHELLS_ID, workspace_of({ cwd = "C:\\work", text = "PS C:\\work>" }))
+        local existing = busy_pane()
+        local gui = new_gui_window()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        assert.truthy(gui:choice(MIXED_ID).label:find("cannot tell what is running", 1, true))
+        assert.truthy(gui:choice(SHELLS_ID).label:find("^%[ %]"), "a copy with no resume line stays restorable")
+    end)
+
+    it("looks under USERPROFILE on Windows even when HOME points elsewhere", function()
+        rawset(os, "getenv", function(name)
+            if name == "HOME" then return "/c/stray/home" end
+            if name == "USERPROFILE" then return "C:\\Users\\me" end
+            return real_getenv(name)
+        end)
+        local dirs = guard.control_dirs()
+        assert.equals("C:\\Users\\me\\.claude\\sessions", dirs[1])
+        for _, dir in ipairs(dirs) do
+            assert.falsy(dir:find("stray", 1, true), dir)
+        end
+    end)
+end)
