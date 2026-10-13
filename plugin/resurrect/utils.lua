@@ -143,7 +143,13 @@ end
 -- Characters that could enable command injection when a CWD is embedded in
 -- a shell command via send_text(). Blocks shell metacharacters plus \r\n
 -- (a newline in a path from a tampered state file could inject commands).
-utils.UNSAFE_CWD_PATTERN = "[;&|`$%(%)%{%}\r\n]"
+-- Quotes and redirections are blocked too: the path is quoted by
+-- wezterm.shell_join_args, which follows POSIX rules, while the shell it is
+-- typed into may be PowerShell or cmd. A path that can close the quote can
+-- add "> file" and truncate it. So is every other control character.
+-- (Windows itself forbids " < > | in paths; a ' is legal but rare, and such
+-- a pane is then left as a plain shell.)
+utils.UNSAFE_CWD_PATTERN = "[;&|`$%(%)%{%}\"'<>%c]"
 
 -- Validate that a CWD path is safe to embed in a shell command.
 ---@param cwd string

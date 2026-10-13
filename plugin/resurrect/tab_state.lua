@@ -174,7 +174,6 @@ local SAFE_RESTORE_PROCESSES = {
 	vim = true, nvim = true, gvim = true, vi = true,
 	htop = true, btop = true, top = true,
 	less = true, more = true, man = true,
-	claude = true,
 	nano = true,
 	tmux = true, screen = true,
 }
@@ -190,12 +189,17 @@ pub.process_restore_delay_seconds = 3
 ---@param pane_tree pane_tree
 ---@param quiet boolean? do not log an unrecognized process (used when only looking at a saved state)
 ---@return string|nil
+---@return boolean rejected a handler (e.g. Claude Code) claimed the process but refused its saved command
 function pub.get_pane_restore_command(pane_tree, quiet)
 	if type(pane_tree.process) ~= "table" or not pane_tree.process.argv then
-		return nil
+		return nil, false
 	end
 	-- Check registered process handlers first (e.g., Claude Code)
-	local restore_cmd = process_handlers.get_restore_command(pane_tree.process, pane_tree)
+	local restore_cmd, rejected = process_handlers.get_restore_command(pane_tree.process, pane_tree)
+	if rejected then
+		-- Never fall back to replaying the argv of a process a handler owns.
+		return nil, true
+	end
 	if not restore_cmd then
 		-- Fall back to allowlist-based argv replay
 		local proc_name = pane_tree.process.name or ""
@@ -211,7 +215,7 @@ function pub.get_pane_restore_command(pane_tree, quiet)
 			)
 		end
 	end
-	return restore_cmd
+	return restore_cmd, false
 end
 
 --- Function to restore text or processes when restoring panes
@@ -223,15 +227,35 @@ function pub.default_on_pane_restore(pane_tree)
 	-- otherwise restore scrollback text. Some TUI apps (e.g., Claude Code) don't
 	-- use the alt screen buffer but still need process-based restoration.
 	if pane_tree.process and pane_tree.process.argv then
-		local restore_cmd = pub.get_pane_restore_command(pane_tree)
+		local restore_cmd, rejected = pub.get_pane_restore_command(pane_tree)
 
-		if restore_cmd then
+		if rejected then
+			-- The saved command was refused before any line was built.
+			restore_guard.note_skipped({
+				state = "unknown",
+				reason = "the saved command is not exactly 'claude --resume <session id>', so it is not typed",
+			}, pane:pane_id())
+			restore_guard.schedule_report(pub.process_restore_delay_seconds + 1)
+		elseif restore_cmd then
 			local pane_id = pane:pane_id()
 			-- THE ONLY PLACE A RESTORE COMMAND IS SENT. Ask the guard first: a
 			-- command that would resume a Claude session which is already
 			-- running (or whose state cannot be established) is not sent, and
 			-- the pane stays the plain shell it was created as.
-			local verdict = restore_guard.check_command(restore_cmd, pane_tree.process.cwd or pane_tree.cwd)
+			local cwd = pane_tree.process.cwd
+			if cwd == nil or cwd == "" then
+				cwd = pane_tree.cwd
+			end
+			local verdict = restore_guard.check_command(restore_cmd, cwd)
+			if verdict.allow and verdict.target then
+				-- A Claude resume line is never typed as the state file gave
+				-- it. The guard has checked its shape and rebuilt it from
+				-- fixed parts; the directory has passed is_safe_cwd.
+				restore_cmd = verdict.target.line
+				if cwd ~= nil and cwd ~= "" then
+					restore_cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n" .. restore_cmd
+				end
+			end
 			if not verdict.allow then
 				restore_guard.note_skipped(verdict, pane_id)
 			else

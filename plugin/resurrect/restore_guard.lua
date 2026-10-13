@@ -205,21 +205,18 @@ end
 
 local STATE_RANK = { dead = 1, unknown = 2, live = 3 }
 
--- Same validation process_handlers applies before a session id reaches a
--- shell command.
-local function is_session_id(s)
-	return type(s) == "string" and s:match("^[%x%-]+$") ~= nil
-end
+-- A session id is a lower-case UUID and nothing else. Every id in the saved
+-- states, control files and pane-session files looked at had this form.
+local HEX = "[0-9a-f]"
+local UUID_PATTERN = "^" .. HEX:rep(8) .. "%-" .. HEX:rep(4) .. "%-" .. HEX:rep(4)
+	.. "%-" .. HEX:rep(4) .. "%-" .. HEX:rep(12) .. "$"
 
--- Compare working directories the way Windows does: slash direction, case and
--- a trailing separator do not matter. WezTerm reports /C:/..., Claude C:\...
-local function normalize_cwd(cwd)
-	if type(cwd) ~= "string" or cwd == "" then
-		return nil
-	end
-	local n = cwd:gsub("\\", "/"):gsub("^/(%a:)", "%1"):gsub("/+$", "")
-	return n:lower()
+---@param s any
+---@return boolean
+local function is_session_id(s)
+	return type(s) == "string" and s:match(UUID_PATTERN) ~= nil
 end
+pub.is_session_id = is_session_id
 
 --- Turn records into a snapshot: sessions[<id>] = { state, pid }, the records
 --- with their state, and .error when nothing in it may be trusted.
@@ -238,7 +235,7 @@ local function build_snapshot(records)
 					.. tostring(record.pid or "?") .. " could not be read"
 			end
 		else
-			local id = record.session_id:lower()
+			local id = record.session_id
 			local known = snapshot.sessions[id]
 			if not known or STATE_RANK[record.state] > STATE_RANK[known.state] then
 				snapshot.sessions[id] = { state = record.state, pid = record.pid }
@@ -286,102 +283,129 @@ local function command_words(cmd)
 	return words
 end
 
---- What Claude session a command would resume.
---- Returns nil when it resumes nothing (not a claude command, or a claude
---- command that starts a fresh session), otherwise one of
----   { session_id = <id> }  claude --resume / -r / --session-id <id>
----   { continue = true }    claude --continue / -c (latest session in the cwd)
----   { unreadable = true }  a resume flag whose session id cannot be read
+-- True when any word of the command is a claude binary (claude, claude2,
+-- claude-dev, with or without a path or .exe).
+local function mentions_claude(cmd)
+	for _, word in ipairs(command_words(cmd)) do
+		local base = (word:match("([^/\\]+)$") or word):lower():gsub("%.exe$", ""):gsub("%.cmd$", ""):gsub("%.bat$", "")
+		if base:match("^claude[%w%-]*$") then
+			return true
+		end
+	end
+	return false
+end
+
+-- The only flags a rebuilt resume line may carry, in the order they are
+-- written. The saved states looked at hold exactly two shapes:
+--   claude --resume <id>
+--   claude --resume <id> --dangerously-skip-permissions
+local ALLOWED_FLAGS = { "--dangerously-skip-permissions" }
+
+--- What Claude session a command would resume, and the line to type for it.
+---
+--- The command comes from a state file, which is plain JSON anything could
+--- have written, so it is never typed as it stands. If any word of it is a
+--- claude binary it must have exactly this shape:
+---   [cd <dir> newline] <claude binary> --resume <lower-case UUID> [allowed flags]
+--- and the line to type is rebuilt from those fixed parts (target.line).
+--- Returns
+---   nil                           not a claude command
+---   { session_id, line }          the shape above
+---   { unreadable = true }         a claude command of any other shape: it
+---                                 must not be typed
 ---@param cmd string|nil
 ---@return table|nil target
 function pub.resume_target(cmd)
-	if type(cmd) ~= "string" then
+	if type(cmd) ~= "string" or not mentions_claude(cmd) then
 		return nil
 	end
-	local words = command_words(cmd)
-	local is_claude = false
-	for _, word in ipairs(words) do
-		local base = (word:match("([^/\\]+)$") or word):lower():gsub("%.exe$", ""):gsub("%.cmd$", ""):gsub("%.bat$", "")
-		if base:match("^claude[%w%-]*$") then
-			is_claude = true
-		end
+	local unreadable = { unreadable = true }
+	local lines = {}
+	for line in cmd:gmatch("[^\r\n]+") do
+		table.insert(lines, line)
 	end
-	if not is_claude then
-		return nil
+	if #lines == 0 or #lines > 2 or (#lines == 2 and not lines[1]:match("^cd ")) then
+		return unreadable
 	end
-	local target = nil
-	for i, word in ipairs(words) do
-		local flag, inline = word:match("^(%-%-[%w%-]+)=(.*)$")
-		flag = flag or word
-		if flag == "--resume" or flag == "-r" or flag == "--session-id" then
-			local id = inline or words[i + 1]
-			if is_session_id(id) then
-				return { session_id = id:lower() }
+	-- Letters, digits, hyphens and single spaces only: no quotes, no shell
+	-- punctuation, nothing to interpret.
+	local line = lines[#lines]
+	if not line:match("^[%w%-]+[%w%- ]*$") then
+		return unreadable
+	end
+	local words = {}
+	for word in line:gmatch("%S+") do
+		table.insert(words, word)
+	end
+	local bin = words[1]
+	if not (bin:match("^claude%d*$") or bin:match("^claude%-[%w%-]+$")) then
+		return unreadable
+	end
+	local session_id = nil
+	local flags = {}
+	local i = 2
+	while i <= #words do
+		local word = words[i]
+		if word == "--resume" and not session_id and is_session_id(words[i + 1]) then
+			session_id = words[i + 1]
+			i = i + 1
+		else
+			local allowed = false
+			for _, flag in ipairs(ALLOWED_FLAGS) do
+				allowed = allowed or word == flag
 			end
-			target = { unreadable = true }
-		elseif flag == "--continue" or flag == "-c" then
-			target = target or { continue = true }
+			if not allowed then
+				return unreadable
+			end
+			flags[word] = true
+		end
+		i = i + 1
+	end
+	if not session_id then
+		return unreadable
+	end
+	local parts = { bin, "--resume", session_id }
+	for _, flag in ipairs(ALLOWED_FLAGS) do
+		if flags[flag] then
+			table.insert(parts, flag)
 		end
 	end
-	return target
+	return { session_id = session_id, line = table.concat(parts, " ") }
 end
-
 --- Whether the session a command would resume is running, per a snapshot.
 ---@param target table from resume_target
----@param cwd string|nil the pane's working directory (needed for --continue)
+---@param cwd string|nil the pane's working directory
 ---@param snapshot table from get_snapshot
 ---@return string state "dead" (safe to resume), "live" or "unknown"
 ---@return string|nil reason why it is not "dead"
 ---@return number|nil pid
 function pub.inspect(target, cwd, snapshot)
+	if target.unreadable then
+		return "unknown", "the saved command is not exactly 'claude --resume <session id>', so it is not typed"
+	end
+	if cwd ~= nil and cwd ~= "" and not utils.is_safe_cwd(cwd) then
+		return "unknown", "the saved working directory holds characters a shell would interpret"
+	end
 	if snapshot.error then
 		return "unknown", "liveness unreadable (" .. snapshot.error .. ")"
 	end
-	if target.session_id then
-		local session = snapshot.sessions[target.session_id]
-		if not session or session.state == "dead" then
-			return "dead"
-		end
-		if session.state == "live" then
-			return "live", "already running pid " .. tostring(session.pid), session.pid
-		end
-		return "unknown", "liveness unreadable (pid " .. tostring(session.pid)
-			.. " is running but its start time could not be confirmed)", session.pid
-	end
-	if target.continue then
-		-- --continue picks the newest session of the directory, so it is only
-		-- safe when no running session belongs to that directory.
-		local wanted = normalize_cwd(cwd)
-		if not wanted then
-			return "unknown", "liveness unreadable (--continue without a working directory)"
-		end
-		for _, record in ipairs(snapshot.records) do
-			if record.state ~= "dead" and normalize_cwd(record.cwd) == wanted then
-				return "live", "a session is already running in this directory, pid "
-					.. tostring(record.pid), record.pid
-			end
-		end
+	local session = snapshot.sessions[target.session_id]
+	if not session or session.state == "dead" then
 		return "dead"
 	end
-	return "unknown", "liveness unreadable (no session id in the resume command)"
+	if session.state == "live" then
+		return "live", "already running pid " .. tostring(session.pid), session.pid
+	end
+	return "unknown", "liveness unreadable (pid " .. tostring(session.pid)
+		.. " is running but its start time could not be confirmed)", session.pid
 end
 
--- Sessions this plugin has just sent a resume command for: key -> os.time().
+-- Sessions this plugin has just sent a resume command for: id -> os.time().
 local claims = {}
-
-local function claim_key(target, cwd)
-	if target.session_id then
-		return target.session_id
-	end
-	if target.continue then
-		return "continue:" .. tostring(normalize_cwd(cwd))
-	end
-	return nil
-end
 
 --- Decide whether a restore command may be sent, and reserve its session so
 --- that a second pane asking for the same one is refused.
----@param cmd string the command about to be typed into a pane
+---@param cmd string the restore command built for a pane
 ---@param cwd string|nil the pane's working directory
 ---@return table verdict { allow, target?, state?, reason?, pid? }
 function pub.check_command(cmd, cwd)
@@ -393,8 +417,7 @@ function pub.check_command(cmd, cwd)
 	if state ~= "dead" then
 		return { allow = false, target = target, state = state, reason = reason, pid = pid }
 	end
-	local key = claim_key(target, cwd)
-	local claimed_at = key and claims[key]
+	local claimed_at = claims[target.session_id]
 	if claimed_at and os.time() - claimed_at < pub.claim_ttl_seconds then
 		return {
 			allow = false,
@@ -403,12 +426,9 @@ function pub.check_command(cmd, cwd)
 			reason = "already resumed in another pane by this restore",
 		}
 	end
-	if key then
-		claims[key] = os.time()
-	end
+	claims[target.session_id] = os.time()
 	return { allow = true, target = target, state = "dead" }
 end
-
 -- ---------------------------------------------------------------------------
 -- Reporting
 -- ---------------------------------------------------------------------------
@@ -441,9 +461,6 @@ end
 local function short_id(target)
 	if target and target.session_id then
 		return target.session_id:sub(1, 8)
-	end
-	if target and target.continue then
-		return "(--continue)"
 	end
 	return "(unknown)"
 end
@@ -481,7 +498,7 @@ local function report()
 		.. plural(done.skipped_live, "pane", "panes") .. " left alone because the session is already running"
 	if done.skipped_unknown > 0 then
 		message = message .. ", " .. plural(done.skipped_unknown, "pane", "panes")
-			.. " left alone because it could not be told whether the session is running"
+			.. " left alone because the session's state or its saved command could not be verified"
 	end
 	wezterm.log_info("resurrect: " .. message)
 	wezterm.emit("resurrect.restore_guard.report", done)
@@ -519,7 +536,13 @@ function pub.summarize(state, get_command)
 			return
 		end
 		summary.panes = summary.panes + 1
-		local target = pub.resume_target(get_command(node))
+		local command, rejected = get_command(node)
+		local target = pub.resume_target(command)
+		if rejected then
+			-- A saved command its handler refused: it will not be typed, and
+			-- a copy holding one is not to be trusted.
+			target = { unreadable = true }
+		end
 		if target then
 			summary.sessions = summary.sessions + 1
 			local cwd = (type(node.process) == "table" and node.process.cwd) or node.cwd
@@ -593,7 +616,7 @@ end
 pub._test = {
 	parse_query_output = parse_query_output,
 	build_snapshot = build_snapshot,
-	normalize_cwd = normalize_cwd,
+
 	reset = function()
 		cached_snapshot = nil
 		cached_at = nil

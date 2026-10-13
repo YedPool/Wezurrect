@@ -353,19 +353,6 @@ describe("restore guard: resume commands", function()
         assert.equals("", all_sent(second))
     end)
 
-    it("does not send --continue into a directory that has a running session", function()
-        local tree = claude_pane(LIVE, "C:/work/live/")
-        tree.process.argv = { "claude" }
-        local pane = restore_pane(tree)
-        assert.equals("", all_sent(pane))
-    end)
-
-    it("sends --continue into a directory with no running session", function()
-        local tree = claude_pane(LIVE, "C:\\work\\elsewhere")
-        tree.process.argv = { "claude" }
-        local pane = restore_pane(tree)
-        assert.truthy(all_sent(pane):find("claude --continue", 1, true))
-    end)
 
     it("still restores a program that is not Claude", function()
         local pane = restore_pane({
@@ -943,4 +930,117 @@ describe("restore guard: other entry points", function()
         assert.truthy(everything_sent():find(DEAD, 1, true))
         assert.falsy(everything_sent():find(LIVE, 1, true))
     end)
+end)
+-- ---------------------------------------------------------------------------
+-- The typed line is rebuilt from fixed parts, never copied from the file
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: the line that is typed", function()
+    before_each(reset)
+
+    it("is exactly cd <dir> and claude --resume <id>", function()
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("cd C:\\work\r\nclaude --resume " .. DEAD .. "\r\n", all_sent(pane))
+    end)
+
+    it("keeps the one allowed flag", function()
+        local tree = claude_pane(DEAD)
+        tree.process.argv = { "claude", "--resume", DEAD, "--dangerously-skip-permissions" }
+        local pane = restore_pane(tree)
+        assert.equals(
+            "cd C:\\work\r\nclaude --resume " .. DEAD .. " --dangerously-skip-permissions\r\n",
+            all_sent(pane)
+        )
+    end)
+
+    it("keeps the claude2 binary name", function()
+        local tree = claude_pane(DEAD)
+        tree.process.name = "claude2"
+        tree.process.argv = { "claude2", "--resume", DEAD }
+        local pane = restore_pane(tree)
+        assert.equals("cd C:\\work\r\nclaude2 --resume " .. DEAD .. "\r\n", all_sent(pane))
+    end)
+
+    for _, bad_id in ipairs({
+        "abc-123",
+        "BBBBBBBB-2222-4222-8222-222222222222",
+        DEAD .. "0",
+        "bbbbbbbb22224222822222222222222222222",
+        "------------------------------------",
+    }) do
+        it("is not typed when the session id is " .. bad_id, function()
+            local tree = claude_pane(DEAD)
+            tree.process.argv = { "claude", "--resume", bad_id }
+            local pane = restore_pane(tree)
+            assert.equals("", all_sent(pane))
+        end)
+    end
+
+    it("is not typed when the saved command carries a flag that is not allowed", function()
+        local tree = claude_pane(DEAD)
+        tree.process.argv = { "claude", "--resume", DEAD, "--model", "x" }
+        local pane = restore_pane(tree)
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("pane " .. pane.id), "the refusal names the pane")
+    end)
+
+    it("is not typed when the saved command has no session id", function()
+        local tree = claude_pane(DEAD)
+        tree.process.argv = { "claude" }
+        local pane = restore_pane(tree)
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("is not typed when the saved process name carries a path", function()
+        -- The Claude handler does not recognise this name; the argv used to
+        -- be replayed as written because "claude" was on the allow-list.
+        local tree = claude_pane(DEAD)
+        tree.process.name = "C:\\evil\\claude.exe"
+        tree.process.argv = { "claude", "--resume", DEAD, "--append-system-prompt", "x" }
+        local pane = restore_pane(tree)
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("is not typed when the saved argv does not start with a claude binary", function()
+        local tree = claude_pane(DEAD)
+        tree.process.argv = { "powershell", "--resume", DEAD }
+        local pane = restore_pane(tree)
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("is not typed when another handler builds a claude command of another shape", function()
+        require("resurrect.process_handlers").register({
+            name = "wrapper",
+            detect = function(info) return info.name == "wrapped" end,
+            get_restore_cmd = function() return "claude --resume " .. DEAD .. " ; calc" end,
+        })
+        local pane = restore_pane({
+            cwd = "C:\\work",
+            process = { name = "wrapped", executable = "wrapped", argv = { "wrapped" } },
+        })
+        assert.equals("", all_sent(pane))
+    end)
+
+    for _, bad_cwd in ipairs({
+        "C:\\a' > 'C:\\Users\\me\\precious.txt",
+        "C:\\a\" > \"C:\\x",
+        "C:\\a > C:\\x",
+        "C:\\a < C:\\x",
+        "C:\\a; calc",
+        "C:\\a\r\ncalc",
+    }) do
+        it("types nothing when the saved directory is " .. bad_cwd:gsub("[\r\n]", "<newline>"), function()
+            local pane = restore_pane(claude_pane(DEAD, bad_cwd))
+            assert.equals("", all_sent(pane))
+        end)
+
+        it("restore_tab does not cd into " .. bad_cwd:gsub("[\r\n]", "<newline>"), function()
+            local fresh = new_pane()
+            tab_state.restore_tab(new_tab(fresh), { title = "t", pane_tree = { cwd = bad_cwd } }, {
+                pane = fresh,
+                pane_is_new = true,
+            })
+            assert.equals("", all_sent(fresh))
+        end)
+    end
 end)
