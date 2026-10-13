@@ -5,4 +5,4 @@
 ---@alias MuxTab any
 ---@alias MuxWindow any
 
----@alias restore_opts {spawn_in_workspace: boolean?, relative: boolean?, absolute: boolean?, close_open_tabs: boolean?, close_open_panes: boolean?, pane: Pane?, pane_is_new: boolean?, tab: MuxTab?, window: MuxWindow, resize_window: boolean?, on_pane_restore: fun(pane_tree: pane_tree)}
+---@alias restore_opts {spawn_in_workspace: boolean?, relative: boolean?, absolute: boolean?, close_open_tabs: boolean?, close_open_panes: boolean?, pane: Pane?, pane_is_new: boolean?, liveness_read: boolean?, tab: MuxTab?, window: MuxWindow, resize_window: boolean?, on_pane_restore: fun(pane_tree: pane_tree)}

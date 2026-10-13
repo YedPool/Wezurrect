@@ -103,7 +103,7 @@ end
 ---@param opts restore_opts
 function pub.restore_tab(tab, tab_state, opts)
 	wezterm.emit("resurrect.tab_state.restore_tab.start")
-	opts = utils.shallow_copy(opts)
+	opts = utils.restore_opts_with_fresh_liveness(opts)
 	-- A restore types into panes (cd, then the program's restore command).
 	-- It may only do that to a pane it created itself, flagged by
 	-- opts.pane_is_new. Any other pane may hold a running program -- typing

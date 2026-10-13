@@ -678,8 +678,15 @@ end
 --- Create a callback for fuzzy_loader.fuzzy_load that dispatches restore
 --- based on state type (workspace/window/tab). Extracted to avoid duplication
 --- between the "no instances" path and the "[Browse named saves]" action.
+---
+--- Every kind is restored into a window of its own. A window or tab save used
+--- to go into the window the selector was opened from: a tab save split the
+--- pane Alt+R was pressed in and renamed its tab, a window save added tabs to
+--- that window and retitled it. The selector is opened from whatever is in
+--- front, usually a pane that is busy, so nothing of that window is touched.
+--- (Calling restore_window / restore_tab directly still restores in place.)
 ---@param restore_opts table
----@param fallback_pane table Pane to use for window/tab restore
+---@param fallback_pane table Pane the selector was opened from (no longer restored into)
 ---@return fun(id: string, label: string)
 local function make_fuzzy_restore_callback(restore_opts, fallback_pane)
 	return function(id, label)
@@ -694,10 +701,24 @@ local function make_fuzzy_restore_callback(restore_opts, fallback_pane)
 			require("resurrect.workspace_state").restore_workspace(state, restore_opts)
 		elseif state_type == "window" then
 			local state = sm.load_state(name, "window")
-			require("resurrect.window_state").restore_window(fallback_pane:window(), state, restore_opts)
+			if type(state.tabs) ~= "table" or not state.tabs[1] then
+				return
+			end
+			local opts = utils.tbl_deep_extend("force", restore_opts, {})
+			local window
+			opts.tab, opts.pane, window = wezterm.mux.spawn_window({ cwd = state.tabs[1].pane_tree.cwd })
+			opts.pane_is_new = true
+			require("resurrect.window_state").restore_window(window, state, opts)
 		elseif state_type == "tab" then
 			local state = sm.load_state(name, "tab")
-			require("resurrect.tab_state").restore_tab(fallback_pane:tab(), state, restore_opts)
+			if type(state.pane_tree) ~= "table" then
+				return
+			end
+			local opts = utils.tbl_deep_extend("force", restore_opts, {})
+			local tab
+			tab, opts.pane = wezterm.mux.spawn_window({ cwd = state.pane_tree.cwd })
+			opts.pane_is_new = true
+			require("resurrect.tab_state").restore_tab(tab, state, opts)
 		end
 	end
 end
@@ -797,6 +818,8 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 		elseif workspace_state then
 			restored = restored + 1
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
+			-- Read at the top of this function.
+			opts.liveness_read = true
 			if restored == 1 and is_blank_startup_pane(pane, restore_opts) then
 				opts.window = pane:window()
 				opts.pane = pane

@@ -346,6 +346,8 @@ function pub.resurrect_on_gui_startup()
 				return
 			end
 			require("resurrect.workspace_state").restore_workspace(state, {
+				-- Read just above, outside the pcall.
+				liveness_read = true,
 				spawn_in_workspace = true,
 				relative = true,
 				restore_text = true,

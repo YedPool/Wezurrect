@@ -178,6 +178,22 @@ function utils.shallow_copy(original)
 	return copy
 end
 
+-- The options a restore function works with: its own copy of the caller's,
+-- marked once a fresh reading of the running sessions has been taken. Every
+-- restore that can lead to typing starts from a reading taken for it, not
+-- from one a selector took up to 10 seconds earlier; the functions it calls
+-- see the mark and do not read again.
+---@param opts table|nil
+---@return table
+function utils.restore_opts_with_fresh_liveness(opts)
+	local copy = utils.shallow_copy(opts)
+	if not copy.liveness_read then
+		require("resurrect.restore_guard").get_snapshot(true)
+		copy.liveness_read = true
+	end
+	return copy
+end
+
 -- deep copy
 ---@param original table
 ---@return any copy

@@ -55,7 +55,7 @@ local function new_window(first_pane)
     local first_tab = new_tab(first_pane)
     function window:active_tab() return first_tab end
     function window:active_pane() return first_pane end
-    function window:set_title() end
+    function window:set_title(title) self.title = title end
     function window:gui_window()
         return { set_inner_size = function() end }
     end
@@ -1139,5 +1139,72 @@ describe("restore guard: a running session in the same directory", function()
         instance_manager._test.restore_instances({ MIXED_ID }, gui, existing, restore_opts)
         run_timers()
         assert.equals("", everything_sent())
+    end)
+end)
+-- ---------------------------------------------------------------------------
+-- Browse named saves
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: Browse named saves", function()
+    local existing, gui
+    local dir = state_manager.save_state_dir .. sep
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        save_instance_file(SAVED_ID, workspace_of(claude_pane(OTHER)))
+        existing = busy_pane()
+        existing:window().title = "my live window"
+        function existing:tab() return existing:window():active_tab() end
+        function existing:split()
+            self.was_split = true
+            return new_pane()
+        end
+        gui = new_gui_window()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        gui:pick("__BROWSE_NAMED__", existing)
+    end)
+
+    it("a named tab save opens in a new window, not as a split of the pane Alt+R was pressed in", function()
+        file_store[dir .. "tab" .. sep .. "notes.json"] = json.encode({ title = "notes", pane_tree = claude_pane(DEAD) })
+        fuzzy_callback("tab" .. sep .. "notes.json", "notes")
+        run_timers()
+        assert.equals(1, spawned_windows)
+        assert.is_nil(existing.was_split, "the existing pane must not be split")
+        assert.is_nil(existing:tab().title, "the existing tab must not be renamed")
+        assert.equals("", all_sent(existing))
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+    end)
+
+    it("a named window save opens in a new window, not as tabs of the current one", function()
+        local window_state = workspace_of(claude_pane(DEAD)).window_states[1]
+        window_state.title = "saved window"
+        file_store[dir .. "window" .. sep .. "saved.json"] = json.encode(window_state)
+        fuzzy_callback("window" .. sep .. "saved.json", "saved")
+        run_timers()
+        assert.equals(1, spawned_windows)
+        assert.equals(0, existing:window().spawned_tabs, "no tab may be added to the current window")
+        assert.equals("my live window", existing:window().title, "the current window must keep its title")
+        assert.equals("", all_sent(existing))
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+    end)
+
+    it("decides on a fresh reading of what is running", function()
+        file_store[dir .. "tab" .. sep .. "notes.json"] = json.encode({ title = "notes", pane_tree = claude_pane(DEAD) })
+        -- DEAD is started elsewhere after the selector took its reading.
+        control_files({ { DEAD, 4444, START, true, START, "C:\\elsewhere" } })
+        fuzzy_callback("tab" .. sep .. "notes.json", "notes")
+        run_timers()
+        assert.falsy(everything_sent():find("claude", 1, true))
+    end)
+
+    it("a config calling restore_workspace directly also gets a fresh reading", function()
+        guard.get_snapshot() -- an earlier reading, still within its 10 seconds
+        control_files({ { DEAD, 4444, START, true, START, "C:\\elsewhere" } })
+        workspace_state_mod.restore_workspace(workspace_of(claude_pane(DEAD)), {
+            on_pane_restore = tab_state.default_on_pane_restore,
+        })
+        run_timers()
+        assert.falsy(everything_sent():find("claude", 1, true))
     end)
 end)

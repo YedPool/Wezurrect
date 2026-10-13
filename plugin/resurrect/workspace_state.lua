@@ -13,7 +13,7 @@ function pub.restore_workspace(workspace_state, opts)
 	end
 
 	wezterm.emit("resurrect.workspace_state.restore_workspace.start")
-	opts = utils.shallow_copy(opts)
+	opts = utils.restore_opts_with_fresh_liveness(opts)
 
 	for i, window_state in ipairs(workspace_state.window_states) do
 		if i == 1 and opts.window then

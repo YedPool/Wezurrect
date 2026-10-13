@@ -47,7 +47,7 @@ end
 ---@param opts? restore_opts
 function pub.restore_window(window, window_state, opts)
 	wezterm.emit("resurrect.window_state.restore_window.start")
-	opts = utils.shallow_copy(opts)
+	opts = utils.restore_opts_with_fresh_liveness(opts)
 
 	if window_state.title then
 		window:set_title(window_state.title)
