@@ -37,12 +37,48 @@ end
 -- Instance ID
 -- ---------------------------------------------------------------------------
 
---- Generate a unique instance ID: epoch seconds + underscore + 5-digit random.
---- Called once during setup(). Uses os.clock() for sub-second entropy to reduce
---- collision risk when multiple WezTerm processes start in the same second.
+--- Validate that an instance ID matches the expected format.
+--- Rejects anything that could be a path traversal attempt.
+---@param id string
+---@return boolean
+local function is_valid_instance_id(id)
+	return type(id) == "string" and id:match("^%d+_%d+$") ~= nil
+end
+
+-- Keys in wezterm.GLOBAL, the only state that outlives a config reload.
+local GLOBAL_ID_KEY = "resurrect_instance_id"
+local GLOBAL_NAME_KEY = "resurrect_instance_display_name"
+
+--- Set this instance's display name, here and for later config reloads.
+---@param name string
+local function set_display_name(name)
+	pub.display_name = name
+	wezterm.GLOBAL[GLOBAL_NAME_KEY] = name
+end
+
+--- Give this WezTerm process its instance ID: epoch seconds + underscore +
+--- 5-digit random. Uses os.clock() for sub-second entropy to reduce collision
+--- risk when multiple WezTerm processes start in the same second.
+---
+--- setup() calls this on EVERY evaluation of the config, and WezTerm
+--- evaluates the config again on every reload, in a fresh Lua state. A new
+--- id per evaluation left the previous id's saved file behind looking like
+--- the saved instance of another terminal, when it was a copy of the windows
+--- still open. So the id is kept in wezterm.GLOBAL, which survives reloads
+--- within one process, and a new one is made only when there is none.
 function pub.init_instance_id()
+	local known = wezterm.GLOBAL[GLOBAL_ID_KEY]
+	if is_valid_instance_id(known) then
+		pub.instance_id = known
+		local name = wezterm.GLOBAL[GLOBAL_NAME_KEY]
+		if type(name) == "string" and name ~= "" then
+			pub.display_name = name
+		end
+		return pub.instance_id
+	end
 	math.randomseed(os.time() * 1000 + math.floor(os.clock() * 1000000))
 	pub.instance_id = tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+	wezterm.GLOBAL[GLOBAL_ID_KEY] = pub.instance_id
 	return pub.instance_id
 end
 
@@ -54,14 +90,6 @@ end
 ---@return string
 function pub.get_instances_dir()
 	return get_state_manager().save_state_dir .. utils.separator .. "instances"
-end
-
---- Validate that an instance ID matches the expected format.
---- Rejects anything that could be a path traversal attempt.
----@param id string
----@return boolean
-local function is_valid_instance_id(id)
-	return type(id) == "string" and id:match("^%d+_%d+$") ~= nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -639,7 +667,7 @@ function pub.rename_instance(instance_id, new_name)
 
 	-- If this is the current instance, update in memory too
 	if instance_id == pub.instance_id then
-		pub.display_name = new_name
+		set_display_name(new_name)
 	end
 end
 
@@ -759,7 +787,7 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 
 			-- Carry over display_name from first restored instance
 			if restored == 1 and old_meta and old_meta.display_name and old_meta.display_name ~= "" then
-				pub.display_name = old_meta.display_name
+				set_display_name(old_meta.display_name)
 			end
 
 			-- Tombstone the old instance: move to restored/ subdirectory rather

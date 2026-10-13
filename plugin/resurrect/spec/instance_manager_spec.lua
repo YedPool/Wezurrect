@@ -57,6 +57,7 @@ end
 
 local wezterm_stub = {
     target_triple = is_windows() and "x86_64-pc-windows-msvc" or "x86_64-unknown-linux-gnu",
+    GLOBAL = {},
     emit = function(event, ...)
         table.insert(emitted_events, { event = event, args = { ... } })
     end,
@@ -289,6 +290,7 @@ describe("instance_manager", function()
         removed_files = {}
         moved_files = {}
         file_store = {}
+        wezterm_stub.GLOBAL = {}
         instance_manager.instance_id = nil
         instance_manager.display_name = nil
         instance_manager.retention_days = 7

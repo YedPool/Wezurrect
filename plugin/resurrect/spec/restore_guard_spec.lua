@@ -653,3 +653,54 @@ describe("restore guard: this terminal's own instance", function()
         assert.truthy(gui:choice(OWN_ID).label:find("cannot restore"))
     end)
 end)
+
+-- ---------------------------------------------------------------------------
+-- The instance id across config reloads
+-- ---------------------------------------------------------------------------
+
+-- WezTerm evaluates the config in a fresh Lua state on every reload; only
+-- wezterm.GLOBAL carries over. Loading the module again models that.
+local function reload_config()
+    package.loaded["resurrect.instance_manager"] = nil
+    local fresh = require("resurrect.instance_manager")
+    fresh.init_instance_id()
+    return fresh
+end
+
+describe("restore guard: instance id across config reloads", function()
+    before_each(reset)
+    after_each(function()
+        package.loaded["resurrect.instance_manager"] = instance_manager
+    end)
+
+    it("a reloaded config keeps the same instance id", function()
+        local first = reload_config()
+        local second = reload_config()
+        local third = reload_config()
+        assert.truthy(first.instance_id:match("^%d+_%d+$"))
+        assert.equals(first.instance_id, second.instance_id)
+        assert.equals(first.instance_id, third.instance_id)
+    end)
+
+    it("a reloaded config keeps the instance's display name", function()
+        local first = reload_config()
+        save_instance_file(first.instance_id, workspace_of(claude_pane(DEAD)))
+        first.rename_instance(first.instance_id, "Fleet")
+        local second = reload_config()
+        assert.equals("Fleet", second.display_name)
+    end)
+
+    it("a new WezTerm process gets a new instance id", function()
+        reload_config()
+        wezterm_stub.GLOBAL = {} -- a new process starts with an empty GLOBAL
+        local other = reload_config()
+        assert.truthy(other.instance_id:match("^%d+_%d+$"))
+        assert.equals(other.instance_id, wezterm_stub.GLOBAL.resurrect_instance_id)
+    end)
+
+    it("ignores a remembered id that is not a valid instance id", function()
+        wezterm_stub.GLOBAL.resurrect_instance_id = "..\\..\\evil"
+        local fresh = reload_config()
+        assert.truthy(fresh.instance_id:match("^%d+_%d+$"))
+    end)
+end)
