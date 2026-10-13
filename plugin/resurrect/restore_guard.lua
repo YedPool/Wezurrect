@@ -42,9 +42,15 @@ pub.start_time_tolerance = 10000000
 -- The one function that asks the operating system
 -- ---------------------------------------------------------------------------
 
--- One PowerShell statement list, written without double quotes or newlines so
--- it survives being passed as a single process argument.
-local QUERY_SCRIPT = table.concat({
+-- How long the process query may take. PowerShell abandons its own work after
+-- this long and says so, and an answer that took longer than this to arrive
+-- is not used either.
+pub.query_time_limit_seconds = 10
+
+-- The work: list the control files and look up each pid. Runs inside the
+-- wrapper below. Written without double quotes or newlines so the whole
+-- script survives being passed as a single process argument.
+local QUERY_WORK = table.concat({
 	"$ErrorActionPreference = 'Stop'; $t = [char]9;",
 	"try { $n = 0; $dirs = @(@DIRS@);",
 	"for ($i = 0; $i -lt $dirs.Count; $i++) { $d = $dirs[$i];",
@@ -66,6 +72,19 @@ local QUERY_SCRIPT = table.concat({
 	"catch { ('ERR', $_.Exception.Message) -join $t }",
 }, " ")
 
+-- The wrapper: run the work on a second PowerShell runspace and wait for it
+-- no longer than the time limit. If it has not finished (a hung file read, a
+-- stuck process lookup), print an ERR line and end the process, abandoning
+-- the stuck thread.
+local QUERY_SCRIPT = table.concat({
+	"$t = [char]9; $work = {", QUERY_WORK, "};",
+	"try { $ps = [powershell]::Create(); [void]$ps.AddScript($work.ToString());",
+	"$h = $ps.BeginInvoke();",
+	"if ($h.AsyncWaitHandle.WaitOne(@LIMIT@000)) { $ps.EndInvoke($h) }",
+	"else { [Console]::Out.WriteLine(('ERR', 'the process query did not finish in @LIMIT@ seconds') -join $t);",
+	"[Console]::Out.Flush(); [Environment]::Exit(0) } }",
+	"catch { ('ERR', $_.Exception.Message) -join $t }",
+}, " ")
 --- Ask the operating system which Claude control files exist and whether the
 --- process each one names is running. THE ONLY PLACE THIS MODULE TOUCHES THE
 --- OS; everything else works on the text it returns.
@@ -89,6 +108,12 @@ local QUERY_SCRIPT = table.concat({
 ---               output is incomplete and must not be trusted.
 ---   ERR <text>  the query failed (for example the first directory is gone).
 ---
+--- Time: wezterm.run_child_process takes no timeout. The script bounds its
+--- own work (see QUERY_SCRIPT) and get_snapshot refuses an answer that took
+--- longer than query_time_limit_seconds. What neither can bound is
+--- powershell.exe never starting or never returning: the call then does not
+--- come back, the restore that asked does not continue, and nothing is typed.
+---
 --- Yields (wezterm.run_child_process), so it must be called from an event or
 --- key callback, never while the config file is being evaluated.
 ---@param dirs string[]
@@ -107,7 +132,7 @@ function pub.run_query(dirs)
 	local dir_list = table.concat(quoted, ", ")
 	local script = QUERY_SCRIPT:gsub("@DIRS@", function()
 		return dir_list
-	end)
+	end):gsub("@LIMIT@", tostring(math.floor(pub.query_time_limit_seconds)))
 	local success, stdout, stderr = wezterm.run_child_process({
 		"powershell.exe", "-NoProfile", "-NoLogo", "-NonInteractive", "-Command", script,
 	})
@@ -273,7 +298,13 @@ function pub.get_snapshot(force)
 		return cached_snapshot
 	end
 	local records
+	local asked_at = os.time()
 	local stdout, err = pub.run_query(pub.control_dirs())
+	local took = os.time() - asked_at
+	if stdout and took > pub.query_time_limit_seconds then
+		-- Too old to act on, and a sign that something is wrong.
+		stdout, err = nil, "the process query took " .. took .. " seconds"
+	end
 	if stdout then
 		records, err = parse_query_output(stdout)
 	end

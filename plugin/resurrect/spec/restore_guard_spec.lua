@@ -1208,3 +1208,55 @@ describe("restore guard: Browse named saves", function()
         assert.falsy(everything_sent():find("claude", 1, true))
     end)
 end)
+-- ---------------------------------------------------------------------------
+-- A slow or failing process query
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: the process query itself", function()
+    local real_time = os.time
+    before_each(reset)
+    after_each(function() rawset(os, "time", real_time) end)
+
+    it("an answer that took too long is unknown", function()
+        local now = real_time()
+        rawset(os, "time", function() return now end)
+        usual_world()
+        local answer = guard.run_query
+        guard.run_query = function(...)
+            now = now + guard.query_time_limit_seconds + 1 -- the query hangs for a while
+            return answer(...)
+        end
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+        local line = logged("not resuming session")
+        assert.truthy(line and line:find("took", 1, true), line)
+    end)
+
+    it("a query that reports its own timeout is unknown", function()
+        guard.run_query = function()
+            return "ERR\tthe process query did not finish in 10 seconds\r\n"
+        end
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("did not finish"))
+    end)
+
+    it("the query asks PowerShell to stop its own work after the time limit", function()
+        local seen
+        wezterm_stub.run_child_process = function(args)
+            seen = args
+            return true, "END\t0\r\n", ""
+        end
+        package.loaded["resurrect.restore_guard"] = nil
+        local fresh = require("resurrect.restore_guard")
+        fresh.run_query({ "C:\\Users\\me\\.claude\\sessions" })
+        package.loaded["resurrect.restore_guard"] = guard
+        wezterm_stub.run_child_process = function()
+            return true, table.concat(listed_instance_ids, "\n"), ""
+        end
+        local script = seen[#seen]
+        assert.truthy(script:find("BeginInvoke", 1, true), "the work runs where it can be abandoned")
+        assert.truthy(script:find("WaitOne(" .. fresh.query_time_limit_seconds .. "000)", 1, true), script)
+        assert.falsy(script:find('"', 1, true), "no double quotes: it is passed as one argument")
+    end)
+end)
