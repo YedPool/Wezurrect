@@ -49,11 +49,36 @@ end
 local GLOBAL_ID_KEY = "resurrect_instance_id"
 local GLOBAL_NAME_KEY = "resurrect_instance_display_name"
 
+-- Read and write wezterm.GLOBAL without ever raising: init_instance_id runs
+-- while WezTerm loads the user's config, and an error there fails the whole
+-- config. If GLOBAL is missing or unusable the id simply is not kept: every
+-- reload then gets a new one (the old behaviour), and the copies that leaves
+-- behind are stopped by restore_guard's running-session rules instead.
+local function global_get(key)
+	local ok, value = pcall(function()
+		return wezterm.GLOBAL[key]
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+local function global_set(key, value)
+	local ok, err = pcall(function()
+		wezterm.GLOBAL[key] = value
+	end)
+	if not ok then
+		wezterm.log_warn("resurrect: could not keep " .. key .. " in wezterm.GLOBAL ("
+			.. tostring(err) .. "); it will not survive a config reload")
+	end
+end
+
 --- Set this instance's display name, here and for later config reloads.
 ---@param name string
 local function set_display_name(name)
 	pub.display_name = name
-	wezterm.GLOBAL[GLOBAL_NAME_KEY] = name
+	global_set(GLOBAL_NAME_KEY, name)
 end
 
 --- Give this WezTerm process its instance ID: epoch seconds + underscore +
@@ -67,10 +92,10 @@ end
 --- still open. So the id is kept in wezterm.GLOBAL, which survives reloads
 --- within one process, and a new one is made only when there is none.
 function pub.init_instance_id()
-	local known = wezterm.GLOBAL[GLOBAL_ID_KEY]
+	local known = global_get(GLOBAL_ID_KEY)
 	if is_valid_instance_id(known) then
 		pub.instance_id = known
-		local name = wezterm.GLOBAL[GLOBAL_NAME_KEY]
+		local name = global_get(GLOBAL_NAME_KEY)
 		if type(name) == "string" and name ~= "" then
 			pub.display_name = name
 		end
@@ -78,7 +103,7 @@ function pub.init_instance_id()
 	end
 	math.randomseed(os.time() * 1000 + math.floor(os.clock() * 1000000))
 	pub.instance_id = tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
-	wezterm.GLOBAL[GLOBAL_ID_KEY] = pub.instance_id
+	global_set(GLOBAL_ID_KEY, pub.instance_id)
 	return pub.instance_id
 end
 

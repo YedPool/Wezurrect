@@ -1260,3 +1260,78 @@ describe("restore guard: the process query itself", function()
         assert.falsy(script:find('"', 1, true), "no double quotes: it is passed as one argument")
     end)
 end)
+-- ---------------------------------------------------------------------------
+-- When wezterm.GLOBAL does not keep the instance id
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: an instance id that is not kept", function()
+    before_each(reset)
+    after_each(function()
+        package.loaded["resurrect.instance_manager"] = instance_manager
+    end)
+
+    it("a missing wezterm.GLOBAL does not break the config", function()
+        wezterm_stub.GLOBAL = nil
+        local fresh
+        assert.has_no.errors(function() fresh = reload_config() end)
+        assert.truthy(fresh.instance_id:match("^%d+_%d+$"))
+        assert.truthy(logged("wezterm.GLOBAL"))
+    end)
+
+    it("a wezterm.GLOBAL that cannot be read or written does not break the config", function()
+        wezterm_stub.GLOBAL = setmetatable({}, {
+            __index = function() error("GLOBAL is not available") end,
+            __newindex = function() error("GLOBAL is not available") end,
+        })
+        local fresh
+        assert.has_no.errors(function() fresh = reload_config() end)
+        assert.truthy(fresh.instance_id:match("^%d+_%d+$"))
+        assert.has_no.errors(function() fresh.rename_instance(fresh.instance_id, "Fleet") end)
+    end)
+
+    -- The original fault: every reload a new id, and the previous id's file
+    -- left behind as a copy of the windows still open. The copy is then not
+    -- recognised as "own", so the running-session rules have to stop it.
+    describe("with a new id on every reload", function()
+        local PREVIOUS_ID = "1700000005_55555"
+        local fresh, existing, gui
+
+        before_each(function()
+            control_files({
+                { LIVE, 4242, START, true, START, "C:\\work\\a" },
+                { OTHER, 4343, START, true, START, "C:\\work\\b" },
+            })
+            wezterm_stub.GLOBAL = nil -- nothing is kept between evaluations
+            reload_config()
+            fresh = reload_config()
+            assert.are_not.equal(PREVIOUS_ID, fresh.instance_id)
+            existing = busy_pane()
+            gui = new_gui_window()
+        end)
+
+        it("the previous id's copy is refused when all its sessions are running", function()
+            save_instance_file(PREVIOUS_ID, workspace_of(claude_pane(LIVE), claude_pane(OTHER)))
+            fresh.show_instance_selector(gui, existing, restore_opts)
+            assert.truthy(gui:choice(PREVIOUS_ID).label:find("all 2 sessions already running, cannot restore", 1, true))
+            gui:pick(PREVIOUS_ID, existing)
+            assert.is_nil(gui:choice("__RESTORE_SELECTED__"))
+
+            fresh._test.restore_instances({ PREVIOUS_ID }, gui, existing, restore_opts)
+            run_timers()
+            assert.equals(0, spawned_windows)
+            assert.equals("", everything_sent())
+        end)
+
+        it("a partly running copy resumes only the sessions that are not running", function()
+            save_instance_file(PREVIOUS_ID, workspace_of(claude_pane(LIVE), claude_pane(DEAD)))
+            fresh.show_instance_selector(gui, existing, restore_opts)
+            assert.truthy(gui:choice(PREVIOUS_ID).label:find("1 of 2 sessions already running", 1, true))
+            gui:pick(PREVIOUS_ID, existing)
+            gui:pick("__RESTORE_SELECTED__", existing)
+            run_timers()
+            assert.truthy(everything_sent():find(DEAD, 1, true))
+            assert.falsy(everything_sent():find(LIVE, 1, true))
+            assert.equals("", all_sent(existing))
+        end)
+    end)
+end)
