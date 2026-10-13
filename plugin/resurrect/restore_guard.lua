@@ -388,6 +388,41 @@ function pub.resume_target(cmd)
 	end
 	return { session_id = session_id, line = table.concat(parts, " ") }
 end
+-- Sessions this plugin has just sent a resume command for: id -> os.time().
+local claims = {}
+
+local function recently_claimed(session_id)
+	local claimed_at = claims[session_id]
+	return claimed_at ~= nil and os.time() - claimed_at < pub.claim_ttl_seconds
+end
+
+-- Compare working directories the way Windows does: slash direction, case and
+-- a trailing separator do not matter. WezTerm reports /C:/..., Claude C:\...
+local function normalize_cwd(cwd)
+	if type(cwd) ~= "string" or cwd == "" then
+		return nil
+	end
+	local n = cwd:gsub("\\", "/"):gsub("^/(%a:)", "%1"):gsub("/+$", "")
+	if utils.is_windows then
+		n = n:lower()
+	end
+	return n
+end
+
+-- A running session in the pane's directory, other than ones this plugin has
+-- just resumed itself. Without a directory to compare, any running session.
+local function running_session_in(cwd, snapshot)
+	local wanted = normalize_cwd(cwd)
+	for _, record in ipairs(snapshot.records) do
+		if record.state ~= "dead" and not recently_claimed(record.session_id) then
+			if not wanted or normalize_cwd(record.cwd) == wanted then
+				return record
+			end
+		end
+	end
+	return nil
+end
+
 --- Whether the session a command would resume is running, per a snapshot.
 ---@param target table from resume_target
 ---@param cwd string|nil the pane's working directory
@@ -407,6 +442,15 @@ function pub.inspect(target, cwd, snapshot)
 	end
 	local session = snapshot.sessions[target.session_id]
 	if not session or session.state == "dead" then
+		-- Not running under this id. But Claude can give a conversation a
+		-- new id (compaction, /resume); the saved id then has no control
+		-- file while the conversation runs on. The one trace is a running
+		-- session in the same directory, so that is "unknown", not "dead".
+		local other = running_session_in(cwd, snapshot)
+		if other then
+			return "unknown", "a session is running in the same directory (pid " .. tostring(other.pid)
+				.. "); this id may be an earlier id of it", other.pid
+		end
 		return "dead"
 	end
 	if session.state == "live" then
@@ -416,8 +460,6 @@ function pub.inspect(target, cwd, snapshot)
 		.. " is running but its start time could not be confirmed)", session.pid
 end
 
--- Sessions this plugin has just sent a resume command for: id -> os.time().
-local claims = {}
 
 --- Decide whether a restore command may be sent, and reserve its session so
 --- that a second pane asking for the same one is refused.
@@ -433,8 +475,7 @@ function pub.check_command(cmd, cwd)
 	if state ~= "dead" then
 		return { allow = false, target = target, state = state, reason = reason, pid = pid }
 	end
-	local claimed_at = claims[target.session_id]
-	if claimed_at and os.time() - claimed_at < pub.claim_ttl_seconds then
+	if recently_claimed(target.session_id) then
 		return {
 			allow = false,
 			target = target,

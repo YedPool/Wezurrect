@@ -1086,3 +1086,58 @@ describe("restore guard: the control folder", function()
         end
     end)
 end)
+-- ---------------------------------------------------------------------------
+-- A session whose id has changed since the copy was saved
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: a running session in the same directory", function()
+    before_each(reset)
+
+    -- Claude can give a conversation a new id (compaction, /resume). A saved
+    -- copy then holds the old id, which has no control file. The only trace
+    -- is that a running session sits in the same directory.
+    for _, saved_cwd in ipairs({ "C:\\work\\live", "c:/WORK/Live/", "C:\\work\\live\\", "/C:/work/live" }) do
+        it("does not resume an id with no control file when a session runs in " .. saved_cwd, function()
+            local pane = restore_pane(claude_pane(OTHER, saved_cwd))
+            assert.equals("", all_sent(pane))
+            local line = logged("not resuming session dddddddd")
+            assert.truthy(line and line:find("same directory", 1, true), line)
+            assert.truthy(line:find("pid 4242", 1, true), line)
+        end)
+    end
+
+    it("resumes it when the running sessions are in other directories", function()
+        local pane = restore_pane(claude_pane(OTHER, "C:\\work\\livelier"))
+        assert.truthy(all_sent(pane):find(OTHER, 1, true))
+    end)
+
+    it("does not resume when the pane has no directory and a session is running", function()
+        local tree = claude_pane(OTHER)
+        tree.cwd = nil
+        tree.process.cwd = nil
+        local pane = restore_pane(tree)
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("a session this restore resumed does not block the next pane of the same directory", function()
+        local first = restore_pane(claude_pane(DEAD, "C:\\work\\shared"))
+        assert.truthy(all_sent(first):find(DEAD, 1, true))
+        -- DEAD has started and written its control file; the reading is renewed.
+        control_files({ { DEAD, 9090, START, true, START, "C:\\work\\shared" } })
+        guard.get_snapshot(true)
+        local second = restore_pane(claude_pane(OTHER, "C:\\work\\shared"))
+        assert.truthy(all_sent(second):find(OTHER, 1, true))
+    end)
+
+    it("a saved copy holding such an id cannot be restored", function()
+        instance_manager.instance_id = OWN_ID
+        save_instance_file(MIXED_ID, workspace_of(claude_pane(DEAD, "C:\\work\\elsewhere"), claude_pane(OTHER, "C:\\work\\live")))
+        local existing = busy_pane()
+        local gui = new_gui_window()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        assert.truthy(gui:choice(MIXED_ID).label:find("cannot tell what is running", 1, true))
+        instance_manager._test.restore_instances({ MIXED_ID }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals("", everything_sent())
+    end)
+end)
