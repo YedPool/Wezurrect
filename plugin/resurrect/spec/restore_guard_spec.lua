@@ -598,6 +598,36 @@ describe("restore guard: panes that already exist", function()
         assert.truthy(all_sent(blank):find(DEAD, 1, true))
     end)
 
+    it("Alt+R never reuses the startup window, even when its foreground process is a shell", function()
+        -- Start with saved copies, press Esc on the startup selector, run
+        -- Claude in that first pane. Claude's pane reports its CHILD process
+        -- (bash, pwsh) as the foreground, so it looks like a blank shell.
+        local gui = new_gui_window()
+        save_instance_file("1700000001_11111", workspace_of(claude_pane(DEAD)))
+        local first_pane
+        wezterm_stub.gui.gui_windows = function()
+            for _, pane in pairs(panes) do first_pane = pane end
+            first_pane.foreground = "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+            function gui:active_pane() return first_pane end
+            return { gui }
+        end
+        instance_manager.auto_restore_on_startup()
+        run_timers()
+        wezterm_stub.gui.gui_windows = function() return {} end
+        gui.selector.action(gui, first_pane, nil, nil) -- Esc
+        first_pane.foreground = "C:\\Program Files\\Git\\usr\\bin\\bash.exe"
+
+        -- Later: Alt+R in that pane, with the keybinding's own options.
+        instance_manager.show_instance_selector(gui, first_pane, restore_opts)
+        gui:pick("1700000001_11111", first_pane)
+        gui:pick("__RESTORE_SELECTED__", first_pane)
+        run_timers()
+
+        assert.equals("", all_sent(first_pane), "nothing may be typed into the pane Alt+R was pressed in")
+        assert.equals(2, spawned_windows, "the restore must open its own window")
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+    end)
+
     it("the startup window is not reused once a program runs in it", function()
         local gui = new_gui_window()
         save_instance_file("1700000001_11111", workspace_of(claude_pane(DEAD)))

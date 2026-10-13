@@ -706,9 +706,6 @@ end
 -- Selector UI
 -- ---------------------------------------------------------------------------
 
--- Pane id of the blank window auto_restore_on_startup opened for the selector.
--- It is the only pre-existing pane a restore is allowed to reuse.
-local startup_pane_id = nil
 
 -- Shells an untouched startup pane can be sitting in.
 local BLANK_SHELLS = {
@@ -716,14 +713,23 @@ local BLANK_SHELLS = {
 	bash = true, zsh = true, fish = true, sh = true, nu = true,
 }
 
---- True when the pane is the selector's own startup window and still shows
---- nothing but its shell. Anything else -- a pane Alt+R was pressed in, or the
---- startup pane after a program was started in it -- must not be typed into.
+--- True when the pane is the blank window auto_restore_on_startup opened for
+--- its selector -- the only pre-existing pane a restore may reuse -- and it
+--- still shows nothing but its shell.
+---
+--- The pane's id travels in restore_opts.startup_pane_id, which only the
+--- startup selector's own options table carries. It is deliberately not module
+--- state: the Alt+R keybinding has a different options table, so a restore
+--- started from Alt+R can never reuse a pane, whatever runs in it. (A Claude
+--- pane reports its child shell as the foreground process, so the shell check
+--- below cannot tell a busy pane from a blank one on its own.)
 --- If the foreground process cannot be read the answer is false, which only
 --- costs an extra window.
 ---@param pane table Pane
+---@param restore_opts table
 ---@return boolean
-local function is_blank_startup_pane(pane)
+local function is_blank_startup_pane(pane, restore_opts)
+	local startup_pane_id = restore_opts.startup_pane_id
 	if not startup_pane_id or pane:pane_id() ~= startup_pane_id then
 		return false
 	end
@@ -791,13 +797,14 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 		elseif workspace_state then
 			restored = restored + 1
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
-			if restored == 1 and is_blank_startup_pane(pane) then
+			if restored == 1 and is_blank_startup_pane(pane, restore_opts) then
 				opts.window = pane:window()
 				opts.pane = pane
 				opts.pane_is_new = true
 			end
 			-- Reusable once at most: after this it holds restored panes.
-			startup_pane_id = nil
+			restore_opts.startup_pane_id = nil
+			opts.startup_pane_id = nil
 
 			require("resurrect.workspace_state").restore_workspace(workspace_state, opts)
 
@@ -1059,7 +1066,7 @@ function pub.auto_restore_on_startup()
 	-- will reuse this window (via restore_opts.window) so no extra blank
 	-- shell window remains.
 	local _, startup_pane = wezterm.mux.spawn_window({})
-	startup_pane_id = startup_pane and startup_pane:pane_id() or nil
+	local startup_pane_id = startup_pane and startup_pane:pane_id() or nil
 
 	wezterm.time.call_after(1, function()
 		local gui_windows = wezterm.gui.gui_windows()
@@ -1070,6 +1077,8 @@ function pub.auto_restore_on_startup()
 				relative = true,
 				restore_text = true,
 				on_pane_restore = require("resurrect.tab_state").default_on_pane_restore,
+				-- Lets a restore chosen in THIS selector reuse the blank window.
+				startup_pane_id = startup_pane_id,
 			}
 			pub.show_instance_selector(gui_win, active_pane, restore_opts)
 		end
