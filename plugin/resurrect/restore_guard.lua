@@ -286,6 +286,25 @@ local function build_snapshot(records)
 	return snapshot
 end
 
+-- A few plain words for why the running sessions could not be read, short
+-- enough for a selector entry. The full text stays in snapshot.error.
+local function error_label(err)
+	if err:find("control directory not found", 1, true) then
+		return "control folder not found"
+	elseif err:find("no control files", 1, true) then
+		return "control folder is empty"
+	elseif err:find("denied", 1, true) then
+		return "control folder unreadable"
+	elseif err:find("did not finish", 1, true) or err:find("the process query took", 1, true) then
+		return "process query timed out"
+	elseif err:find("only implemented on Windows", 1, true) then
+		return "not supported on this system"
+	elseif err:find("control file of running process", 1, true) then
+		return "a control file is unreadable"
+	end
+	return "process query failed"
+end
+
 local cached_snapshot = nil
 local cached_at = nil
 
@@ -312,6 +331,9 @@ function pub.get_snapshot(force)
 		cached_snapshot = build_snapshot(records)
 	else
 		cached_snapshot = { sessions = {}, records = {}, error = err or "unknown error" }
+	end
+	if cached_snapshot.error then
+		cached_snapshot.error_label = error_label(cached_snapshot.error)
 	end
 	cached_at = os.time()
 	return cached_snapshot
@@ -461,15 +483,20 @@ end
 ---@return string state "dead" (safe to resume), "live" or "unknown"
 ---@return string|nil reason why it is not "dead"
 ---@return number|nil pid
+---@return string|nil kind why, as a word: "live", "malformed" (the saved
+---  command or directory is not usable), "reading" (the running sessions
+---  could not be read), "rotated" (maybe running under a new id) or
+---  "unconfirmed" (a process is there but its start time is not known)
 function pub.inspect(target, cwd, snapshot)
 	if target.unreadable then
-		return "unknown", "the saved command is not exactly 'claude --resume <session id>', so it is not typed"
+		return "unknown", "the saved command is not exactly 'claude --resume <session id>', so it is not typed",
+			nil, "malformed"
 	end
 	if cwd ~= nil and cwd ~= "" and not utils.is_safe_cwd(cwd) then
-		return "unknown", "the saved working directory holds characters a shell would interpret"
+		return "unknown", "the saved working directory holds characters a shell would interpret", nil, "malformed"
 	end
 	if snapshot.error then
-		return "unknown", "liveness unreadable (" .. snapshot.error .. ")"
+		return "unknown", "liveness unreadable (" .. snapshot.error .. ")", nil, "reading"
 	end
 	local session = snapshot.sessions[target.session_id]
 	if not session or session.state == "dead" then
@@ -479,16 +506,17 @@ function pub.inspect(target, cwd, snapshot)
 		-- session in the same directory, so that is "unknown", not "dead".
 		local other = running_session_in(cwd, snapshot)
 		if other then
-			return "unknown", "a session is running in the same directory (pid " .. tostring(other.pid)
-				.. "); this id may be an earlier id of it", other.pid
+			return "unknown", "not running under this id, but in the same folder as running pid "
+				.. tostring(other.pid) .. ", so it may be the same conversation under a new id"
+				.. " - resume it by hand if it is not", other.pid, "rotated"
 		end
 		return "dead"
 	end
 	if session.state == "live" then
-		return "live", "already running pid " .. tostring(session.pid), session.pid
+		return "live", "already running pid " .. tostring(session.pid), session.pid, "live"
 	end
 	return "unknown", "liveness unreadable (pid " .. tostring(session.pid)
-		.. " is running but its start time could not be confirmed)", session.pid
+		.. " is running but its start time could not be confirmed)", session.pid, "unconfirmed"
 end
 
 
@@ -586,7 +614,7 @@ local function report()
 		.. plural(done.skipped_live, "pane", "panes") .. " left alone because the session is already running"
 	if done.skipped_unknown > 0 then
 		message = message .. ", " .. plural(done.skipped_unknown, "pane", "panes")
-			.. " left alone because the session's state or its saved command could not be verified"
+			.. " left alone as uncertain (each has its own line above saying why)"
 	end
 	wezterm.log_info("resurrect: " .. message)
 	wezterm.emit("resurrect.restore_guard.report", done)
@@ -617,7 +645,15 @@ end
 ---@return table summary { panes, sessions, live, unknown, error? }
 function pub.summarize(state, get_command)
 	local snapshot = pub.get_snapshot()
-	local summary = { panes = 0, sessions = 0, live = 0, unknown = 0, error = snapshot.error }
+	local summary = {
+		panes = 0, sessions = 0,
+		-- Of the sessions: will be resumed / already running / maybe running
+		-- under a new id / process there but not confirmed / unusable command.
+		resumable = 0, live = 0, rotated = 0, unconfirmed = 0, malformed = 0,
+		-- Everything that is neither resumable nor known to be running.
+		unknown = 0,
+		error = snapshot.error, error_label = snapshot.error_label,
+	}
 
 	local function walk(node, depth)
 		if type(node) ~= "table" or depth > 100 then
@@ -634,11 +670,16 @@ function pub.summarize(state, get_command)
 		if target then
 			summary.sessions = summary.sessions + 1
 			local cwd = (type(node.process) == "table" and node.process.cwd) or node.cwd
-			local pane_state = pub.inspect(target, cwd, snapshot)
-			if pane_state == "live" then
+			local pane_state, _, _, kind = pub.inspect(target, cwd, snapshot)
+			if pane_state == "dead" then
+				summary.resumable = summary.resumable + 1
+			elseif pane_state == "live" then
 				summary.live = summary.live + 1
-			elseif pane_state == "unknown" then
+			else
 				summary.unknown = summary.unknown + 1
+				if summary[kind] then
+					summary[kind] = summary[kind] + 1
+				end
 			end
 		end
 		walk(node.right, depth + 1)
@@ -666,40 +707,92 @@ function pub.summarize(state, get_command)
 	return summary
 end
 
+-- "1 thing" / "3 things"
+local function count_of(n, one, many)
+	return tostring(n) .. " " .. (n == 1 and one or many)
+end
+
 --- Why a saved state must not be restored at all, or nil when it may be.
---- A state that would resume nothing is always restorable. Otherwise:
----   * if what is running cannot be established, it is refused -- unknown is
----     not permission, and restoring it as bare shells would only retire the
----     saved copy without bringing anything back;
----   * if every session in it is running, it is a stale copy of running
----     windows and there is nothing in it to bring back.
+--- A state that would resume nothing is always restorable. Otherwise it is
+--- refused when
+---   * what is running could not be read: unknown is not permission;
+---   * a saved command in it is not a plain resume line: the file is not what
+---     this plugin writes;
+---   * none of its sessions would be resumed -- they are running, or cannot
+---     be told apart from running ones -- so restoring it would only retire
+---     the saved copy and open a window of bare shells.
+--- Each case has its own words, so that a refused entry in the selector does
+--- not look like a fault.
 ---@param summary table from summarize
----@return string|nil reason
+---@return string|nil label a few words for the selector entry
+---@return string|nil detail the full sentence for the log and the toast
 function pub.refusal(summary)
 	if summary.sessions == 0 then
 		return nil
 	end
-	if summary.error or summary.unknown > 0 then
-		return "cannot tell what is running, cannot restore"
+	if summary.error then
+		return "cannot tell what is running: " .. tostring(summary.error_label) .. " - cannot restore",
+			"cannot tell what is running: " .. summary.error .. "; nothing carrying a resume line is restored"
+	end
+	if summary.malformed > 0 then
+		local is_not = summary.malformed == 1 and " is not" or " are not"
+		return count_of(summary.malformed, "saved command", "saved commands") .. is_not
+			.. " a plain resume line - cannot restore",
+			count_of(summary.malformed, "of its saved commands", "of its saved commands") .. is_not
+			.. " exactly 'claude --resume <session id>' with a plain working directory;"
+			.. " the file may have been edited, so nothing in it is restored"
+	end
+	if summary.resumable > 0 then
+		return nil
 	end
 	if summary.live == summary.sessions then
-		local which = summary.sessions == 1 and "its session is" or ("all " .. summary.sessions .. " sessions")
-		return which .. " already running, cannot restore"
+		if summary.sessions == 1 then
+			return "its session is already running - cannot restore",
+				"its one session is already running; it is a stale copy of running windows"
+		end
+		return "all " .. summary.sessions .. " sessions already running - cannot restore",
+			"all " .. summary.sessions .. " of its sessions are already running;"
+			.. " it is a stale copy of running windows"
 	end
-	return nil
+	local label, detail = {}, {}
+	if summary.live > 0 then
+		table.insert(label, summary.live .. " already running")
+		table.insert(detail, summary.live .. " already running")
+	end
+	if summary.rotated > 0 then
+		table.insert(label, summary.rotated .. " may be running under a new id")
+		table.insert(detail, count_of(summary.rotated, "is", "are") .. " not running under the saved id but"
+			.. " share a working folder with a running session, so may be the same"
+			.. (summary.rotated == 1 and " conversation" or " conversations")
+			.. " under a new id - resume those by hand if they are not")
+	end
+	if summary.unconfirmed > 0 then
+		table.insert(label, summary.unconfirmed .. " could not be checked")
+		table.insert(detail, count_of(summary.unconfirmed, "has", "have")
+			.. " a running process whose start time could not be confirmed")
+	end
+	return "nothing to resume: " .. table.concat(label, ", ") .. " - cannot restore",
+		"none of its sessions can be resumed: " .. table.concat(detail, "; ")
 end
 
---- For a restorable state: how many of its sessions are already running (and
---- so will be left alone), or nil when none are.
+--- For a restorable state, what restoring it will do when not every session
+--- in it is resumed: how many are resumed, how many are already running and
+--- how many are left alone as uncertain. nil when all of them are resumed.
 ---@param summary table from summarize
 ---@return string|nil note
 function pub.running_note(summary)
-	if summary.live > 0 then
-		return summary.live .. " of " .. summary.sessions .. " sessions already running"
+	if summary.sessions == 0 or summary.resumable == summary.sessions then
+		return nil
 	end
-	return nil
+	local parts = { "resumes " .. summary.resumable }
+	if summary.live > 0 then
+		table.insert(parts, summary.live .. " already running")
+	end
+	if summary.unknown > 0 then
+		table.insert(parts, summary.unknown .. " uncertain, left alone")
+	end
+	return table.concat(parts, "; ")
 end
-
 -- Expose internals for unit testing only
 pub._test = {
 	parse_query_output = parse_query_output,

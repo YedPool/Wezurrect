@@ -808,17 +808,20 @@ end
 --- is already running, or what is running cannot be established).
 ---@param instance_id string
 ---@param workspace_state table|nil the instance's loaded state
----@return string|nil reason
----@return string|nil note for a restorable instance: how many sessions are already running
+---@return string|nil reason a few words for the selector entry
+---@return string|nil note for a restorable instance: what restoring it will and will not resume
+---@return string|nil detail the reason as a full sentence, for the log and the toast
 local function restore_refusal(instance_id, workspace_state)
 	if pub.is_own_instance(instance_id) then
-		return "live - this terminal, cannot restore"
+		return "this terminal's own live copy - cannot restore", nil,
+			"it is this terminal's own live copy (a snapshot of the windows open now), not a saved session"
 	end
 	if not workspace_state then
 		return nil
 	end
 	local summary = restore_guard.summarize(workspace_state, quiet_restore_command)
-	return restore_guard.refusal(summary), restore_guard.running_note(summary)
+	local reason, detail = restore_guard.refusal(summary)
+	return reason, restore_guard.running_note(summary), detail
 end
 
 --- Restore one or more instances. Each gets its own new windows, except that
@@ -835,11 +838,14 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 	for _, id in ipairs(instance_ids) do
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
-		local refusal = workspace_state and restore_refusal(id, workspace_state)
+		local refusal, detail
+		if workspace_state then
+			refusal, _, detail = restore_refusal(id, workspace_state)
+		end
 		if refusal then
 			-- Checked here, not only in the selector: this is the function
 			-- that restores, whoever calls it.
-			restore_guard.notify("refusing to restore instance " .. id .. ": " .. refusal)
+			restore_guard.notify("refusing to restore instance " .. id .. ": " .. detail)
 		elseif workspace_state then
 			restored = restored + 1
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
@@ -894,16 +900,18 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 
 	-- Instance entries with [x] / [ ] markers. An instance that must not be
 	-- restored is listed (so it is clear where it went) but marked [-] with
-	-- the reason, and cannot be selected. One that can be restored says how
-	-- many of its sessions are already running and will be left alone.
+	-- the reason in a few plain words, and cannot be selected; picking it
+	-- anyway logs and toasts the reason in full. One that can be restored
+	-- only in part says how many sessions will be resumed, how many are
+	-- already running and how many are left alone as uncertain.
 	local refusals = {}
 	for _, entry in ipairs(instances) do
 		local workspace_state = nil
 		if not pub.is_own_instance(entry.instance_id) then
 			workspace_state = pub.load_instance(entry.instance_id)
 		end
-		local refusal, note = restore_refusal(entry.instance_id, workspace_state)
-		refusals[entry.instance_id] = refusal
+		local refusal, note, detail = restore_refusal(entry.instance_id, workspace_state)
+		refusals[entry.instance_id] = detail
 		local marker = selected[entry.instance_id] and "[x] " or "[ ] "
 		local label = pub.format_instance_summary(entry.meta)
 		if refusal then

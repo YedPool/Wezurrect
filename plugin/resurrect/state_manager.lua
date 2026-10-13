@@ -338,11 +338,11 @@ function pub.resurrect_on_gui_startup()
 			-- all running, or whose state cannot be established, is not
 			-- restored. What does get restored still passes the per-pane
 			-- check in default_on_pane_restore.
-			local refusal = restore_guard.refusal(restore_guard.summarize(state, function(pane_tree)
+			local refusal, detail = restore_guard.refusal(restore_guard.summarize(state, function(pane_tree)
 				return tab_state.get_pane_restore_command(pane_tree, true)
 			end))
 			if refusal then
-				restore_guard.notify("not restoring workspace " .. tostring(name) .. " at startup: " .. refusal)
+				restore_guard.notify("not restoring workspace " .. tostring(name) .. " at startup: " .. detail)
 				return
 			end
 			require("resurrect.workspace_state").restore_workspace(state, {

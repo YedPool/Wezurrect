@@ -686,7 +686,7 @@ describe("restore guard: this terminal's own instance", function()
         instance_manager.show_instance_selector(gui, existing, restore_opts)
 
         local own = gui:choice(OWN_ID)
-        assert.truthy(own.label:find("live %- this terminal, cannot restore"), own.label)
+        assert.truthy(own.label:find("this terminal's own live copy %- cannot restore"), own.label)
         assert.falsy(own.label:find("^%[ %]"), "must not look selectable")
 
         gui:pick(OWN_ID, existing)
@@ -793,7 +793,7 @@ describe("restore guard: saved copies in the selector", function()
     it("shows how many sessions of a partly running copy are already running", function()
         instance_manager.show_instance_selector(gui, existing, restore_opts)
         local label = gui:choice(MIXED_ID).label
-        assert.truthy(label:find("1 of 2 sessions already running", 1, true), label)
+        assert.truthy(label:find("resumes 1; 1 already running", 1, true), label)
         assert.truthy(label:find("^%[ %]"), "it stays selectable")
     end)
 
@@ -1101,7 +1101,7 @@ describe("restore guard: a running session in the same directory", function()
             local pane = restore_pane(claude_pane(OTHER, saved_cwd))
             assert.equals("", all_sent(pane))
             local line = logged("not resuming session dddddddd")
-            assert.truthy(line and line:find("same directory", 1, true), line)
+            assert.truthy(line and line:find("same folder", 1, true), line)
             assert.truthy(line:find("pid 4242", 1, true), line)
         end)
     end
@@ -1129,15 +1129,16 @@ describe("restore guard: a running session in the same directory", function()
         assert.truthy(all_sent(second):find(OTHER, 1, true))
     end)
 
-    it("a saved copy holding such an id cannot be restored", function()
+    it("a saved copy holding only such ids cannot be restored", function()
         instance_manager.instance_id = OWN_ID
-        save_instance_file(MIXED_ID, workspace_of(claude_pane(DEAD, "C:\\work\\elsewhere"), claude_pane(OTHER, "C:\\work\\live")))
+        save_instance_file(MIXED_ID, workspace_of(claude_pane(OTHER, "C:\\work\\live")))
         local existing = busy_pane()
         local gui = new_gui_window()
         instance_manager.show_instance_selector(gui, existing, restore_opts)
-        assert.truthy(gui:choice(MIXED_ID).label:find("cannot tell what is running", 1, true))
+        assert.truthy(gui:choice(MIXED_ID).label:find("may be running under a new id", 1, true))
         instance_manager._test.restore_instances({ MIXED_ID }, gui, existing, restore_opts)
         run_timers()
+        assert.equals(0, spawned_windows)
         assert.equals("", everything_sent())
     end)
 end)
@@ -1312,7 +1313,7 @@ describe("restore guard: an instance id that is not kept", function()
         it("the previous id's copy is refused when all its sessions are running", function()
             save_instance_file(PREVIOUS_ID, workspace_of(claude_pane(LIVE), claude_pane(OTHER)))
             fresh.show_instance_selector(gui, existing, restore_opts)
-            assert.truthy(gui:choice(PREVIOUS_ID).label:find("all 2 sessions already running, cannot restore", 1, true))
+            assert.truthy(gui:choice(PREVIOUS_ID).label:find("all 2 sessions already running - cannot restore", 1, true))
             gui:pick(PREVIOUS_ID, existing)
             assert.is_nil(gui:choice("__RESTORE_SELECTED__"))
 
@@ -1325,7 +1326,7 @@ describe("restore guard: an instance id that is not kept", function()
         it("a partly running copy resumes only the sessions that are not running", function()
             save_instance_file(PREVIOUS_ID, workspace_of(claude_pane(LIVE), claude_pane(DEAD)))
             fresh.show_instance_selector(gui, existing, restore_opts)
-            assert.truthy(gui:choice(PREVIOUS_ID).label:find("1 of 2 sessions already running", 1, true))
+            assert.truthy(gui:choice(PREVIOUS_ID).label:find("resumes 1; 1 already running", 1, true))
             gui:pick(PREVIOUS_ID, existing)
             gui:pick("__RESTORE_SELECTED__", existing)
             run_timers()
@@ -1333,5 +1334,175 @@ describe("restore guard: an instance id that is not kept", function()
             assert.falsy(everything_sent():find(LIVE, 1, true))
             assert.equals("", all_sent(existing))
         end)
+    end)
+end)
+-- ---------------------------------------------------------------------------
+-- The selector says why, in plain words
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: the reason shown for each saved copy", function()
+    local existing, gui
+    local COPY = "1700000006_66666"
+    local A, B, C = "C:\\work\\a", "C:\\work\\b", "C:\\work\\c"
+
+    -- LIVE runs in A. OTHER runs in B but its start time cannot be read.
+    local function world()
+        control_files({
+            { LIVE, 4242, START, true, START, A },
+            { OTHER, 4343, START, true, "?", B },
+        })
+    end
+
+    -- The text in the trailing parentheses of a copy's selector entry.
+    local function reason_for(...)
+        save_instance_file(COPY, workspace_of(...))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(COPY).label
+        return label:match("%((.-)%)$"), label
+    end
+
+    -- What the log says when a person picks the entry anyway.
+    local function log_when_picked()
+        log = {}
+        gui:pick(COPY, existing)
+        return logged("cannot be selected") or ""
+    end
+
+    local ROTATED = "eeeeeeee-5555-4555-8555-555555555555"
+    local ROTATED2 = "ffffffff-6666-4666-8666-666666666666"
+
+    before_each(function()
+        reset()
+        world()
+        instance_manager.instance_id = OWN_ID
+        existing = busy_pane()
+        gui = new_gui_window()
+    end)
+
+    it("this terminal's own live copy", function()
+        save_instance_file(OWN_ID, workspace_of(claude_pane(DEAD, C)))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(OWN_ID).label
+        assert.equals("this terminal's own live copy - cannot restore", label:match("%((.-)%)$"))
+        assert.truthy(label:find("^%[%-%]"))
+        log = {}
+        gui:pick(OWN_ID, existing)
+        assert.truthy(logged("a snapshot of the windows open now"))
+    end)
+
+    it("every session already running", function()
+        local reason, label = reason_for(claude_pane(LIVE, A), claude_pane(LIVE, A))
+        assert.equals("all 2 sessions already running - cannot restore", reason)
+        assert.truthy(label:find("^%[%-%]"))
+        assert.truthy(log_when_picked():find("stale copy of running windows", 1, true))
+    end)
+
+    it("its one session already running", function()
+        assert.equals("its session is already running - cannot restore", reason_for(claude_pane(LIVE, A)))
+    end)
+
+    for _, case in ipairs({
+        { "control folder not found", function() return "ERR\tcontrol directory not found\r\n" end },
+        { "control folder unreadable", function() return "ERR\tAccess to the path is denied.\r\n" end },
+        { "control folder is empty", function() return "END\t0\r\n" end },
+        { "process query failed", function() return nil, "powershell.exe failed: boom" end },
+        { "process query failed", function() return "S\tgarbage\r\n" end },
+        { "process query timed out", function() return "ERR\tthe process query did not finish in 10 seconds\r\n" end },
+        { "not supported on this system", function() return nil, "the running-session check is only implemented on Windows" end },
+        { "a control file is unreadable", function() return "S\t\t77\t\t1\t" .. START .. "\t\r\nEND\t1\r\n" end },
+    }) do
+        it("cannot tell what is running: " .. case[1], function()
+            guard.run_query = case[2]
+            local reason, label = reason_for(claude_pane(DEAD, C))
+            assert.equals("cannot tell what is running: " .. case[1] .. " - cannot restore", reason)
+            assert.truthy(label:find("^%[%-%]"))
+            assert.truthy(log_when_picked():find("nothing carrying a resume line is restored", 1, true))
+        end)
+    end
+
+    it("sessions that may be running under a new id, none resumable", function()
+        local reason, label = reason_for(claude_pane(ROTATED, A), claude_pane(ROTATED2, "c:/work/A/"), claude_pane(LIVE, A))
+        assert.equals(
+            "nothing to resume: 1 already running, 2 may be running under a new id - cannot restore",
+            reason
+        )
+        assert.truthy(label:find("^%[%-%]"))
+        local line = log_when_picked()
+        assert.truthy(line:find("share a working folder with a running session", 1, true), line)
+        assert.truthy(line:find("resume those by hand", 1, true), line)
+    end)
+
+    it("a session whose process could not be checked, none resumable", function()
+        local reason = reason_for(claude_pane(OTHER, B))
+        assert.equals("nothing to resume: 1 could not be checked - cannot restore", reason)
+        assert.truthy(log_when_picked():find("start time could not be confirmed", 1, true))
+    end)
+
+    it("a saved command that is not a plain resume line", function()
+        local odd = claude_pane(DEAD, C)
+        odd.process.argv = { "claude", "--resume", DEAD, "--model", "x" }
+        local reason, label = reason_for(odd, claude_pane(DEAD, C))
+        assert.equals("1 saved command is not a plain resume line - cannot restore", reason)
+        assert.truthy(label:find("^%[%-%]"))
+        assert.truthy(log_when_picked():find("may have been edited", 1, true))
+    end)
+
+    it("a partly restorable copy says what will be resumed, what runs and what is uncertain", function()
+        local reason, label = reason_for(
+            claude_pane(DEAD, C), claude_pane("abababab-7777-4777-8777-777777777777", "C:\\work\\d"),
+            claude_pane(LIVE, A), claude_pane(ROTATED, A), claude_pane(OTHER, B)
+        )
+        assert.equals("resumes 2; 1 already running; 2 uncertain, left alone", reason)
+        assert.truthy(label:find("^%[ %]"), "it can be selected")
+    end)
+
+    it("a partly restorable copy leaves out the counts that are zero", function()
+        assert.equals("resumes 1; 1 already running", reason_for(claude_pane(DEAD, C), claude_pane(LIVE, A)))
+    end)
+
+    it("a copy whose sessions can all be resumed carries no remark", function()
+        local reason, label = reason_for(claude_pane(DEAD, C))
+        assert.is_nil(reason)
+        assert.truthy(label:find("^%[ %]"))
+    end)
+
+    it("restoring a partly restorable copy resumes the certain ones and logs why each other was left", function()
+        reason_for(claude_pane(DEAD, C), claude_pane(LIVE, A), claude_pane(ROTATED, A))
+        gui:pick(COPY, existing)
+        gui:pick("__RESTORE_SELECTED__", existing)
+        run_timers()
+        run_timers()
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+        assert.falsy(everything_sent():find(LIVE, 1, true))
+        assert.falsy(everything_sent():find(ROTATED, 1, true))
+        assert.truthy(logged("not resuming session aaaaaaaa.*already running pid 4242"))
+        assert.truthy(logged("not resuming session eeeeeeee.*same folder as running pid 4242.*resume it by hand"))
+        assert.truthy(logged("1 session resumed, 1 pane left alone because the session is already running, "
+            .. "1 pane left alone as uncertain"))
+    end)
+
+    it("restore_instances gives the same plain reason when asked to restore a refused copy", function()
+        reason_for(claude_pane(ROTATED, A))
+        log = {}
+        instance_manager._test.restore_instances({ COPY }, gui, existing, restore_opts)
+        local line = logged("refusing to restore instance " .. COPY)
+        assert.truthy(line and line:find("share a working folder with a running session", 1, true), line)
+        assert.equals(0, spawned_windows)
+    end)
+
+    it("the startup path that restores without a prompt logs the same plain reason", function()
+        local real_open = io.open
+        rawset(io, "open", function(path, mode)
+            if path == state_manager.save_state_dir .. sep .. "current_state" then
+                local lines = { "default", "workspace" }
+                return { read = function() return table.remove(lines, 1) end, close = function() end }
+            end
+            return real_open(path, mode)
+        end)
+        file_store[state_manager.save_state_dir .. sep .. "workspace" .. sep .. "default.json"] =
+            json.encode(workspace_of(claude_pane(LIVE, A)))
+        instance_manager.auto_restore_on_startup()
+        rawset(io, "open", real_open)
+        assert.truthy(logged("not restoring workspace default at startup: its one session is already running"))
     end)
 end)
