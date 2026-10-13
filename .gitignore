@@ -40,3 +40,6 @@ luac.out
 *.x86_64
 *.hex
 
+
+# Locally installed test tools (busted, luacheck)
+test_debug/tools/

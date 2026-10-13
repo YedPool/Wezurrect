@@ -10,6 +10,7 @@
 local wezterm = require("wezterm") --[[@as Wezterm]]
 local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
+local restore_guard = require("resurrect.restore_guard")
 
 local pub = {}
 
@@ -36,12 +37,73 @@ end
 -- Instance ID
 -- ---------------------------------------------------------------------------
 
---- Generate a unique instance ID: epoch seconds + underscore + 5-digit random.
---- Called once during setup(). Uses os.clock() for sub-second entropy to reduce
---- collision risk when multiple WezTerm processes start in the same second.
+--- Validate that an instance ID matches the expected format.
+--- Rejects anything that could be a path traversal attempt.
+---@param id string
+---@return boolean
+local function is_valid_instance_id(id)
+	return type(id) == "string" and id:match("^%d+_%d+$") ~= nil
+end
+
+-- Keys in wezterm.GLOBAL, the only state that outlives a config reload.
+local GLOBAL_ID_KEY = "resurrect_instance_id"
+local GLOBAL_NAME_KEY = "resurrect_instance_display_name"
+
+-- Read and write wezterm.GLOBAL without ever raising: init_instance_id runs
+-- while WezTerm loads the user's config, and an error there fails the whole
+-- config. If GLOBAL is missing or unusable the id simply is not kept: every
+-- reload then gets a new one (the old behaviour), and the copies that leaves
+-- behind are stopped by restore_guard's running-session rules instead.
+local function global_get(key)
+	local ok, value = pcall(function()
+		return wezterm.GLOBAL[key]
+	end)
+	if ok then
+		return value
+	end
+	return nil
+end
+
+local function global_set(key, value)
+	local ok, err = pcall(function()
+		wezterm.GLOBAL[key] = value
+	end)
+	if not ok then
+		wezterm.log_warn("resurrect: could not keep " .. key .. " in wezterm.GLOBAL ("
+			.. tostring(err) .. "); it will not survive a config reload")
+	end
+end
+
+--- Set this instance's display name, here and for later config reloads.
+---@param name string
+local function set_display_name(name)
+	pub.display_name = name
+	global_set(GLOBAL_NAME_KEY, name)
+end
+
+--- Give this WezTerm process its instance ID: epoch seconds + underscore +
+--- 5-digit random. Uses os.clock() for sub-second entropy to reduce collision
+--- risk when multiple WezTerm processes start in the same second.
+---
+--- setup() calls this on EVERY evaluation of the config, and WezTerm
+--- evaluates the config again on every reload, in a fresh Lua state. A new
+--- id per evaluation left the previous id's saved file behind looking like
+--- the saved instance of another terminal, when it was a copy of the windows
+--- still open. So the id is kept in wezterm.GLOBAL, which survives reloads
+--- within one process, and a new one is made only when there is none.
 function pub.init_instance_id()
+	local known = global_get(GLOBAL_ID_KEY)
+	if is_valid_instance_id(known) then
+		pub.instance_id = known
+		local name = global_get(GLOBAL_NAME_KEY)
+		if type(name) == "string" and name ~= "" then
+			pub.display_name = name
+		end
+		return pub.instance_id
+	end
 	math.randomseed(os.time() * 1000 + math.floor(os.clock() * 1000000))
 	pub.instance_id = tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+	global_set(GLOBAL_ID_KEY, pub.instance_id)
 	return pub.instance_id
 end
 
@@ -53,14 +115,6 @@ end
 ---@return string
 function pub.get_instances_dir()
 	return get_state_manager().save_state_dir .. utils.separator .. "instances"
-end
-
---- Validate that an instance ID matches the expected format.
---- Rejects anything that could be a path traversal attempt.
----@param id string
----@return boolean
-local function is_valid_instance_id(id)
-	return type(id) == "string" and id:match("^%d+_%d+$") ~= nil
 end
 
 -- ---------------------------------------------------------------------------
@@ -638,7 +692,7 @@ function pub.rename_instance(instance_id, new_name)
 
 	-- If this is the current instance, update in memory too
 	if instance_id == pub.instance_id then
-		pub.display_name = new_name
+		set_display_name(new_name)
 	end
 end
 
@@ -649,8 +703,15 @@ end
 --- Create a callback for fuzzy_loader.fuzzy_load that dispatches restore
 --- based on state type (workspace/window/tab). Extracted to avoid duplication
 --- between the "no instances" path and the "[Browse named saves]" action.
+---
+--- Every kind is restored into a window of its own. A window or tab save used
+--- to go into the window the selector was opened from: a tab save split the
+--- pane Alt+R was pressed in and renamed its tab, a window save added tabs to
+--- that window and retitled it. The selector is opened from whatever is in
+--- front, usually a pane that is busy, so nothing of that window is touched.
+--- (Calling restore_window / restore_tab directly still restores in place.)
 ---@param restore_opts table
----@param fallback_pane table Pane to use for window/tab restore
+---@param fallback_pane table Pane the selector was opened from (no longer restored into)
 ---@return fun(id: string, label: string)
 local function make_fuzzy_restore_callback(restore_opts, fallback_pane)
 	return function(id, label)
@@ -665,10 +726,24 @@ local function make_fuzzy_restore_callback(restore_opts, fallback_pane)
 			require("resurrect.workspace_state").restore_workspace(state, restore_opts)
 		elseif state_type == "window" then
 			local state = sm.load_state(name, "window")
-			require("resurrect.window_state").restore_window(fallback_pane:window(), state, restore_opts)
+			if type(state.tabs) ~= "table" or not state.tabs[1] then
+				return
+			end
+			local opts = utils.tbl_deep_extend("force", restore_opts, {})
+			local window
+			opts.tab, opts.pane, window = wezterm.mux.spawn_window({ cwd = state.tabs[1].pane_tree.cwd })
+			opts.pane_is_new = true
+			require("resurrect.window_state").restore_window(window, state, opts)
 		elseif state_type == "tab" then
 			local state = sm.load_state(name, "tab")
-			require("resurrect.tab_state").restore_tab(fallback_pane:tab(), state, restore_opts)
+			if type(state.pane_tree) ~= "table" then
+				return
+			end
+			local opts = utils.tbl_deep_extend("force", restore_opts, {})
+			local tab
+			tab, opts.pane = wezterm.mux.spawn_window({ cwd = state.pane_tree.cwd })
+			opts.pane_is_new = true
+			require("resurrect.tab_state").restore_tab(tab, state, opts)
 		end
 	end
 end
@@ -677,30 +752,119 @@ end
 -- Selector UI
 -- ---------------------------------------------------------------------------
 
---- Restore one or more instances. The first instance reuses the existing
---- window (via restore_opts.window) to avoid spawning an extra blank window.
---- Subsequent instances get their own new windows.
+
+-- Shells an untouched startup pane can be sitting in.
+local BLANK_SHELLS = {
+	pwsh = true, powershell = true, cmd = true,
+	bash = true, zsh = true, fish = true, sh = true, nu = true,
+}
+
+--- True when the pane is the blank window auto_restore_on_startup opened for
+--- its selector -- the only pre-existing pane a restore may reuse -- and it
+--- still shows nothing but its shell.
+---
+--- The pane's id travels in restore_opts.startup_pane_id, which only the
+--- startup selector's own options table carries. It is deliberately not module
+--- state: the Alt+R keybinding has a different options table, so a restore
+--- started from Alt+R can never reuse a pane, whatever runs in it. (A Claude
+--- pane reports its child shell as the foreground process, so the shell check
+--- below cannot tell a busy pane from a blank one on its own.)
+--- If the foreground process cannot be read the answer is false, which only
+--- costs an extra window.
+---@param pane table Pane
+---@param restore_opts table
+---@return boolean
+local function is_blank_startup_pane(pane, restore_opts)
+	local startup_pane_id = restore_opts.startup_pane_id
+	if not startup_pane_id or pane:pane_id() ~= startup_pane_id then
+		return false
+	end
+	local ok, name = pcall(function()
+		return pane:get_foreground_process_name()
+	end)
+	if not ok or type(name) ~= "string" then
+		return false
+	end
+	local base = (name:match("([^/\\]+)$") or name):lower():gsub("%.exe$", "")
+	return BLANK_SHELLS[base] == true
+end
+
+--- True when the id is the running terminal's own instance: its saved file is
+--- a snapshot of the windows that are open right now, not a saved session.
+---@param instance_id string
+---@return boolean
+function pub.is_own_instance(instance_id)
+	return pub.instance_id ~= nil and instance_id == pub.instance_id
+end
+
+-- Builds a pane's restore command without logging; used to look at a saved
+-- instance, not to restore it.
+local function quiet_restore_command(pane_tree)
+	return require("resurrect.tab_state").get_pane_restore_command(pane_tree, true)
+end
+
+--- Why a saved instance must not be restored, or nil when it may be: it is
+--- this terminal's own, or restore_guard.refusal says so (every session in it
+--- is already running, or what is running cannot be established).
+---@param instance_id string
+---@param workspace_state table|nil the instance's loaded state
+---@return string|nil reason a few words for the selector entry
+---@return string|nil note for a restorable instance: what restoring it will and will not resume
+---@return string|nil detail the reason as a full sentence, for the log and the toast
+local function restore_refusal(instance_id, workspace_state)
+	if pub.is_own_instance(instance_id) then
+		return "this terminal's own live copy - cannot restore", nil,
+			"it is this terminal's own live copy (a snapshot of the windows open now), not a saved session"
+	end
+	if not workspace_state then
+		return nil
+	end
+	local summary = restore_guard.summarize(workspace_state, quiet_restore_command)
+	local reason, detail = restore_guard.refusal(summary)
+	return reason, restore_guard.running_note(summary), detail
+end
+
+--- Restore one or more instances. Each gets its own new windows, except that
+--- the first one reuses the selector's blank startup window when there is one
+--- (so no extra blank shell window remains after a startup restore).
 ---@param instance_ids string[] array of instance IDs to restore
----@param window table GuiWindow whose MuxWindow to reuse for the first restore
+---@param window table GuiWindow the selector was shown in
 ---@param pane table Pane in that window
 ---@param restore_opts table options passed to restore_workspace
 local function restore_instances(instance_ids, window, pane, restore_opts)
-	for i, id in ipairs(instance_ids) do
+	local restored = 0
+	-- Decide on what is running now, not on what the selector saw.
+	restore_guard.get_snapshot(true)
+	for _, id in ipairs(instance_ids) do
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
+		local refusal, detail
 		if workspace_state then
-			-- First instance reuses the current window to avoid extra blank shell
+			refusal, _, detail = restore_refusal(id, workspace_state)
+		end
+		if refusal then
+			-- Checked here, not only in the selector: this is the function
+			-- that restores, whoever calls it.
+			restore_guard.notify("refusing to restore instance " .. id .. ": " .. detail)
+		elseif workspace_state then
+			restored = restored + 1
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
-			if i == 1 then
+			-- Read at the top of this function.
+			opts.liveness_read = true
+			if restored == 1 and is_blank_startup_pane(pane, restore_opts) then
 				opts.window = pane:window()
 				opts.pane = pane
+				opts.pane_is_new = true
 			end
+			-- Reusable once at most: after this it holds restored panes.
+			restore_opts.startup_pane_id = nil
+			opts.startup_pane_id = nil
 
 			require("resurrect.workspace_state").restore_workspace(workspace_state, opts)
 
 			-- Carry over display_name from first restored instance
-			if i == 1 and old_meta and old_meta.display_name and old_meta.display_name ~= "" then
-				pub.display_name = old_meta.display_name
+			if restored == 1 and old_meta and old_meta.display_name and old_meta.display_name ~= "" then
+				set_display_name(old_meta.display_name)
 			end
 
 			-- Tombstone the old instance: move to restored/ subdirectory rather
@@ -733,24 +897,45 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 	-- Build choices with selection markers
 	local choices = {}
 
+
+	-- Instance entries with [x] / [ ] markers. An instance that must not be
+	-- restored is listed (so it is clear where it went) but marked [-] with
+	-- the reason in a few plain words, and cannot be selected; picking it
+	-- anyway logs and toasts the reason in full. One that can be restored
+	-- only in part says how many sessions will be resumed, how many are
+	-- already running and how many are left alone as uncertain.
+	local refusals = {}
+	for _, entry in ipairs(instances) do
+		local workspace_state = nil
+		if not pub.is_own_instance(entry.instance_id) then
+			workspace_state = pub.load_instance(entry.instance_id)
+		end
+		local refusal, note, detail = restore_refusal(entry.instance_id, workspace_state)
+		refusals[entry.instance_id] = detail
+		local marker = selected[entry.instance_id] and "[x] " or "[ ] "
+		local label = pub.format_instance_summary(entry.meta)
+		if refusal then
+			selected[entry.instance_id] = nil
+			marker = "[-] "
+			label = label .. "  (" .. refusal .. ")"
+		elseif note then
+			label = label .. "  (" .. note .. ")"
+		end
+		table.insert(choices, {
+			id = entry.instance_id,
+			label = marker .. label,
+		})
+	end
+
 	-- Count selections
 	local sel_count = 0
 	for _ in pairs(selected) do sel_count = sel_count + 1 end
 
 	-- "Restore selected" at the top when there are selections
 	if sel_count > 0 then
-		table.insert(choices, {
+		table.insert(choices, 1, {
 			id = "__RESTORE_SELECTED__",
 			label = ">>> Restore " .. sel_count .. " selected instance" .. (sel_count > 1 and "s" or "") .. " <<<",
-		})
-	end
-
-	-- Instance entries with [x] / [ ] markers
-	for _, entry in ipairs(instances) do
-		local marker = selected[entry.instance_id] and "[x] " or "[ ] "
-		table.insert(choices, {
-			id = entry.instance_id,
-			label = marker .. pub.format_instance_summary(entry.meta),
 		})
 	end
 
@@ -800,7 +985,9 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 				end
 
 				-- Toggle selection on this instance and re-show the selector
-				if selected[id] then
+				if refusals[id] then
+					restore_guard.notify("instance " .. id .. " cannot be selected: " .. refusals[id])
+				elseif selected[id] then
 					selected[id] = nil
 				else
 					selected[id] = true
@@ -934,7 +1121,8 @@ function pub.auto_restore_on_startup()
 	-- Spawn a default window for the selector UI. The first restored instance
 	-- will reuse this window (via restore_opts.window) so no extra blank
 	-- shell window remains.
-	wezterm.mux.spawn_window({})
+	local _, startup_pane = wezterm.mux.spawn_window({})
+	local startup_pane_id = startup_pane and startup_pane:pane_id() or nil
 
 	wezterm.time.call_after(1, function()
 		local gui_windows = wezterm.gui.gui_windows()
@@ -945,6 +1133,8 @@ function pub.auto_restore_on_startup()
 				relative = true,
 				restore_text = true,
 				on_pane_restore = require("resurrect.tab_state").default_on_pane_restore,
+				-- Lets a restore chosen in THIS selector reuse the blank window.
+				startup_pane_id = startup_pane_id,
 			}
 			pub.show_instance_selector(gui_win, active_pane, restore_opts)
 		end

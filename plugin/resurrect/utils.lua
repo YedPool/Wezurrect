@@ -143,7 +143,13 @@ end
 -- Characters that could enable command injection when a CWD is embedded in
 -- a shell command via send_text(). Blocks shell metacharacters plus \r\n
 -- (a newline in a path from a tampered state file could inject commands).
-utils.UNSAFE_CWD_PATTERN = "[;&|`$%(%)%{%}\r\n]"
+-- Quotes and redirections are blocked too: the path is quoted by
+-- wezterm.shell_join_args, which follows POSIX rules, while the shell it is
+-- typed into may be PowerShell or cmd. A path that can close the quote can
+-- add "> file" and truncate it. So is every other control character.
+-- (Windows itself forbids " < > | in paths; a ' is legal but rare, and such
+-- a pane is then left as a plain shell.)
+utils.UNSAFE_CWD_PATTERN = "[;&|`$%(%)%{%}\"'<>%c]"
 
 -- Validate that a CWD path is safe to embed in a shell command.
 ---@param cwd string
@@ -156,6 +162,36 @@ function utils.is_safe_cwd(cwd)
 		return false
 	end
 	return true
+end
+
+-- A copy of a table's top level (nil gives an empty table). The restore
+-- functions take their options through this: they record the window, tab and
+-- pane they are working on in the options, and that must not end up in a
+-- table the caller reuses for its next restore.
+---@param original table|nil
+---@return table copy
+function utils.shallow_copy(original)
+	local copy = {}
+	for k, v in pairs(original or {}) do
+		copy[k] = v
+	end
+	return copy
+end
+
+-- The options a restore function works with: its own copy of the caller's,
+-- marked once a fresh reading of the running sessions has been taken. Every
+-- restore that can lead to typing starts from a reading taken for it, not
+-- from one a selector took up to 10 seconds earlier; the functions it calls
+-- see the mark and do not read again.
+---@param opts table|nil
+---@return table
+function utils.restore_opts_with_fresh_liveness(opts)
+	local copy = utils.shallow_copy(opts)
+	if not copy.liveness_read then
+		require("resurrect.restore_guard").get_snapshot(true)
+		copy.liveness_read = true
+	end
+	return copy
 end
 
 -- deep copy

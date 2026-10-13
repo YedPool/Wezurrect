@@ -1,6 +1,7 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
+local restore_guard = require("resurrect.restore_guard")
 
 local pub = {}
 
@@ -318,6 +319,10 @@ end
 ---@return string|nil
 function pub.resurrect_on_gui_startup()
 	local file_path = pub.save_state_dir .. utils.separator .. "current_state"
+	-- This path restores with no prompt, so nobody sees what is about to be
+	-- resumed. Read what is running before deciding (outside the pcall: the
+	-- read waits on a child process).
+	restore_guard.get_snapshot(true)
 	local suc, err = pcall(function()
 		local file = io.open(file_path, "r")
 		if not file then
@@ -327,11 +332,26 @@ function pub.resurrect_on_gui_startup()
 		local state_type = file:read("*line")
 		file:close()
 		if state_type == "workspace" then
-			require("resurrect.workspace_state").restore_workspace(pub.load_state(name, state_type), {
+			local state = pub.load_state(name, state_type)
+			local tab_state = require("resurrect.tab_state")
+			-- Same rule as the instance selector: a copy of sessions that are
+			-- all running, or whose state cannot be established, is not
+			-- restored. What does get restored still passes the per-pane
+			-- check in default_on_pane_restore.
+			local refusal, detail = restore_guard.refusal(restore_guard.summarize(state, function(pane_tree)
+				return tab_state.get_pane_restore_command(pane_tree, true)
+			end))
+			if refusal then
+				restore_guard.notify("not restoring workspace " .. tostring(name) .. " at startup: " .. detail)
+				return
+			end
+			require("resurrect.workspace_state").restore_workspace(state, {
+				-- Read just above, outside the pcall.
+				liveness_read = true,
 				spawn_in_workspace = true,
 				relative = true,
 				restore_text = true,
-				on_pane_restore = require("resurrect.tab_state").default_on_pane_restore,
+				on_pane_restore = tab_state.default_on_pane_restore,
 			})
 			wezterm.mux.set_active_workspace(name)
 		end

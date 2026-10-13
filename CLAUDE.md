@@ -34,6 +34,18 @@ Fork of MLFlexer/resurrect.wezterm with Windows fixes, security hardening, and C
 - Run `bash test_debug/verify.sh` for luacheck + busted tests
 - Always verify cached plugin matches source repo before testing
 - No Lua runtime installed on system -- tests use bundled tools in `test_debug/tools/`
+- Where `verify.sh`'s tools are missing: `pwsh test_debug/run_tests.ps1` runs busted + luacheck from a luarocks tree in `test_debug/tools/rocks` (setup commands are at the top of the script)
+
+## Restore Guard
+
+- `plugin/resurrect/restore_guard.lua` decides whether a restore command may be typed into a pane. `tab_state.default_on_pane_restore` is the only place a command is sent and it asks the guard first
+- A Claude session is live when a control file `~/.claude/sessions/<pid>.json` names it, that pid is running, and the process start time equals the file's `procStart`. Live or unknown = not resumed (fail closed)
+- Also unknown: an empty control folder; an id with no control file while a running session has the same cwd (ids rotate on compaction); a query that took over 10 seconds
+- A Claude line is typed only when the saved command is exactly `<claude binary> --resume <lower-case UUID> [--dangerously-skip-permissions]`; the typed line is rebuilt from those parts, never copied from the state file. `claude --continue` is never typed
+- `restore_guard.run_query` is the only function that asks the OS (one PowerShell call, Windows only). Tests replace it
+- "Browse named saves" restores every kind of save into a new window; the startup selector's blank window is the only pre-existing pane ever reused, and only via `restore_opts.startup_pane_id`
+- A restore only types into panes it created (`opts.pane_is_new`); never into a pane that already existed
+- The instance ID lives in `wezterm.GLOBAL` so a config reload keeps it. A terminal's own instance, and a saved copy whose sessions are all running, cannot be restored
 
 ## Multi-Instance State Management
 

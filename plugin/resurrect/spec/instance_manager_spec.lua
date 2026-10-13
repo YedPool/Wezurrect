@@ -57,10 +57,12 @@ end
 
 local wezterm_stub = {
     target_triple = is_windows() and "x86_64-pc-windows-msvc" or "x86_64-unknown-linux-gnu",
+    GLOBAL = {},
     emit = function(event, ...)
         table.insert(emitted_events, { event = event, args = { ... } })
     end,
     log_error = function() end,
+    log_warn = function() end,
     log_info = function() end,
     json_encode = json_encode_value,
     json_parse = function(str)
@@ -288,6 +290,7 @@ describe("instance_manager", function()
         removed_files = {}
         moved_files = {}
         file_store = {}
+        wezterm_stub.GLOBAL = {}
         instance_manager.instance_id = nil
         instance_manager.display_name = nil
         instance_manager.retention_days = 7
@@ -682,6 +685,10 @@ describe("instance_manager", function()
             local restored_dir = instance_manager.get_tombstone_dir()
             local src_json = dir .. sep .. id .. ".json"
             local dst_json = restored_dir .. sep .. id .. ".json"
+
+            -- The file now belongs to an earlier terminal, not this one: a
+            -- terminal refuses to restore its own live instance.
+            instance_manager.instance_id = "1700000000_10000"
 
             -- Minimal stubs to drive restore_instances
             local fake_pane = { window = function() return {} end, tab = function() return {} end }

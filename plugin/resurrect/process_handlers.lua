@@ -11,6 +11,7 @@
 local wezterm = require("wezterm") --[[@as Wezterm]]
 local utils = require("resurrect.utils")
 local json_text = require("resurrect.json_text")
+local restore_guard = require("resurrect.restore_guard")
 
 local pub = {}
 
@@ -52,15 +53,17 @@ end
 ---@param process_info table
 ---@param pane_tree table
 ---@return string|nil
+---@return boolean rejected a handler claimed the process but produced no command
 function pub.get_restore_command(process_info, pane_tree)
 	local handler = pub.find_handler(process_info)
 	if handler then
 		local ok, cmd = pcall(handler.get_restore_cmd, process_info, pane_tree)
 		if ok and cmd then
-			return cmd
+			return cmd, false
 		end
+		return nil, true
 	end
-	return nil
+	return nil, false
 end
 
 --- Sanitize process_info at save time if a handler provides a sanitize function.
@@ -121,13 +124,11 @@ local function has_flag(argv, flag)
 	return false
 end
 
--- Validate that a string looks like a UUID/hex-dash identifier.
+-- Validate that a string is a session id: a lower-case UUID, nothing else.
 -- Used to sanitize session IDs before embedding them in shell commands.
 ---@param s string
 ---@return boolean
-local function is_valid_session_id(s)
-	return s and s:match("^[%x%-]+$") ~= nil
-end
+local is_valid_session_id = restore_guard.is_session_id
 
 -- Validate that a binary name is a known Claude Code executable.
 -- Prevents command injection via tampered process_info.name in state files.
@@ -206,41 +207,53 @@ pub.register({
 	end,
 
 	-- Build the restore command from saved process info.
-	-- Prioritizes --resume <session-id> over --continue.
-	-- Preserves --dangerously-skip-permissions if it was present.
-	-- All values from state files are validated before use to prevent
-	-- command injection via tampered JSON (input sanitization).
+	-- The saved argv comes from a state file, which is plain JSON anything
+	-- could have written, so it is not replayed. It must be exactly what
+	-- sanitize() below writes at save time:
+	--   { <claude binary>, "--resume", <session id> [, "--dangerously-skip-permissions"] }
+	-- and the command is rebuilt from those parts. Anything else -- another
+	-- flag, a session id that is not a lower-case UUID, no session id at all
+	-- -- returns nil and the pane is left as a plain shell.
 	get_restore_cmd = function(process_info, pane_tree)
 		local argv = process_info.argv or {}
 		-- Use the saved executable name (e.g., "claude", "claude2") so
 		-- multi-account setups restore with the correct binary.
-		-- Validate the name is actually a claude binary to prevent injection.
-		local bin = process_info.name or process_info.executable or "claude"
-		if not is_valid_claude_binary(bin) then
-			wezterm.log_warn("resurrect: rejected invalid claude binary name: " .. tostring(bin))
-			bin = "claude"
+		local bin = process_info.name
+		if not is_valid_claude_binary(bin) or not is_valid_claude_binary(argv[1]) then
+			wezterm.log_warn("resurrect: rejected saved Claude command: not a claude binary: "
+				.. tostring(bin) .. " / " .. tostring(argv[1]))
+			return nil
 		end
 		local parts = { bin }
 
-		-- Session ID: check --resume, -r, --session-id
-		local session_id = parse_flag_value(argv, "--resume", "-r")
-			or parse_flag_value(argv, "--session-id")
-		-- Validate session ID is a hex/dash string (UUID format)
-		if session_id and not is_valid_session_id(session_id) then
-			wezterm.log_warn("resurrect: rejected invalid session_id: " .. tostring(session_id))
-			session_id = nil
+		local session_id = nil
+		local skip_permissions = false
+		local i = 2
+		while i <= #argv do
+			if argv[i] == "--resume" and not session_id and is_valid_session_id(argv[i + 1]) then
+				session_id = argv[i + 1]
+				i = i + 1
+			elseif argv[i] == "--dangerously-skip-permissions" then
+				skip_permissions = true
+			else
+				wezterm.log_warn("resurrect: rejected saved Claude command: unexpected argument "
+					.. tostring(argv[i]))
+				return nil
+			end
+			i = i + 1
 		end
-		if session_id then
-			table.insert(parts, "--resume")
-			table.insert(parts, session_id)
-		else
-			-- No explicit session ID captured; use --continue to resume
-			-- the most recent session in this CWD
-			table.insert(parts, "--continue")
+		if not session_id then
+			-- "claude --continue" used to be typed here. It resumes whatever
+			-- session is newest in the directory, which cannot be checked
+			-- against the running sessions.
+			wezterm.log_warn("resurrect: rejected saved Claude command: it has no session id")
+			return nil
 		end
+		table.insert(parts, "--resume")
+		table.insert(parts, session_id)
 
 		-- Preserve dangerous permissions flag
-		if has_flag(argv, "--dangerously-skip-permissions") then
+		if skip_permissions then
 			table.insert(parts, "--dangerously-skip-permissions")
 		end
 
@@ -260,7 +273,6 @@ pub.register({
 
 		return cmd
 	end,
-
 	-- At save time, clean up the raw node argv into a portable form.
 	-- The raw argv looks like:
 	--   {"node", "C:/Users/.../cli.js", "--dangerously-skip-permissions", "--resume", "uuid"}

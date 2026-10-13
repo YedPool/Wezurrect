@@ -1,6 +1,7 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local tab_state_mod = require("resurrect.tab_state")
 local state_manager_mod = require("resurrect.state_manager")
+local utils = require("resurrect.utils")
 local pub = {}
 
 
@@ -46,9 +47,7 @@ end
 ---@param opts? restore_opts
 function pub.restore_window(window, window_state, opts)
 	wezterm.emit("resurrect.window_state.restore_window.start")
-	if opts == nil then
-		opts = {}
-	end
+	opts = utils.restore_opts_with_fresh_liveness(opts)
 
 	if window_state.title then
 		window:set_title(window_state.title)
@@ -65,6 +64,8 @@ function pub.restore_window(window, window_state, opts)
 				spawn_tab_args.domain = { DomainName = tab_state.pane_tree.domain }
 			end
 			tab, opts.pane, _ = window:spawn_tab(spawn_tab_args)
+			-- A pane this restore just created: restore_tab may type into it.
+			opts.pane_is_new = true
 		end
 
 		if i == 1 and opts.close_open_tabs then
