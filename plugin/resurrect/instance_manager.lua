@@ -745,14 +745,28 @@ function pub.is_own_instance(instance_id)
 	return pub.instance_id ~= nil and instance_id == pub.instance_id
 end
 
---- Why a saved instance must not be restored, or nil when it may be.
+-- Builds a pane's restore command without logging; used to look at a saved
+-- instance, not to restore it.
+local function quiet_restore_command(pane_tree)
+	return require("resurrect.tab_state").get_pane_restore_command(pane_tree, true)
+end
+
+--- Why a saved instance must not be restored, or nil when it may be: it is
+--- this terminal's own, or restore_guard.refusal says so (every session in it
+--- is already running, or what is running cannot be established).
 ---@param instance_id string
+---@param workspace_state table|nil the instance's loaded state
 ---@return string|nil reason
-local function restore_refusal(instance_id)
+---@return string|nil note for a restorable instance: how many sessions are already running
+local function restore_refusal(instance_id, workspace_state)
 	if pub.is_own_instance(instance_id) then
 		return "live - this terminal, cannot restore"
 	end
-	return nil
+	if not workspace_state then
+		return nil
+	end
+	local summary = restore_guard.summarize(workspace_state, quiet_restore_command)
+	return restore_guard.refusal(summary), restore_guard.running_note(summary)
 end
 
 --- Restore one or more instances. Each gets its own new windows, except that
@@ -764,10 +778,12 @@ end
 ---@param restore_opts table options passed to restore_workspace
 local function restore_instances(instance_ids, window, pane, restore_opts)
 	local restored = 0
+	-- Decide on what is running now, not on what the selector saw.
+	restore_guard.get_snapshot(true)
 	for _, id in ipairs(instance_ids) do
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
-		local refusal = workspace_state and restore_refusal(id)
+		local refusal = workspace_state and restore_refusal(id, workspace_state)
 		if refusal then
 			-- Checked here, not only in the selector: this is the function
 			-- that restores, whoever calls it.
@@ -823,10 +839,15 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 
 	-- Instance entries with [x] / [ ] markers. An instance that must not be
 	-- restored is listed (so it is clear where it went) but marked [-] with
-	-- the reason, and cannot be selected.
+	-- the reason, and cannot be selected. One that can be restored says how
+	-- many of its sessions are already running and will be left alone.
 	local refusals = {}
 	for _, entry in ipairs(instances) do
-		local refusal = restore_refusal(entry.instance_id)
+		local workspace_state = nil
+		if not pub.is_own_instance(entry.instance_id) then
+			workspace_state = pub.load_instance(entry.instance_id)
+		end
+		local refusal, note = restore_refusal(entry.instance_id, workspace_state)
 		refusals[entry.instance_id] = refusal
 		local marker = selected[entry.instance_id] and "[x] " or "[ ] "
 		local label = pub.format_instance_summary(entry.meta)
@@ -834,6 +855,8 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 			selected[entry.instance_id] = nil
 			marker = "[-] "
 			label = label .. "  (" .. refusal .. ")"
+		elseif note then
+			label = label .. "  (" .. note .. ")"
 		end
 		table.insert(choices, {
 			id = entry.instance_id,

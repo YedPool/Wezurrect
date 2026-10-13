@@ -19,6 +19,7 @@ local wezterm_stub = {
   target_triple = is_windows() and "x86_64-pc-windows-msvc" or "x86_64-unknown-linux-gnu",
   emit = function() end,
   log_error = function() end,
+  log_warn = function() end,
   log_info = function() end,
   -- list_dated_backups shells out via this; stubbed empty so it returns no
   -- prior backups (which is what a fresh-test state would actually show).

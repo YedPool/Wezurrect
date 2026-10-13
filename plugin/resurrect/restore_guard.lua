@@ -555,6 +555,40 @@ function pub.summarize(state, get_command)
 	return summary
 end
 
+--- Why a saved state must not be restored at all, or nil when it may be.
+--- A state that would resume nothing is always restorable. Otherwise:
+---   * if what is running cannot be established, it is refused -- unknown is
+---     not permission, and restoring it as bare shells would only retire the
+---     saved copy without bringing anything back;
+---   * if every session in it is running, it is a stale copy of running
+---     windows and there is nothing in it to bring back.
+---@param summary table from summarize
+---@return string|nil reason
+function pub.refusal(summary)
+	if summary.sessions == 0 then
+		return nil
+	end
+	if summary.error or summary.unknown > 0 then
+		return "cannot tell what is running, cannot restore"
+	end
+	if summary.live == summary.sessions then
+		local which = summary.sessions == 1 and "its session is" or ("all " .. summary.sessions .. " sessions")
+		return which .. " already running, cannot restore"
+	end
+	return nil
+end
+
+--- For a restorable state: how many of its sessions are already running (and
+--- so will be left alone), or nil when none are.
+---@param summary table from summarize
+---@return string|nil note
+function pub.running_note(summary)
+	if summary.live > 0 then
+		return summary.live .. " of " .. summary.sessions .. " sessions already running"
+	end
+	return nil
+end
+
 -- Expose internals for unit testing only
 pub._test = {
 	parse_query_output = parse_query_output,

@@ -161,8 +161,10 @@ package.preload["resurrect.file_io"] = function()
         end,
     }
 end
+-- The named-save browser: keep the callback it would run on a choice.
+local fuzzy_callback = nil
 package.preload["resurrect.fuzzy_loader"] = function()
-    return { fuzzy_load = function() end }
+    return { fuzzy_load = function(_, _, callback) fuzzy_callback = callback end }
 end
 
 package.path = table.concat({
@@ -702,5 +704,191 @@ describe("restore guard: instance id across config reloads", function()
         wezterm_stub.GLOBAL.resurrect_instance_id = "..\\..\\evil"
         local fresh = reload_config()
         assert.truthy(fresh.instance_id:match("^%d+_%d+$"))
+    end)
+end)
+-- ---------------------------------------------------------------------------
+-- Saved copies of sessions that are running
+-- ---------------------------------------------------------------------------
+
+local STALE_ID = "1700000002_22222"
+local MIXED_ID = "1700000003_33333"
+local SHELLS_ID = "1700000004_44444"
+
+describe("restore guard: saved copies in the selector", function()
+    local existing, gui
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        -- Every session of STALE is running; MIXED has one running, one not.
+        control_files({
+            { LIVE, 4242, START, true, START, "C:\\work\\a" },
+            { OTHER, 4343, START, true, START, "C:\\work\\b" },
+        })
+        save_instance_file(STALE_ID, workspace_of(claude_pane(LIVE), claude_pane(OTHER)))
+        save_instance_file(MIXED_ID, workspace_of(claude_pane(LIVE), claude_pane(DEAD)))
+        save_instance_file(SHELLS_ID, workspace_of({ cwd = "C:\\work", text = "PS C:\\work>" }))
+        existing = busy_pane()
+        gui = new_gui_window()
+    end)
+
+    it("does not offer a saved instance whose sessions are all running", function()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(STALE_ID).label
+        assert.truthy(label:find("all 2 sessions already running", 1, true), label)
+        assert.truthy(label:find("cannot restore", 1, true), label)
+
+        gui:pick(STALE_ID, existing)
+        assert.is_nil(gui:choice("__RESTORE_SELECTED__"))
+    end)
+
+    it("restore_instances refuses a saved instance whose sessions are all running", function()
+        instance_manager._test.restore_instances({ STALE_ID }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(0, spawned_windows)
+        assert.equals("", everything_sent())
+        assert.is_true(instance_file_exists(STALE_ID))
+        assert.truthy(logged("refusing to restore instance " .. STALE_ID))
+    end)
+
+    it("shows how many sessions of a partly running copy are already running", function()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(MIXED_ID).label
+        assert.truthy(label:find("1 of 2 sessions already running", 1, true), label)
+        assert.truthy(label:find("^%[ %]"), "it stays selectable")
+    end)
+
+    it("restores a partly running copy but resumes only the sessions that are not running", function()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        gui:pick(MIXED_ID, existing)
+        gui:pick("__RESTORE_SELECTED__", existing)
+        run_timers()
+        assert.equals(1, spawned_windows)
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+        assert.falsy(everything_sent():find(LIVE, 1, true))
+        assert.is_false(instance_file_exists(MIXED_ID), "a restored copy is tombstoned as before")
+    end)
+
+    it("says so and restores nothing with a resume line when liveness cannot be read", function()
+        control_dir_unreadable()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(MIXED_ID).label
+        assert.truthy(label:find("cannot tell what is running", 1, true), label)
+        gui:pick(MIXED_ID, existing)
+        assert.is_nil(gui:choice("__RESTORE_SELECTED__"))
+
+        instance_manager._test.restore_instances({ MIXED_ID, STALE_ID }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(0, spawned_windows)
+        assert.equals("", everything_sent())
+        assert.is_true(instance_file_exists(MIXED_ID))
+    end)
+
+    it("still restores a copy that resumes nothing when liveness cannot be read", function()
+        control_dir_unreadable()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        assert.truthy(gui:choice(SHELLS_ID).label:find("^%[ %]"))
+        gui:pick(SHELLS_ID, existing)
+        gui:pick("__RESTORE_SELECTED__", existing)
+        assert.equals(1, spawned_windows)
+    end)
+
+    it("reads the control files afresh when the restore starts", function()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        gui:pick(MIXED_ID, existing)
+        -- DEAD is started somewhere else while the selector is open.
+        control_files({
+            { LIVE, 4242, START, true, START, "C:\\work\\a" },
+            { DEAD, 4444, START, true, START, "C:\\work\\c" },
+        })
+        gui:pick("__RESTORE_SELECTED__", existing)
+        run_timers()
+        assert.equals("", everything_sent())
+        assert.is_true(instance_file_exists(MIXED_ID))
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- Every other way into a restore
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: other entry points", function()
+    local real_open = io.open
+    local workspace_file = state_manager.save_state_dir .. sep .. "workspace" .. sep .. "default.json"
+
+    -- state/current_state is read with io.open; serve it from memory.
+    local function current_state_names_default()
+        rawset(io, "open", function(path, mode)
+            if path == state_manager.save_state_dir .. sep .. "current_state" then
+                local lines = { "default", "workspace" }
+                return {
+                    read = function() return table.remove(lines, 1) end,
+                    close = function() end,
+                }
+            end
+            return real_open(path, mode)
+        end)
+    end
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        current_state_names_default()
+    end)
+    after_each(function()
+        rawset(io, "open", real_open)
+    end)
+
+    it("startup with no saved instances resumes only the sessions that are not running", function()
+        file_store[workspace_file] = json.encode(workspace_of(claude_pane(LIVE), claude_pane(DEAD)))
+        instance_manager.auto_restore_on_startup()
+        run_timers()
+        assert.equals(1, spawned_windows)
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+        assert.falsy(everything_sent():find(LIVE, 1, true))
+    end)
+
+    it("startup with no saved instances restores nothing when every session is running", function()
+        file_store[workspace_file] = json.encode(workspace_of(claude_pane(LIVE)))
+        instance_manager.auto_restore_on_startup()
+        run_timers()
+        assert.equals(0, spawned_windows)
+        assert.equals("", everything_sent())
+        assert.truthy(logged("not restoring workspace default at startup"))
+    end)
+
+    it("startup with no saved instances restores nothing when liveness cannot be read", function()
+        control_dir_unreadable()
+        file_store[workspace_file] = json.encode(workspace_of(claude_pane(DEAD)))
+        instance_manager.auto_restore_on_startup()
+        run_timers()
+        assert.equals(0, spawned_windows)
+        assert.equals("", everything_sent())
+    end)
+
+    it("Browse named saves resumes only the sessions that are not running", function()
+        file_store[workspace_file] = json.encode(workspace_of(claude_pane(LIVE), claude_pane(DEAD)))
+        save_instance_file(SAVED_ID, workspace_of(claude_pane(OTHER)))
+        local existing = busy_pane()
+        local gui = new_gui_window()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        gui:pick("__BROWSE_NAMED__", existing)
+        fuzzy_callback("workspace" .. sep .. "default.json", "default")
+        run_timers()
+        assert.equals("", all_sent(existing))
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+        assert.falsy(everything_sent():find(LIVE, 1, true))
+    end)
+
+    it("a config calling restore_workspace directly resumes only the sessions that are not running", function()
+        -- What WezTerm-Recovery\recovery.lua does on gui-startup.
+        workspace_state_mod.restore_workspace(workspace_of(claude_pane(LIVE), claude_pane(DEAD)), {
+            relative = true,
+            restore_text = true,
+            on_pane_restore = tab_state.default_on_pane_restore,
+        })
+        run_timers()
+        assert.truthy(everything_sent():find(DEAD, 1, true))
+        assert.falsy(everything_sent():find(LIVE, 1, true))
     end)
 end)
