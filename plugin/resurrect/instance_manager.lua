@@ -677,11 +677,42 @@ end
 -- Selector UI
 -- ---------------------------------------------------------------------------
 
---- Restore one or more instances. The first instance reuses the existing
---- window (via restore_opts.window) to avoid spawning an extra blank window.
---- Subsequent instances get their own new windows.
+-- Pane id of the blank window auto_restore_on_startup opened for the selector.
+-- It is the only pre-existing pane a restore is allowed to reuse.
+local startup_pane_id = nil
+
+-- Shells an untouched startup pane can be sitting in.
+local BLANK_SHELLS = {
+	pwsh = true, powershell = true, cmd = true,
+	bash = true, zsh = true, fish = true, sh = true, nu = true,
+}
+
+--- True when the pane is the selector's own startup window and still shows
+--- nothing but its shell. Anything else -- a pane Alt+R was pressed in, or the
+--- startup pane after a program was started in it -- must not be typed into.
+--- If the foreground process cannot be read the answer is false, which only
+--- costs an extra window.
+---@param pane table Pane
+---@return boolean
+local function is_blank_startup_pane(pane)
+	if not startup_pane_id or pane:pane_id() ~= startup_pane_id then
+		return false
+	end
+	local ok, name = pcall(function()
+		return pane:get_foreground_process_name()
+	end)
+	if not ok or type(name) ~= "string" then
+		return false
+	end
+	local base = (name:match("([^/\\]+)$") or name):lower():gsub("%.exe$", "")
+	return BLANK_SHELLS[base] == true
+end
+
+--- Restore one or more instances. Each gets its own new windows, except that
+--- the first one reuses the selector's blank startup window when there is one
+--- (so no extra blank shell window remains after a startup restore).
 ---@param instance_ids string[] array of instance IDs to restore
----@param window table GuiWindow whose MuxWindow to reuse for the first restore
+---@param window table GuiWindow the selector was shown in
 ---@param pane table Pane in that window
 ---@param restore_opts table options passed to restore_workspace
 local function restore_instances(instance_ids, window, pane, restore_opts)
@@ -689,12 +720,14 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
 		if workspace_state then
-			-- First instance reuses the current window to avoid extra blank shell
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
-			if i == 1 then
+			if i == 1 and is_blank_startup_pane(pane) then
 				opts.window = pane:window()
 				opts.pane = pane
+				opts.pane_is_new = true
 			end
+			-- Reusable once at most: after this it holds restored panes.
+			startup_pane_id = nil
 
 			require("resurrect.workspace_state").restore_workspace(workspace_state, opts)
 
@@ -934,7 +967,8 @@ function pub.auto_restore_on_startup()
 	-- Spawn a default window for the selector UI. The first restored instance
 	-- will reuse this window (via restore_opts.window) so no extra blank
 	-- shell window remains.
-	wezterm.mux.spawn_window({})
+	local _, startup_pane = wezterm.mux.spawn_window({})
+	startup_pane_id = startup_pane and startup_pane:pane_id() or nil
 
 	wezterm.time.call_after(1, function()
 		local gui_windows = wezterm.gui.gui_windows()

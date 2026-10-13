@@ -2,6 +2,7 @@ local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes 
 local pane_tree_mod = require("resurrect.pane_tree")
 local state_manager_mod = require("resurrect.state_manager")
 local process_handlers = require("resurrect.process_handlers")
+local restore_guard = require("resurrect.restore_guard")
 local utils = require("resurrect.utils")
 local pub = {}
 
@@ -102,7 +103,12 @@ end
 ---@param opts restore_opts
 function pub.restore_tab(tab, tab_state, opts)
 	wezterm.emit("resurrect.tab_state.restore_tab.start")
-	if opts.pane then
+	-- A restore types into panes (cd, then the program's restore command).
+	-- It may only do that to a pane it created itself, flagged by
+	-- opts.pane_is_new. Any other pane may hold a running program -- typing
+	-- "cd ..." into a live Claude session submits it as a prompt -- so it is
+	-- left alone and the tab's first pane becomes a new split instead.
+	if opts.pane and opts.pane_is_new then
 		tab_state.pane_tree.pane = opts.pane
 		-- Set the CWD of the reused pane to match saved state.
 		-- Validate the CWD contains no shell metacharacters to prevent
@@ -178,6 +184,35 @@ local SAFE_RESTORE_PROCESSES = {
 -- gui-startup get swallowed by the shell's init sequence.
 pub.process_restore_delay_seconds = 3
 
+--- The command a restore would type into a pane to bring its program back,
+--- or nil when the pane has no program to restore.
+---@param pane_tree pane_tree
+---@param quiet boolean? do not log an unrecognized process (used when only looking at a saved state)
+---@return string|nil
+function pub.get_pane_restore_command(pane_tree, quiet)
+	if type(pane_tree.process) ~= "table" or not pane_tree.process.argv then
+		return nil
+	end
+	-- Check registered process handlers first (e.g., Claude Code)
+	local restore_cmd = process_handlers.get_restore_command(pane_tree.process, pane_tree)
+	if not restore_cmd then
+		-- Fall back to allowlist-based argv replay
+		local proc_name = pane_tree.process.name or ""
+		local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
+		base_name = base_name:gsub("%.exe$", ""):lower()
+
+		if SAFE_RESTORE_PROCESSES[base_name] then
+			restore_cmd = wezterm.shell_join_args(pane_tree.process.argv)
+		elseif not quiet then
+			wezterm.log_warn(
+				"resurrect: skipping restore of unrecognized process: " .. base_name
+					.. " (add to SAFE_RESTORE_PROCESSES or register a process_handler)"
+			)
+		end
+	end
+	return restore_cmd
+end
+
 --- Function to restore text or processes when restoring panes
 ---@param pane_tree pane_tree
 function pub.default_on_pane_restore(pane_tree)
@@ -187,35 +222,33 @@ function pub.default_on_pane_restore(pane_tree)
 	-- otherwise restore scrollback text. Some TUI apps (e.g., Claude Code) don't
 	-- use the alt screen buffer but still need process-based restoration.
 	if pane_tree.process and pane_tree.process.argv then
-		-- Check registered process handlers first (e.g., Claude Code)
-		local restore_cmd = process_handlers.get_restore_command(pane_tree.process, pane_tree)
-		if not restore_cmd then
-			-- Fall back to allowlist-based argv replay
-			local proc_name = pane_tree.process.name or ""
-			local base_name = proc_name:match("[/\\]?([^/\\]+)$") or proc_name
-			base_name = base_name:gsub("%.exe$", ""):lower()
-
-			if SAFE_RESTORE_PROCESSES[base_name] then
-				restore_cmd = wezterm.shell_join_args(pane_tree.process.argv)
-			else
-				wezterm.log_warn(
-					"resurrect: skipping restore of unrecognized process: " .. base_name
-						.. " (add to SAFE_RESTORE_PROCESSES or register a process_handler)"
-				)
-			end
-		end
+		local restore_cmd = pub.get_pane_restore_command(pane_tree)
 
 		if restore_cmd then
-			-- Delay sending the command so the shell has time to initialize.
-			-- pane:send_text() during gui-startup fires before the shell is ready,
-			-- causing the command to be lost (especially on Windows with PowerShell).
 			local pane_id = pane:pane_id()
-			wezterm.time.call_after(pub.process_restore_delay_seconds, function()
-				local target_pane = wezterm.mux.get_pane(pane_id)
-				if target_pane then
-					target_pane:send_text(restore_cmd .. "\r\n")
-				end
-			end)
+			-- THE ONLY PLACE A RESTORE COMMAND IS SENT. Ask the guard first: a
+			-- command that would resume a Claude session which is already
+			-- running (or whose state cannot be established) is not sent, and
+			-- the pane stays the plain shell it was created as.
+			local verdict = restore_guard.check_command(restore_cmd, pane_tree.process.cwd or pane_tree.cwd)
+			if not verdict.allow then
+				restore_guard.note_skipped(verdict, pane_id)
+			else
+				-- Delay sending the command so the shell has time to initialize.
+				-- pane:send_text() during gui-startup fires before the shell is ready,
+				-- causing the command to be lost (especially on Windows with PowerShell).
+				wezterm.time.call_after(pub.process_restore_delay_seconds, function()
+					local target_pane = wezterm.mux.get_pane(pane_id)
+					if target_pane then
+						target_pane:send_text(restore_cmd .. "\r\n")
+						if verdict.target then
+							restore_guard.note_resumed()
+						end
+					end
+				end)
+			end
+			-- One summary line after the last pane's command has gone out.
+			restore_guard.schedule_report(pub.process_restore_delay_seconds + 1)
 		end
 	elseif pane_tree.text then
 		pane:inject_output(pane_tree.text:gsub("%s+$", ""))

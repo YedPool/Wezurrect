@@ -23,9 +23,18 @@ function pub.restore_workspace(workspace_state, opts)
 				opts.window:gui_window():set_inner_size(window_state.size.pixel_width, window_state.size.pixel_height)
 			end
 			if not opts.close_open_tabs then
-				opts.tab = opts.window:active_tab()
-				if not opts.close_open_panes then
-					opts.pane = opts.window:active_pane()
+				-- The window's active tab and pane are reused for the first
+				-- restored tab only when the caller vouches that the pane is a
+				-- blank shell of its own (opts.pane_is_new). Otherwise the pane
+				-- may hold a running program, so nothing is typed into it and
+				-- the restored tabs are added to the window as new tabs.
+				local active_pane = opts.window:active_pane()
+				if opts.pane_is_new and opts.pane and opts.pane:pane_id() == active_pane:pane_id() then
+					opts.tab = opts.window:active_tab()
+				else
+					opts.tab = nil
+					opts.pane = nil
+					opts.pane_is_new = nil
 				end
 			end
 		else
@@ -38,6 +47,8 @@ function pub.restore_workspace(workspace_state, opts)
 				spawn_window_args.workspace = workspace_state.workspace
 			end
 			opts.tab, opts.pane, opts.window = wezterm.mux.spawn_window(spawn_window_args)
+			-- A pane this restore just created: restore_tab may type into it.
+			opts.pane_is_new = true
 		end
 
 		window_state_mod.restore_window(opts.window, window_state, opts)

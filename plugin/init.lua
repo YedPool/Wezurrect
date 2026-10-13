@@ -28,6 +28,7 @@ local function init()
 	pub.state_manager = require("resurrect.state_manager")
 	pub.process_handlers = require("resurrect.process_handlers")
 	pub.instance_manager = require("resurrect.instance_manager")
+	pub.restore_guard = require("resurrect.restore_guard")
 end
 
 init()

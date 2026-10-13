@@ -65,6 +65,8 @@ function pub.restore_window(window, window_state, opts)
 				spawn_tab_args.domain = { DomainName = tab_state.pane_tree.domain }
 			end
 			tab, opts.pane, _ = window:spawn_tab(spawn_tab_args)
+			-- A pane this restore just created: restore_tab may type into it.
+			opts.pane_is_new = true
 		end
 
 		if i == 1 and opts.close_open_tabs then
