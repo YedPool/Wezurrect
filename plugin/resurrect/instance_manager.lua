@@ -10,6 +10,7 @@
 local wezterm = require("wezterm") --[[@as Wezterm]]
 local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
+local restore_guard = require("resurrect.restore_guard")
 
 local pub = {}
 
@@ -708,6 +709,24 @@ local function is_blank_startup_pane(pane)
 	return BLANK_SHELLS[base] == true
 end
 
+--- True when the id is the running terminal's own instance: its saved file is
+--- a snapshot of the windows that are open right now, not a saved session.
+---@param instance_id string
+---@return boolean
+function pub.is_own_instance(instance_id)
+	return pub.instance_id ~= nil and instance_id == pub.instance_id
+end
+
+--- Why a saved instance must not be restored, or nil when it may be.
+---@param instance_id string
+---@return string|nil reason
+local function restore_refusal(instance_id)
+	if pub.is_own_instance(instance_id) then
+		return "live - this terminal, cannot restore"
+	end
+	return nil
+end
+
 --- Restore one or more instances. Each gets its own new windows, except that
 --- the first one reuses the selector's blank startup window when there is one
 --- (so no extra blank shell window remains after a startup restore).
@@ -716,12 +735,19 @@ end
 ---@param pane table Pane in that window
 ---@param restore_opts table options passed to restore_workspace
 local function restore_instances(instance_ids, window, pane, restore_opts)
-	for i, id in ipairs(instance_ids) do
+	local restored = 0
+	for _, id in ipairs(instance_ids) do
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
-		if workspace_state then
+		local refusal = workspace_state and restore_refusal(id)
+		if refusal then
+			-- Checked here, not only in the selector: this is the function
+			-- that restores, whoever calls it.
+			restore_guard.notify("refusing to restore instance " .. id .. ": " .. refusal)
+		elseif workspace_state then
+			restored = restored + 1
 			local opts = utils.tbl_deep_extend("force", restore_opts, {})
-			if i == 1 and is_blank_startup_pane(pane) then
+			if restored == 1 and is_blank_startup_pane(pane) then
 				opts.window = pane:window()
 				opts.pane = pane
 				opts.pane_is_new = true
@@ -732,7 +758,7 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 			require("resurrect.workspace_state").restore_workspace(workspace_state, opts)
 
 			-- Carry over display_name from first restored instance
-			if i == 1 and old_meta and old_meta.display_name and old_meta.display_name ~= "" then
+			if restored == 1 and old_meta and old_meta.display_name and old_meta.display_name ~= "" then
 				pub.display_name = old_meta.display_name
 			end
 
@@ -766,24 +792,36 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 	-- Build choices with selection markers
 	local choices = {}
 
+
+	-- Instance entries with [x] / [ ] markers. An instance that must not be
+	-- restored is listed (so it is clear where it went) but marked [-] with
+	-- the reason, and cannot be selected.
+	local refusals = {}
+	for _, entry in ipairs(instances) do
+		local refusal = restore_refusal(entry.instance_id)
+		refusals[entry.instance_id] = refusal
+		local marker = selected[entry.instance_id] and "[x] " or "[ ] "
+		local label = pub.format_instance_summary(entry.meta)
+		if refusal then
+			selected[entry.instance_id] = nil
+			marker = "[-] "
+			label = label .. "  (" .. refusal .. ")"
+		end
+		table.insert(choices, {
+			id = entry.instance_id,
+			label = marker .. label,
+		})
+	end
+
 	-- Count selections
 	local sel_count = 0
 	for _ in pairs(selected) do sel_count = sel_count + 1 end
 
 	-- "Restore selected" at the top when there are selections
 	if sel_count > 0 then
-		table.insert(choices, {
+		table.insert(choices, 1, {
 			id = "__RESTORE_SELECTED__",
 			label = ">>> Restore " .. sel_count .. " selected instance" .. (sel_count > 1 and "s" or "") .. " <<<",
-		})
-	end
-
-	-- Instance entries with [x] / [ ] markers
-	for _, entry in ipairs(instances) do
-		local marker = selected[entry.instance_id] and "[x] " or "[ ] "
-		table.insert(choices, {
-			id = entry.instance_id,
-			label = marker .. pub.format_instance_summary(entry.meta),
 		})
 	end
 
@@ -833,7 +871,9 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 				end
 
 				-- Toggle selection on this instance and re-show the selector
-				if selected[id] then
+				if refusals[id] then
+					restore_guard.notify("instance " .. id .. " cannot be selected: " .. refusals[id])
+				elseif selected[id] then
 					selected[id] = nil
 				else
 					selected[id] = true

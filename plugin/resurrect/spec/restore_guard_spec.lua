@@ -597,3 +597,59 @@ describe("restore guard: panes that already exist", function()
         assert.equals(2, spawned_windows)
     end)
 end)
+
+-- ---------------------------------------------------------------------------
+-- The running terminal's own instance
+-- ---------------------------------------------------------------------------
+
+local OWN_ID = "1700000000_10000"
+local SAVED_ID = "1700000001_11111"
+
+local function instance_file_exists(id)
+    return file_store[instance_manager.get_instances_dir() .. sep .. id .. ".json"] ~= nil
+end
+
+describe("restore guard: this terminal's own instance", function()
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        -- Sessions that are NOT running, so only the instance check can stop it.
+        save_instance_file(OWN_ID, workspace_of(claude_pane(DEAD)))
+        save_instance_file(SAVED_ID, workspace_of(claude_pane(OTHER)))
+    end)
+
+    it("restore_instances refuses its own instance id", function()
+        local existing = busy_pane()
+        instance_manager._test.restore_instances({ OWN_ID }, new_gui_window(), existing, restore_opts)
+        run_timers()
+
+        assert.equals(0, spawned_windows, "no window may be opened for the terminal's own state")
+        assert.equals("", everything_sent())
+        assert.is_true(instance_file_exists(OWN_ID), "the live instance's file must not be tombstoned")
+        assert.truthy(logged("refusing to restore instance " .. OWN_ID))
+    end)
+
+    it("still restores the other instances asked for in the same call", function()
+        local existing = busy_pane()
+        instance_manager._test.restore_instances({ OWN_ID, SAVED_ID }, new_gui_window(), existing, restore_opts)
+        run_timers()
+
+        assert.equals(1, spawned_windows)
+        assert.truthy(everything_sent():find(OTHER, 1, true))
+        assert.falsy(everything_sent():find(DEAD, 1, true))
+    end)
+
+    it("the selector marks its own instance as live and will not select it", function()
+        local existing = busy_pane()
+        local gui = new_gui_window()
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+
+        local own = gui:choice(OWN_ID)
+        assert.truthy(own.label:find("live %- this terminal, cannot restore"), own.label)
+        assert.falsy(own.label:find("^%[ %]"), "must not look selectable")
+
+        gui:pick(OWN_ID, existing)
+        assert.is_nil(gui:choice("__RESTORE_SELECTED__"), "picking it must not select anything")
+        assert.truthy(gui:choice(OWN_ID).label:find("cannot restore"))
+    end)
+end)
