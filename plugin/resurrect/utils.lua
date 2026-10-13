@@ -158,6 +158,20 @@ function utils.is_safe_cwd(cwd)
 	return true
 end
 
+-- A copy of a table's top level (nil gives an empty table). The restore
+-- functions take their options through this: they record the window, tab and
+-- pane they are working on in the options, and that must not end up in a
+-- table the caller reuses for its next restore.
+---@param original table|nil
+---@return table copy
+function utils.shallow_copy(original)
+	local copy = {}
+	for k, v in pairs(original or {}) do
+		copy[k] = v
+	end
+	return copy
+end
+
 -- deep copy
 ---@param original table
 ---@return any copy

@@ -1,5 +1,6 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local window_state_mod = require("resurrect.window_state")
+local utils = require("resurrect.utils")
 
 local pub = {}
 
@@ -12,9 +13,7 @@ function pub.restore_workspace(workspace_state, opts)
 	end
 
 	wezterm.emit("resurrect.workspace_state.restore_workspace.start")
-	if opts == nil then
-		opts = {}
-	end
+	opts = utils.shallow_copy(opts)
 
 	for i, window_state in ipairs(workspace_state.window_states) do
 		if i == 1 and opts.window then

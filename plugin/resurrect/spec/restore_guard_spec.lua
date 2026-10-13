@@ -552,6 +552,28 @@ describe("restore guard: panes that already exist", function()
         assert.truthy(everything_sent():find(DEAD, 1, true))
     end)
 
+    it("a restore leaves nothing behind in the options table it was given", function()
+        -- The keybinding passes the same table to every restore. A pane or
+        -- window left in it would be reused, and typed into, by the next one.
+        local opts = { relative = true, on_pane_restore = tab_state.default_on_pane_restore }
+        workspace_state_mod.restore_workspace(workspace_of(claude_pane(DEAD)), opts)
+        assert.is_nil(opts.window)
+        assert.is_nil(opts.tab)
+        assert.is_nil(opts.pane)
+        assert.is_nil(opts.pane_is_new)
+        run_timers()
+
+        local first_restore_panes = {}
+        for id, pane in pairs(panes) do first_restore_panes[id] = #pane.sent end
+        local existing = busy_pane()
+        tab_state.restore_tab(new_tab(existing), { title = "t", pane_tree = claude_pane(OTHER) }, opts)
+        run_timers()
+        for id, count in pairs(first_restore_panes) do
+            assert.equals(count, #panes[id].sent, "a pane of the earlier restore was typed into")
+        end
+        assert.truthy(everything_sent():find(OTHER, 1, true))
+    end)
+
     it("the startup selector reuses its own blank window", function()
         local gui = new_gui_window()
         save_instance_file("1700000001_11111", workspace_of(claude_pane(DEAD)))
