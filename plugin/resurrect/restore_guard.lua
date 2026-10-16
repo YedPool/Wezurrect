@@ -68,15 +68,17 @@ local QUERY_WORK = table.concat({
 	"if ($p) { try { $st = [string]$p.StartTime.ToFileTimeUtc() } catch { $st = '?' } }",
 	"else { $run = 0 } };",
 	"('S', $sid, $id, $ps, $run, $st, $cwd) -join $t } };",
-	"$m = 0; $md = @MARKERS@;",
-	"if (Test-Path -LiteralPath $md) {",
-	"if (-not (Test-Path -LiteralPath $md -PathType Container)) { throw 'the no-restore marker path is not a folder' };",
-	"foreach ($f in @(Get-ChildItem -LiteralPath $md -Filter '*.json' -Force)) {",
+	"$m = 0; $md = @MARKERS@; $mk = @();",
+	"try { if (Test-Path -LiteralPath $md) {",
+	"if (-not (Test-Path -LiteralPath $md -PathType Container)) { throw 'the path is not a folder' };",
+	"$mk = @(Get-ChildItem -LiteralPath $md -Filter '*.json' -Force) } }",
+	"catch { throw ('no-restore marker folder unreadable: ' + $_.Exception.Message) };",
+	"foreach ($f in $mk) {",
 	"$m++; $r = ''; $by = '';",
 	"try { $j = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json;",
 	"$r = [string]$j.reason; $by = [string]$j.by } catch { };",
 	"$r = $r -replace '[^ -~]', ' '; $by = $by -replace '[^ -~]', ' ';",
-	"('M', $f.BaseName, $r, $by) -join $t } };",
+	"('M', $f.BaseName, $r, $by) -join $t };",
 	"('END', $n, $m) -join $t }",
 	"catch { ('ERR', $_.Exception.Message) -join $t }",
 }, " ")
@@ -303,7 +305,7 @@ local function build_snapshot(records, markers)
 	for _, marker in ipairs(markers or {}) do
 		-- Windows file names ignore case. A name that is not a session id
 		-- cannot match one a restore would resume, so it is ignored.
-		local id = marker.name:lower():gsub("%.json$", "")
+		local id = marker.name:lower():gsub("^%s+", ""):gsub("%s+$", ""):gsub("%.json$", "")
 		if is_session_id(id) then
 			snapshot.parked[id] = { reason = marker_text(marker.reason), by = marker_text(marker.by) }
 		end
@@ -344,6 +346,8 @@ local function error_label(err)
 		return "control folder not found"
 	elseif err:find("no control files", 1, true) then
 		return "control folder is empty"
+	elseif err:find("marker", 1, true) then
+		return "no-restore markers unreadable"
 	elseif err:find("denied", 1, true) then
 		return "control folder unreadable"
 	elseif err:find("did not finish", 1, true) or err:find("the process query took", 1, true) then
@@ -352,8 +356,6 @@ local function error_label(err)
 		return "not supported on this system"
 	elseif err:find("control file of running process", 1, true) then
 		return "a control file is unreadable"
-	elseif err:find("marker", 1, true) then
-		return "no-restore markers unreadable"
 	end
 	return "process query failed"
 end
@@ -494,45 +496,83 @@ function pub.resume_target(cmd)
 	end
 	return { session_id = session_id, line = table.concat(parts, " ") }
 end
--- Sessions this plugin has just scheduled a resume command for. Kept in
--- wezterm.GLOBAL, one flat key per session id holding os.time(), because a
--- config reload starts a new Lua state and every module local is lost with
--- it; GLOBAL lives as long as the WezTerm process and is shared by every
--- restore in it. The module-local copy is used only if GLOBAL cannot be
--- written.
+-- Sessions this plugin has scheduled a resume command for: when, and the
+-- pane the line goes to. A claim holds for claim_ttl_seconds AND for as long
+-- as that pane exists, so a resume that is slow to write its control file
+-- is not started a second time by a later restore. (A pane that still
+-- exists after its Claude has exited keeps the claim: resume that by hand.)
+-- Kept in wezterm.GLOBAL, flat keys per session id, because a config reload
+-- starts a new Lua state and every module local is lost with it; GLOBAL
+-- lives as long as the WezTerm process and is shared by every restore in
+-- it. The module-local copy is used only if GLOBAL cannot be written.
 local CLAIM_KEY_PREFIX = "resurrect_resume_claim_"
+local CLAIM_PANE_PREFIX = "resurrect_resume_claim_pane_"
 local local_claims = {}
 
-local function claim_time(session_id)
+local function global_number(key)
 	local ok, value = pcall(function()
-		return wezterm.GLOBAL[CLAIM_KEY_PREFIX .. session_id]
+		return wezterm.GLOBAL[key]
 	end)
-	local global_time = ok and type(value) == "number" and value or nil
-	local local_time = local_claims[session_id]
-	if global_time and local_time then
-		return math.max(global_time, local_time)
-	end
-	return global_time or local_time
+	return ok and type(value) == "number" and value or nil
+end
+
+local function pane_exists(pane_id)
+	local ok, pane = pcall(function()
+		return wezterm.mux.get_pane(pane_id)
+	end)
+	-- A failed lookup cannot prove the pane is gone.
+	return not ok or pane ~= nil
 end
 
 local function recently_claimed(session_id)
 	if type(session_id) ~= "string" then
 		return false
 	end
-	local claimed_at = claim_time(session_id)
-	return claimed_at ~= nil and os.time() - claimed_at < pub.claim_ttl_seconds
+	local mine = local_claims[session_id] or {}
+	local times = { global_number(CLAIM_KEY_PREFIX .. session_id), mine.at }
+	local claimed_at = nil
+	for _, t in pairs(times) do
+		claimed_at = math.max(claimed_at or t, t)
+	end
+	if claimed_at == nil then
+		return false
+	end
+	if os.time() - claimed_at < pub.claim_ttl_seconds then
+		return true
+	end
+	local pane_id = global_number(CLAIM_PANE_PREFIX .. session_id) or mine.pane
+	return pane_id ~= nil and pane_exists(pane_id)
 end
 
 --- True when this WezTerm process resumed or scheduled the session in the
---- last claim_ttl_seconds.
+--- last claim_ttl_seconds, or the pane it was sent to still exists.
 pub.is_claimed = recently_claimed
 
-local function claim(session_id)
+local function claim(session_id, pane_id)
 	local now = os.time()
-	local_claims[session_id] = now
+	local pane = tonumber(pane_id)
+	local_claims[session_id] = { at = now, pane = pane }
 	pcall(function()
 		wezterm.GLOBAL[CLAIM_KEY_PREFIX .. session_id] = now
+		wezterm.GLOBAL[CLAIM_PANE_PREFIX .. session_id] = pane
 	end)
+end
+
+--- Whether a no-restore marker for the session exists right now, read
+--- directly (no PowerShell). Called just before a resume line is typed, to
+--- close the gap since the restore read the markers. Anything but "no such
+--- file" counts as present: a folder of that name, a file that cannot be
+--- opened.
+---@param session_id string
+---@return boolean
+function pub.marked_now(session_id)
+	local path = pub.marker_dir() .. utils.separator .. session_id .. ".json"
+	local handle, _, code = io.open(path, "rb")
+	if handle then
+		handle:close()
+		return true
+	end
+	return code ~= 2 -- ENOENT
 end
 
 -- Compare working directories the way Windows does: slash direction, case and
@@ -618,8 +658,9 @@ end
 --- that a second pane asking for the same one is refused.
 ---@param cmd string the restore command built for a pane
 ---@param cwd string|nil the pane's working directory
+---@param pane_id number|nil the pane the line will be typed into
 ---@return table verdict { allow, target?, state?, reason?, pid? }
-function pub.check_command(cmd, cwd)
+function pub.check_command(cmd, cwd, pane_id)
 	local target = pub.resume_target(cmd)
 	if not target then
 		return { allow = true }
@@ -636,7 +677,7 @@ function pub.check_command(cmd, cwd)
 			reason = "already resumed in another pane by this restore",
 		}
 	end
-	claim(target.session_id)
+	claim(target.session_id, pane_id)
 	return { allow = true, target = target, state = "dead" }
 end
 -- ---------------------------------------------------------------------------

@@ -249,7 +249,7 @@ function pub.default_on_pane_restore(pane_tree)
 			if cwd == nil or cwd == "" then
 				cwd = pane_tree.cwd
 			end
-			local verdict = restore_guard.check_command(restore_cmd, cwd)
+			local verdict = restore_guard.check_command(restore_cmd, cwd, pane_id)
 			if verdict.allow and verdict.target then
 				-- A Claude resume line is never typed as the state file gave
 				-- it. The guard has checked its shape and rebuilt it from
@@ -267,7 +267,14 @@ function pub.default_on_pane_restore(pane_tree)
 				-- causing the command to be lost (especially on Windows with PowerShell).
 				wezterm.time.call_after(pub.process_restore_delay_seconds, function()
 					local target_pane = wezterm.mux.get_pane(pane_id)
-					if target_pane then
+					if target_pane and verdict.target and restore_guard.marked_now(verdict.target.session_id) then
+						-- Parked or hibernated while the line was waiting.
+						restore_guard.note_skipped({
+							state = "parked",
+							target = verdict.target,
+							reason = "a no-restore marker appeared before the line was typed",
+						}, pane_id)
+					elseif target_pane then
 						target_pane:send_text(restore_cmd .. ENTER)
 						if verdict.target then
 							restore_guard.note_resumed()

@@ -8,6 +8,14 @@
 
 local sep = "\\"
 
+-- A real, empty folder for the no-restore markers the guard checks with
+-- io.open just before it types (tests write marker files into it).
+local real_sep = package.config:sub(1, 1)
+local SPEC_MARKERS = (os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp") .. real_sep
+    .. "wezurrect-spec-markers-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000))
+os.execute((real_sep == "\\" and 'mkdir "' or 'mkdir -p "') .. SPEC_MARKERS .. '"')
+
+
 -- busted shares one Lua process: drop every module and preload stub an
 -- earlier spec file left behind.
 for _, name in ipairs({
@@ -287,7 +295,10 @@ local function reset()
     spawned_windows = 0
     query_calls = 0
     wezterm_stub.GLOBAL = {}
-    if guard_loaded then guard._test.reset() end
+    if guard_loaded then
+        guard._test.reset()
+        guard.marker_dir = function() return SPEC_MARKERS end
+    end
     usual_world()
 end
 
@@ -1833,5 +1844,133 @@ describe("guard probe", function()
         local report = probe()
         assert.truthy(report:find("liveness: UNREADABLE", 1, true), report)
         assert.falsy(report:find("RESUME", 1, true), report)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- PR 26 review: a claim holds while its pane lives; a marker written while
+-- the resume line waits to be typed still stops it.
+-- ---------------------------------------------------------------------------
+
+local function write_marker(session_id, text)
+    local f = assert(io.open(SPEC_MARKERS .. real_sep .. session_id .. ".json", "w"))
+    f:write(text or '{"v":1}')
+    f:close()
+end
+
+-- os.remove is replaced (and not put back) by instance_manager_spec, which
+-- busted may have run first in this process; delete through the shell.
+local function remove_marker(session_id)
+    local path = SPEC_MARKERS .. real_sep .. session_id .. ".json"
+    if real_sep == "\\" then
+        os.execute('if exist "' .. path .. '" del /q "' .. path .. '"')
+    else
+        os.execute('rm -f "' .. path .. '"')
+    end
+end
+
+-- The pane a session's resume line was typed into.
+local function pane_resuming(session_id)
+    for _, pane in pairs(panes) do
+        if all_sent(pane):find("--resume " .. session_id, 1, true) then return pane end
+    end
+    return nil
+end
+
+describe("PR 26 review: a claim holds while its pane lives", function()
+    local real_time = os.time
+    local now
+    local existing, gui
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+    end)
+    after_each(function() rawset(os, "time", real_time) end)
+
+    it("a slow resume that has not written its control file after the TTL is not resumed again", function()
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        now = now + guard.claim_ttl_seconds + 60 -- still no control file for DEAD
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("the pane rule holds across a config reload", function()
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        now = now + guard.claim_ttl_seconds + 60
+        guard._test.new_lua_state()
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("once that pane is closed and the TTL is over, the session can be resumed again", function()
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        local first = pane_resuming(DEAD)
+        assert.truthy(first)
+        panes[first.id] = nil -- the pane was closed
+        now = now + guard.claim_ttl_seconds + 60
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        -- The closed pane is gone from the mux, so only the new one counts.
+        assert.equals(1, resumes_of(DEAD))
+        assert.are_not.equal(first, pane_resuming(DEAD))
+    end)
+end)
+
+describe("PR 26 review: the marker is checked again just before typing", function()
+    before_each(function()
+        reset()
+        remove_marker(DEAD)
+    end)
+    after_each(function() remove_marker(DEAD) end)
+
+    it("a marker written while the resume line waits stops it", function()
+        local tree = claude_pane(DEAD)
+        tree.pane = new_pane()
+        tab_state.default_on_pane_restore(tree)
+        write_marker(DEAD)
+        run_timers()
+        assert.equals("", all_sent(tree.pane))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("no-restore marker", 1, true), line)
+    end)
+
+    it("an unreadable marker written meanwhile stops it too", function()
+        local tree = claude_pane(DEAD)
+        tree.pane = new_pane()
+        tab_state.default_on_pane_restore(tree)
+        write_marker(DEAD, "not json {")
+        run_timers()
+        assert.equals("", all_sent(tree.pane))
+    end)
+
+    it("without a marker the line is typed", function()
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.truthy(all_sent(pane):find(DEAD, 1, true))
+    end)
+end)
+
+describe("PR 26 review: error labels", function()
+    before_each(reset)
+
+    it("an unreadable marker folder is labelled as such", function()
+        guard.run_query = function()
+            return "ERR\tno-restore marker folder unreadable: Access to the path 'X' is denied.\r\n"
+        end
+        local summary = guard.summarize(workspace_of(claude_pane(DEAD)), function(tree)
+            return tab_state.get_pane_restore_command(tree, true)
+        end)
+        assert.equals("no-restore markers unreadable", summary.error_label)
     end)
 end)
