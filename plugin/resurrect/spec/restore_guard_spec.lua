@@ -8,16 +8,23 @@
 
 local sep = "\\"
 
--- A real, empty folder for the no-restore markers the guard checks with
--- io.open just before it types (tests write marker files into it).
+-- A temporary home folder for everything the guard reads or writes on disk
+-- (no-restore markers, resume claim files, the probe report): os.getenv
+-- answers USERPROFILE and HOME with it, so no spec touches the real
+-- ~/.wezurrect. Tests that replace os.getenv themselves wrap this one.
 local real_sep = package.config:sub(1, 1)
-local SPEC_MARKERS = (os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp") .. real_sep
-    .. "wezurrect-spec-markers-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000))
-os.execute((real_sep == "\\" and 'mkdir "' or 'mkdir -p "') .. SPEC_MARKERS .. '"')
--- A real folder for the cross-process resume claim files, emptied of every
--- fixture session's claim before each test.
-local SPEC_CLAIMS = SPEC_MARKERS .. "-claims"
-os.execute((real_sep == "\\" and 'mkdir "' or 'mkdir -p "') .. SPEC_CLAIMS .. '"')
+local SPEC_HOME = (os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp") .. real_sep
+    .. "wezurrect-spec-home-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000))
+local SPEC_MARKERS = SPEC_HOME .. real_sep .. ".wezurrect" .. real_sep .. "no-restore"
+local SPEC_CLAIMS = SPEC_HOME .. real_sep .. ".wezurrect" .. real_sep .. "resuming"
+for _, dir in ipairs({ SPEC_MARKERS, SPEC_CLAIMS }) do
+    os.execute((real_sep == "\\" and 'mkdir "' or 'mkdir -p "') .. dir .. '"')
+end
+local process_getenv = os.getenv
+rawset(os, "getenv", function(name)
+    if name == "USERPROFILE" or name == "HOME" then return SPEC_HOME end
+    return process_getenv(name)
+end)
 local FIXTURE_IDS = {
     "aaaaaaaa-1111-4111-8111-111111111111", "abababab-7777-4777-8777-777777777777",
     "bbbbbbbb-2222-4222-8222-222222222222", "cccccccc-3333-4333-8333-333333333333",
@@ -2093,5 +2100,102 @@ describe("two WezTerm processes sharing the claim folder", function()
         end, guard.get_snapshot(true))
         assert.is_nil(entries[1].resume)
         assert.truthy(entries[1].detail:find("another WezTerm process", 1, true), entries[1].detail)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- PR 26 re-review: the heartbeat survives a config reload; an empty claim
+-- file does not block a session forever.
+-- ---------------------------------------------------------------------------
+
+local COPY_C = "1700000007_77777"
+
+local function claim_file_json(session_id)
+    local text = claim_file_text(session_id)
+    return text and json.decode(text) or nil
+end
+
+describe("claim files across a config reload and a crash", function()
+    local real_time = os.time
+    local now
+    local global_a, global_b
+    local gui, existing
+
+    local function as_process(global)
+        wezterm_stub.GLOBAL = global
+        guard._test.new_lua_state()
+    end
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        global_a, global_b = {}, {}
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_C, workspace_of(claude_pane(DEAD)))
+        as_process(global_a)
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+    end)
+    after_each(function()
+        rawset(os, "time", real_time)
+        package.loaded["resurrect.restore_guard"] = guard
+    end)
+
+    it("a config reload with held claims keeps the heartbeat running and the files fresh", function()
+        -- The reload: WezTerm drops every call_after scheduled before it and
+        -- evaluates the config, so the module loads again in a new Lua state.
+        timers = {}
+        package.loaded["resurrect.restore_guard"] = nil
+        local reloaded = require("resurrect.restore_guard")
+        reloaded.claim_dir = function() return SPEC_CLAIMS end
+        assert.is_true(#timers > 0, "loading the module with held claims must schedule the heartbeat")
+
+        now = now + guard.claim_ttl_seconds + 10 -- past the TTL; the pane is still open
+        run_timers()
+        assert.equals(now, claim_file_json(DEAD).at, "the heartbeat refreshed the claim file")
+
+        now = now + 100 -- the refresh is 100 s old: still held
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a module load with no held claims schedules nothing", function()
+        wezterm_stub.GLOBAL = {}
+        timers = {}
+        package.loaded["resurrect.restore_guard"] = nil
+        require("resurrect.restore_guard")
+        assert.equals(0, #timers)
+    end)
+
+    it("an empty claim file (a crash mid-write) is refused, then taken over once the TTL has passed", function()
+        local f = assert(io.open(SPEC_CLAIMS .. real_sep .. DEAD, "wb"))
+        f:close()
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("empty", 1, true), line)
+
+        now = now + guard.claim_ttl_seconds + 1
+        instance_manager._test.restore_instances({ COPY_C }, gui, existing, restore_opts)
+        assert.truthy(logged("taking over the empty resume claim on session bbbbbbbb"))
+        run_timers()
+        assert.equals(2, resumes_of(DEAD))
+    end)
+end)
+
+-- busted runs every spec file in one process: put the environment back.
+describe("restore guard spec cleanup", function()
+    it("puts os.getenv back", function()
+        rawset(os, "getenv", process_getenv)
+        assert.equals(process_getenv, os.getenv)
     end)
 end)

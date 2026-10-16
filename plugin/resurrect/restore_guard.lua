@@ -596,6 +596,7 @@ pub.claim_heartbeat_seconds = 30
 
 local CLAIM_OWNER_KEY = "resurrect_claim_owner"
 local CLAIM_LIST_KEY = "resurrect_claim_files"
+local EMPTY_SEEN_PREFIX = "resurrect_empty_claim_seen_"
 local heartbeat_running = false
 
 --- The folder of cross-process claim files.
@@ -635,6 +636,11 @@ local function read_claim_file(path)
 	end
 	local text = handle:read("a")
 	handle:close()
+	if text == nil or text == "" then
+		-- The heartbeat rewrites in place; a crash between the truncate and
+		-- the write leaves an empty file.
+		return "empty"
+	end
 	local ok, value = pcall(wezterm.json_parse, text)
 	if ok and type(value) == "table" and tonumber(value.at) and type(value.owner) == "string" then
 		return value
@@ -693,6 +699,10 @@ local function heartbeat()
 	for id in pairs(ids) do
 		local path = claim_path(id)
 		local current = read_claim_file(path)
+		if current == "empty" and recently_claimed(id) then
+			-- Our own rewrite was cut short: write it again.
+			current = { owner = owner, pane = (local_claims[id] or {}).pane }
+		end
 		if type(current) ~= "table" or current.owner ~= owner then
 			ids[id] = nil -- taken over, removed by hand, or unreadable: not ours to touch
 		elseif recently_claimed(id) then
@@ -722,6 +732,15 @@ local function start_heartbeat()
 	wezterm.time.call_after(pub.claim_heartbeat_seconds, heartbeat)
 end
 
+-- A config reload drops every call_after scheduled before it, the heartbeat
+-- included, while the claims in wezterm.GLOBAL live on. So when this module
+-- loads (every config evaluation) and claims are held, start it again.
+pcall(function()
+	if next(claim_list()) then
+		start_heartbeat()
+	end
+end)
+
 --- Who else holds a claim on the session, read-only: a reason, or nil when
 --- this process could take it (no file, its own file, or a stale one).
 ---@param session_id string
@@ -734,6 +753,24 @@ function pub.foreign_claim(session_id)
 	if current == "unreadable" then
 		return "its resume claim file " .. claim_path(session_id) .. " cannot be read"
 			.. " - delete it if no WezTerm is resuming this session"
+	end
+	if current == "empty" then
+		-- No time in it and no file times in Lua: count from when this
+		-- process first saw it empty (kept in wezterm.GLOBAL).
+		local key = EMPTY_SEEN_PREFIX .. session_id
+		local seen = global_number(key)
+		if not seen then
+			seen = os.time()
+			pcall(function()
+				wezterm.GLOBAL[key] = seen
+			end)
+		end
+		local waited = os.time() - seen
+		if waited < pub.claim_ttl_seconds then
+			return "its resume claim file is empty (a write was cut short); it counts as stale after "
+				.. (pub.claim_ttl_seconds - waited) .. " more seconds"
+		end
+		return nil
 	end
 	if current.owner == claim_owner() then
 		return nil
@@ -788,7 +825,13 @@ local function claim_file(session_id, pane_id)
 		return false, "another WezTerm process is taking over its stale claim"
 	end
 	os.remove(aside)
-	if current.owner ~= claim_owner() then
+	if current == "empty" then
+		pcall(function()
+			wezterm.GLOBAL[EMPTY_SEEN_PREFIX .. session_id] = nil
+		end)
+		wezterm.log_warn("resurrect: taking over the empty resume claim on session " .. session_id
+			.. " (empty for at least " .. pub.claim_ttl_seconds .. " s)")
+	elseif current.owner ~= claim_owner() then
 		wezterm.log_warn("resurrect: taking over the stale resume claim on session " .. session_id
 			.. " (owner " .. tostring(current.owner) .. ", " .. (os.time() - tonumber(current.at)) .. " s old)")
 	end
