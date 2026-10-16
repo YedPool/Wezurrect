@@ -184,6 +184,11 @@ local SAFE_RESTORE_PROCESSES = {
 -- gui-startup get swallowed by the shell's init sequence.
 pub.process_restore_delay_seconds = 3
 
+-- The Enter key ending each line a restore types. A terminal Enter is a bare
+-- CR on Windows: PSReadLine reads CRLF as Enter followed by a second key, and
+-- that stray LF lands in the next prompt -- here, in front of the resume line.
+local ENTER = utils.is_windows and "\r" or "\r\n"
+
 --- The command a restore would type into a pane to bring its program back,
 --- or nil when the pane has no program to restore.
 ---@param pane_tree pane_tree
@@ -253,7 +258,7 @@ function pub.default_on_pane_restore(pane_tree)
 				-- fixed parts; the directory has passed is_safe_cwd.
 				restore_cmd = verdict.target.line
 				if cwd ~= nil and cwd ~= "" then
-					restore_cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n" .. restore_cmd
+					restore_cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. ENTER .. restore_cmd
 				end
 			end
 			if not verdict.allow then
@@ -265,7 +270,7 @@ function pub.default_on_pane_restore(pane_tree)
 				wezterm.time.call_after(pub.process_restore_delay_seconds, function()
 					local target_pane = wezterm.mux.get_pane(pane_id)
 					if target_pane then
-						target_pane:send_text(restore_cmd .. "\r\n")
+						target_pane:send_text(restore_cmd .. ENTER)
 						if verdict.target then
 							restore_guard.note_resumed()
 						end

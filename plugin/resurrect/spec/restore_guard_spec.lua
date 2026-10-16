@@ -940,7 +940,14 @@ describe("restore guard: the line that is typed", function()
 
     it("is exactly cd <dir> and claude --resume <id>", function()
         local pane = restore_pane(claude_pane(DEAD))
-        assert.equals("cd C:\\work\r\nclaude --resume " .. DEAD .. "\r\n", all_sent(pane))
+        assert.equals("cd C:\\work\rclaude --resume " .. DEAD .. "\r", all_sent(pane))
+    end)
+
+    it("ends each line with a bare CR on Windows, never an LF", function()
+        -- PSReadLine reads CRLF as Enter plus a second key; the stray LF
+        -- lands in the next prompt, in front of the resume line.
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.falsy(all_sent(pane):find("\n", 1, true), "no LF may be typed on Windows")
     end)
 
     it("keeps the one allowed flag", function()
@@ -948,7 +955,7 @@ describe("restore guard: the line that is typed", function()
         tree.process.argv = { "claude", "--resume", DEAD, "--dangerously-skip-permissions" }
         local pane = restore_pane(tree)
         assert.equals(
-            "cd C:\\work\r\nclaude --resume " .. DEAD .. " --dangerously-skip-permissions\r\n",
+            "cd C:\\work\rclaude --resume " .. DEAD .. " --dangerously-skip-permissions\r",
             all_sent(pane)
         )
     end)
@@ -958,7 +965,7 @@ describe("restore guard: the line that is typed", function()
         tree.process.name = "claude2"
         tree.process.argv = { "claude2", "--resume", DEAD }
         local pane = restore_pane(tree)
-        assert.equals("cd C:\\work\r\nclaude2 --resume " .. DEAD .. "\r\n", all_sent(pane))
+        assert.equals("cd C:\\work\rclaude2 --resume " .. DEAD .. "\r", all_sent(pane))
     end)
 
     for _, bad_id in ipairs({
