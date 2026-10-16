@@ -24,7 +24,7 @@ local restore_guard = require("resurrect.restore_guard")
 local pub = {}
 
 -- Bump with every change to what a restore refuses.
-pub.GUARD_VERSION = "2026-10-16.2 (claims in wezterm.GLOBAL, no-restore markers)"
+pub.GUARD_VERSION = "2026-10-16.3 (claims per pane + cross-process claim files, no-restore markers)"
 
 pub.USER_VAR = "resurrect_guard_probe"
 
