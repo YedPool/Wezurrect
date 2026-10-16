@@ -556,6 +556,54 @@ for _, event in ipairs(resurrect_event_listeners) do
 end
 ```
 
+## Claude sessions a restore will not resume
+
+A restore types `claude --resume <session id>` only after
+`restore_guard.lua` has cleared it. It is never typed when:
+
+- the session is already running (a control file in `~/.claude/sessions`
+  names it, its pid runs, and the process start time matches), or whether it
+  runs cannot be established;
+- this WezTerm process already resumed or scheduled the same session in the
+  last two minutes, in this restore or in another one. The record lives in
+  `wezterm.GLOBAL`, so a config reload does not forget it. Two saved copies,
+  or two windows of one copy, holding the same session resume it once;
+- the session has a "do not restore" marker (below).
+
+Every refusal is logged (`resurrect: not resuming session ...`) with the
+reason, and the restore ends with a summary toast.
+
+### The "do not restore" marker contract
+
+A session that was put away on purpose (parked, hibernated) must not come
+back when a saved copy that still holds it is restored. Any tool that puts a
+session away writes a marker; any tool that brings it back removes it first.
+
+- Folder: `%USERPROFILE%\.wezurrect\no-restore\` (`$HOME/.wezurrect/no-restore/`
+  elsewhere). Create it if it does not exist.
+- File: `<session-uuid>.json`, the session id in lower case.
+- Contents (JSON, ASCII):
+
+  ```json
+  {"v": 1, "sessionId": "<session-uuid>", "by": "<tool>", "reason": "parked", "at": "2026-10-16T12:00:00Z"}
+  ```
+
+  `reason` is `"parked"` or `"hibernated"`. `by` names the tool that wrote
+  it (for example `fleet park`, `horde hibernate`). `at` is an ISO 8601 UTC
+  time.
+- Rule: a restore refuses every session whose marker file EXISTS. The
+  contents are only used for the log line. A marker that cannot be read or
+  parsed, a file name in upper case, or a folder named `<session-uuid>.json`
+  all still count as present. If the marker folder itself exists but cannot
+  be listed, the restore resumes no Claude session at all.
+- Writers (park, hibernate): write the marker BEFORE the session's process
+  is stopped, so no restore can slip in between. Write it whole (write to a
+  temporary name in the same folder, then rename).
+- Wake: delete the marker, THEN resume the session. A wake that fails after
+  deleting it should write it back.
+- Markers are read afresh at the start of every restore, by the same single
+  PowerShell query that reads the control files; there is no cache to clear.
+
 ## State files
 
 State files are json files, which will be decoded into lua tables.

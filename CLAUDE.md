@@ -45,6 +45,8 @@ Fork of MLFlexer/resurrect.wezterm with Windows fixes, security hardening, and C
 - `restore_guard.run_query` is the only function that asks the OS (one PowerShell call, Windows only). Tests replace it
 - "Browse named saves" restores every kind of save into a new window; the startup selector's blank window is the only pre-existing pane ever reused, and only via `restore_opts.startup_pane_id`
 - A restore only types into panes it created (`opts.pane_is_new`); never into a pane that already existed
+- A session resumed or scheduled by this WezTerm process in the last `claim_ttl_seconds` is never resumed again; the claims live in `wezterm.GLOBAL` (flat keys `resurrect_resume_claim_<id>`) so a config reload keeps them
+- A session with a no-restore marker `~/.wezurrect/no-restore/<id>.json` (parked/hibernated) is never resumed; the marker exists = refused, contents only for the log. The marker folder is listed by the same `run_query` call (`M` lines). Contract in README
 - The instance ID lives in `wezterm.GLOBAL` so a config reload keeps it. A terminal's own instance, and a saved copy whose sessions are all running, cannot be restored
 
 ## Multi-Instance State Management
