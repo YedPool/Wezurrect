@@ -177,10 +177,10 @@ if (-not $AllowRunning) {
         Say "would keep the hand edit as $backupDir\hand-edit.patch, then discard it from $handEditFile"
     } else {
         $patch = Join-Path $backupDir "hand-edit.patch"
-        (Invoke-Git diff '--' $handEditFile) -join "`n" | Set-Content -LiteralPath $patch -Encoding ascii
+        Invoke-Git diff --binary "--output=$patch" '--' $handEditFile | Out-Null  # bytes as git sees them; the backup copy of the file is authoritative
         if (-not (Test-Path -LiteralPath $patch) -or (Get-Item -LiteralPath $patch).Length -eq 0) { Fail "could not write $patch" }
         Invoke-Git checkout '--' $handEditFile | Out-Null
-        Say "kept hand edit as $patch (the backup copy has the file too)"
+        Say "kept hand edit as $patch; the backup copy of $handEditFile is authoritative"
     }
 
     if ($DryRun -or $NoFetch) { Say "not fetching (dry run or -NoFetch); using the refs already fetched" }
@@ -304,8 +304,8 @@ if ($plan.Count -eq 0 -and $drop.Count -eq 0 -and $head -eq $sha) {
 # 5. Keep the hand edit as a patch next to the backup (no git stash).
 if ($handEdited) {
     $patch = Join-Path $backupDir "hand-edit.patch"
-    (Invoke-Git diff '--' $handEditFile) -join "`n" | Set-Content -LiteralPath $patch -Encoding ascii
-    Say "kept hand edit as $patch (the backup copy has the file too)"
+    Invoke-Git diff --binary "--output=$patch" '--' $handEditFile | Out-Null  # bytes as git sees them; the backup copy of the file is authoritative
+    Say "kept hand edit as $patch; the backup copy of $handEditFile is authoritative"
 }
 
 # 6. The swap. One rename per file; roll everything back on any error.

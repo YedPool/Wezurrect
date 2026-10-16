@@ -2192,10 +2192,98 @@ describe("claim files across a config reload and a crash", function()
     end)
 end)
 
+-- ---------------------------------------------------------------------------
+-- PR 26 focused check: an empty-file stamp never outlives a non-empty read,
+-- and the heartbeat never leaves a claim file empty or short.
+-- ---------------------------------------------------------------------------
+
+describe("claim files: no takeover of a live claim through an empty read", function()
+    local real_time = os.time
+    local real_open = io.open
+    local now
+    local global_a, global_b
+    local gui, existing
+
+    local function as_process(global)
+        wezterm_stub.GLOBAL = global
+        guard._test.new_lua_state()
+    end
+
+    local function write_claim_raw(text)
+        local f = assert(real_open(SPEC_CLAIMS .. real_sep .. DEAD, "wb"))
+        f:write(text)
+        f:close()
+    end
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        global_a, global_b = {}, {}
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_C, workspace_of(claude_pane(DEAD)))
+        as_process(global_a)
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+    end)
+    after_each(function()
+        rawset(os, "time", real_time)
+        rawset(io, "open", real_open)
+    end)
+
+    it("an empty read, a non-empty read, then an empty read past the TTL does not take over", function()
+        local live = claim_file_text(DEAD) -- process A's claim, held
+        as_process(global_b)
+        write_claim_raw("") -- B catches A's file empty once
+        assert.truthy(guard.foreign_claim(DEAD):find("empty", 1, true))
+        write_claim_raw(live) -- A's file is whole again; B reads it
+        now = now + 10
+        assert.truthy(guard.foreign_claim(DEAD):find("another WezTerm process", 1, true))
+        now = now + guard.claim_ttl_seconds + 1
+        write_claim_raw("") -- and catches it empty once more, long after the first time
+        instance_manager._test.restore_instances({ COPY_C }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD), "a live claim must not be taken over")
+        assert.falsy(logged("taking over the empty resume claim"))
+    end)
+
+    it("the heartbeat never truncates a claim file and keeps its length", function()
+        local path = SPEC_CLAIMS .. real_sep .. DEAD
+        local before = #claim_file_text(DEAD)
+        local modes = {}
+        rawset(io, "open", function(p, mode)
+            if p == path then table.insert(modes, mode or "r") end
+            return real_open(p, mode)
+        end)
+        now = now + 30
+        run_timers() -- process A's heartbeat
+        rawset(io, "open", real_open)
+        for _, mode in ipairs(modes) do
+            assert.falsy(mode:find("w", 1, true), "opened the claim file with mode " .. mode)
+        end
+        assert.equals(before, #claim_file_text(DEAD))
+        assert.equals(now, json.decode(claim_file_text(DEAD)).at, "the heartbeat refreshed it")
+    end)
+
+    it("the heartbeat recreates a claim file of the wrong length through a rename", function()
+        local text = claim_file_text(DEAD)
+        write_claim_raw((text:gsub("%s+$", ""))) -- an old, unpadded record
+        now = now + 30
+        run_timers()
+        assert.equals(#text, #claim_file_text(DEAD))
+        assert.equals(now, json.decode(claim_file_text(DEAD)).at)
+    end)
+end)
+
 -- busted runs every spec file in one process: put the environment back.
 describe("restore guard spec cleanup", function()
-    it("puts os.getenv back", function()
+    it("puts os.getenv back and deletes the temporary home", function()
         rawset(os, "getenv", process_getenv)
         assert.equals(process_getenv, os.getenv)
+        os.execute(real_sep == "\\" and ('rmdir /s /q "' .. SPEC_HOME .. '"') or ('rm -rf "' .. SPEC_HOME .. '"'))
     end)
 end)

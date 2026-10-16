@@ -648,10 +648,20 @@ local function read_claim_file(path)
 	return "unreadable"
 end
 
+-- Every claim record has this exact length (JSON padded with spaces), so the
+-- heartbeat can overwrite it in place without ever truncating: a reader sees
+-- the old record, the new one, or (mid-write) a mix that does not parse and
+-- is refused - never an empty or short file.
+pub.claim_record_bytes = 256
+
 local function claim_content(session_id, pane_id)
-	return wezterm.json_encode({
-		v = 1, sessionId = session_id, owner = claim_owner(), pane = pane_id, at = os.time(),
+	local text = wezterm.json_encode({
+		v = 1, sessionId = session_id, owner = claim_owner(), pane = tonumber(pane_id), at = os.time(),
 	})
+	if #text > pub.claim_record_bytes then
+		error("resume claim record longer than " .. pub.claim_record_bytes .. " bytes")
+	end
+	return text .. string.rep(" ", pub.claim_record_bytes - #text)
 end
 
 -- Create path with content only if it does not exist yet.
@@ -692,6 +702,34 @@ local function store_claim_list(ids)
 	end)
 end
 
+-- Rewrite our claim file with a fresh "at", in place and at full length.
+-- Missing or of another length (an older record format, a cut-short
+-- file): move it aside and create it again through temp + rename; a rename
+-- that fails because the file exists means another process holds it.
+local function refresh_claim(path, session_id, pane_id)
+	local content = claim_content(session_id, pane_id)
+	local handle = io.open(path, "r+b")
+	if handle then
+		local size = handle:seek("end")
+		if size == #content then
+			handle:seek("set", 0)
+			handle:write(content)
+			handle:close()
+			return true
+		end
+		handle:close()
+		local aside = path .. ".resize-" .. claim_owner() .. "-" .. tostring(math.random(100000000, 999999999))
+		if not os.rename(path, aside) then
+			return false, "its claim file could not be moved aside to be rewritten"
+		end
+		os.remove(aside)
+	end
+	if create_new(path, content) then
+		return true
+	end
+	return false, "another WezTerm process now holds its claim file"
+end
+
 -- Keep this process's claim files fresh while they hold, delete them after.
 local function heartbeat()
 	local ids = claim_list()
@@ -706,10 +744,10 @@ local function heartbeat()
 		if type(current) ~= "table" or current.owner ~= owner then
 			ids[id] = nil -- taken over, removed by hand, or unreadable: not ours to touch
 		elseif recently_claimed(id) then
-			local handle = io.open(path, "wb")
-			if handle then
-				handle:write(claim_content(id, current.pane))
-				handle:close()
+			local ok, why = refresh_claim(path, id, current.pane)
+			if not ok then
+				wezterm.log_warn("resurrect: lost the resume claim on session " .. id .. ": " .. why)
+				ids[id] = nil
 			end
 		else
 			os.remove(path)
@@ -747,6 +785,12 @@ end)
 ---@return string|nil reason
 function pub.foreign_claim(session_id)
 	local current = read_claim_file(claim_path(session_id))
+	if current ~= "empty" then
+		-- The empty-file clock runs only while every read finds it empty.
+		pcall(function()
+			wezterm.GLOBAL[EMPTY_SEEN_PREFIX .. session_id] = nil
+		end)
+	end
 	if current == nil then
 		return nil
 	end
