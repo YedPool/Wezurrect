@@ -10,6 +10,9 @@ local pub = {}
 -- when sending cd commands via send_text().
 local is_safe_cwd = utils.is_safe_cwd
 
+-- Every line a restore types ends with this (bare CR on Windows; see utils).
+local ENTER = utils.ENTER
+
 ---Function used to split panes when mapping over the pane_tree
 ---@param opts restore_opts
 ---@return fun(acc: {active_pane: Pane, is_zoomed: boolean}, pane_tree: pane_tree): {active_pane: Pane, is_zoomed: boolean}
@@ -115,7 +118,7 @@ function pub.restore_tab(tab, tab_state, opts)
 		-- Validate the CWD contains no shell metacharacters to prevent
 		-- command injection via tampered state files.
 		if is_safe_cwd(tab_state.pane_tree.cwd) then
-			opts.pane:send_text("cd " .. wezterm.shell_join_args({ tab_state.pane_tree.cwd }) .. "\r\n")
+			opts.pane:send_text("cd " .. wezterm.shell_join_args({ tab_state.pane_tree.cwd }) .. ENTER)
 		elseif tab_state.pane_tree.cwd and tab_state.pane_tree.cwd ~= "" then
 			wezterm.log_error("resurrect: rejected suspicious CWD: " .. tab_state.pane_tree.cwd)
 		end
@@ -253,7 +256,7 @@ function pub.default_on_pane_restore(pane_tree)
 				-- fixed parts; the directory has passed is_safe_cwd.
 				restore_cmd = verdict.target.line
 				if cwd ~= nil and cwd ~= "" then
-					restore_cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n" .. restore_cmd
+					restore_cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. ENTER .. restore_cmd
 				end
 			end
 			if not verdict.allow then
@@ -265,7 +268,7 @@ function pub.default_on_pane_restore(pane_tree)
 				wezterm.time.call_after(pub.process_restore_delay_seconds, function()
 					local target_pane = wezterm.mux.get_pane(pane_id)
 					if target_pane then
-						target_pane:send_text(restore_cmd .. "\r\n")
+						target_pane:send_text(restore_cmd .. ENTER)
 						if verdict.target then
 							restore_guard.note_resumed()
 						end
@@ -278,7 +281,7 @@ function pub.default_on_pane_restore(pane_tree)
 	elseif pane_tree.text then
 		pane:inject_output(pane_tree.text:gsub("%s+$", ""))
 		-- Send newline to trigger a fresh shell prompt at the correct position
-		pane:send_text("\r\n")
+		pane:send_text(ENTER)
 	end
 end
 

@@ -6,6 +6,12 @@ utils.is_windows = wezterm.target_triple == "x86_64-pc-windows-msvc"
 utils.is_mac = (wezterm.target_triple == "x86_64-apple-darwin" or wezterm.target_triple == "aarch64-apple-darwin")
 utils.separator = utils.is_windows and "\\" or "/"
 
+-- The Enter key ending each line a restore types into a pane. A terminal
+-- Enter is a bare CR on Windows: PSReadLine reads CRLF as Enter followed by a
+-- second key, and that stray LF lands in the next prompt -- in front of the
+-- next line typed, such as "claude --resume <id>".
+utils.ENTER = utils.is_windows and "\r" or "\r\n"
+
 -- Helper function to remove formatting esc sequences in the string
 ---@param str string
 ---@return string
