@@ -624,6 +624,16 @@ verb, Horde's hibernate and Wake are to follow.
 - A file whose `at` is more than two minutes old is stale (owner gone) and is
   taken over by the next restore, which logs it. A file that cannot be read is
   never taken over: the session is refused until the file is deleted.
+- A config reload drops WezTerm's pending timers; the plugin restarts the
+  heartbeat whenever it loads with claims held.
+- An EMPTY claim file (the in-place heartbeat rewrite was cut short) is
+  refused at first and taken over, with a log line, once it has stayed empty
+  for two minutes as seen by the process that finds it.
+- Limits: a GUI frozen for over two minutes stops refreshing its claims, and
+  a mux pane that outlives its GUI is not seen by anyone; either can lose its
+  claim. The control-file check (is the session running?) still runs first,
+  so this matters only before the resumed Claude has written its control
+  file.
 - Wake can use the same file to keep a restore from racing it: create it the
   same way before resuming, delete it once the session has its control file.
 

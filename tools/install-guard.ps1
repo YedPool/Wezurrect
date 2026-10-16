@@ -19,7 +19,9 @@
 # Default mode, in order:
 #   1. refuse if WezTerm is running
 #   2. copy the whole plugin folder to <BackupRoot>\<stamp>\
-#   3. git stash the hand edit in plugin\resurrect\tab_state.lua (kept, not dropped)
+#   3. keep the hand edit in plugin\resurrect\tab_state.lua as hand-edit.patch
+#      in the backup folder (the backup copy has the file too), then discard
+#      it from the working tree so the checkout can proceed. No git stash.
 #   4. git fetch origin
 #   5. git checkout --detach <commit>
 #   6. verify plugin\resurrect\restore_guard.lua exists and utils.lua defines
@@ -170,12 +172,15 @@ if (-not $AllowRunning) {
 
     $handEdited = @(Invoke-Git status --porcelain --untracked-files=no '--' $handEditFile).Count -gt 0
     if (-not $handEdited) {
-        Say "no hand edit in $handEditFile, nothing to stash"
+        Say "no hand edit in $handEditFile"
     } elseif ($DryRun) {
-        Say "would git stash push -- $handEditFile (kept in git stash list)"
+        Say "would keep the hand edit as $backupDir\hand-edit.patch, then discard it from $handEditFile"
     } else {
-        Invoke-Git stash push -m "hand edit: Windows bare CR on resume line (pre-guard, $stamp)" '--' $handEditFile | Out-Null
-        Say "stashed hand edit: $((Invoke-Git stash list | Select-Object -First 1))"
+        $patch = Join-Path $backupDir "hand-edit.patch"
+        (Invoke-Git diff '--' $handEditFile) -join "`n" | Set-Content -LiteralPath $patch -Encoding ascii
+        if (-not (Test-Path -LiteralPath $patch) -or (Get-Item -LiteralPath $patch).Length -eq 0) { Fail "could not write $patch" }
+        Invoke-Git checkout '--' $handEditFile | Out-Null
+        Say "kept hand edit as $patch (the backup copy has the file too)"
     }
 
     if ($DryRun -or $NoFetch) { Say "not fetching (dry run or -NoFetch); using the refs already fetched" }
@@ -330,12 +335,14 @@ try {
         }
     }
     # A reload now loads the full old set (or shows which files are mixed).
-    try { (Get-Item -LiteralPath (Join-Path $PluginDir "plugin\init.lua")).LastWriteTime = Get-Date } catch { }
+    $touch = "init.lua touched"
+    try { (Get-Item -LiteralPath (Join-Path $PluginDir "plugin\init.lua")).LastWriteTime = Get-Date }
+    catch { $touch = "init.lua could NOT be touched ($($_.Exception.Message)): press Ctrl+Shift+R in WezTerm" }
     if ($notRestored.Count -gt 0) {
         Fail ("swap failed after $($done.Count) files ($err); COULD NOT PUT BACK: $($notRestored -join '; '). " +
-            "Copy them from $backupPlugin by hand, then press Ctrl+Shift+R in WezTerm.")
+            "Copy them from $backupPlugin by hand, then press Ctrl+Shift+R in WezTerm. ($touch)")
     }
-    Fail "swap failed after $($done.Count) files ($err); every moved file was put back from $backupPlugin and init.lua touched"
+    Fail "swap failed after $($done.Count) files ($err); every moved file was put back from $backupPlugin; $touch"
 }
 $sw.Stop()
 Say "swapped $($plan.Count) files and dropped $($drop.Count) in $($sw.ElapsedMilliseconds) ms"
@@ -348,9 +355,14 @@ if ($left.Count -gt 0) { Fail "after the swap these differ from $($sha.Substring
 
 # 8. One deliberate reload, after the tree is complete.
 Start-Sleep -Milliseconds 1000
-(Get-Item -LiteralPath (Join-Path $PluginDir "plugin\init.lua")).LastWriteTime = Get-Date
-Say "touched plugin\init.lua: WezTerm reloads the config now (Ctrl+Shift+R if automatically_reload_config is off)"
+$reload = "A reload restores nothing; the guard applies from the next restore."
+try {
+    (Get-Item -LiteralPath (Join-Path $PluginDir "plugin\init.lua")).LastWriteTime = Get-Date
+    Say "touched plugin\init.lua: WezTerm reloads the config now (Ctrl+Shift+R if automatically_reload_config is off)"
+} catch {
+    $reload = "reload pending - press Ctrl+Shift+R in every WezTerm window (init.lua could not be touched: $($_.Exception.Message))"
+}
 
 Write-Host ("RESULT: INSTALLED $($sha.Substring(0,7)) (was $($head.Substring(0,7))) without a quit; " +
-    "backup $backupDir; state\ untouched. A reload restores nothing; the guard applies from the next restore.")
+    "backup $backupDir; state\ untouched. $reload")
 exit 0
