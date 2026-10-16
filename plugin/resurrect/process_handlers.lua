@@ -262,11 +262,12 @@ pub.register({
 		-- Claude Code must be started from the original working directory
 		-- for proper context loading and session restoration. Prepend a cd
 		-- command as a separate line so the shell changes directory before
-		-- launching Claude. Using \r\n between commands instead of && for
+		-- launching Claude. Using Enter between commands instead of && for
 		-- cross-shell compatibility (PowerShell 5.x does not support &&).
+		-- utils.ENTER is a bare CR on Windows, so no stray LF precedes claude.
 		local cwd = process_info.cwd or (pane_tree and pane_tree.cwd)
 		if cwd and is_safe_cwd(cwd) then
-			cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. "\r\n" .. cmd
+			cmd = "cd " .. wezterm.shell_join_args({ cwd }) .. utils.ENTER .. cmd
 		elseif cwd then
 			wezterm.log_warn("resurrect: rejected unsafe CWD for Claude restore: " .. tostring(cwd))
 		end

@@ -950,6 +950,36 @@ describe("restore guard: the line that is typed", function()
         assert.falsy(all_sent(pane):find("\n", 1, true), "no LF may be typed on Windows")
     end)
 
+    it("restore_tab ends its cd into the reused first pane with a bare CR on Windows", function()
+        -- The guard types the resume line into this same pane 3 s later; an
+        -- LF left here would land in front of it.
+        local fresh = new_pane()
+        tab_state.restore_tab(new_tab(fresh), { title = "t", pane_tree = { cwd = "C:\\work" } }, {
+            pane = fresh,
+            pane_is_new = true,
+        })
+        assert.equals("cd C:\\work\r", all_sent(fresh))
+    end)
+
+    it("ends the prompt nudge after restored scrollback with a bare CR on Windows", function()
+        local pane = restore_pane({ cwd = "C:\\work", text = "PS C:\\work>" })
+        assert.equals("\r", all_sent(pane))
+    end)
+
+    it("the claude handler joins cd and the resume line with a bare CR on Windows", function()
+        local cmd = require("resurrect.process_handlers").get_restore_command(
+            { name = "claude", executable = "claude", cwd = "C:\\work", argv = { "claude", "--resume", DEAD } },
+            { cwd = "C:\\work" }
+        )
+        assert.truthy(cmd, "the claude handler must build a command")
+        assert.truthy(cmd:find("cd C:\\work\r", 1, true))
+        assert.falsy(cmd:find("\n", 1, true), "no LF may be typed on Windows")
+    end)
+
+    it("utils.ENTER is a bare CR on Windows", function()
+        assert.equals("\r", utils.ENTER)
+    end)
+
     it("keeps the one allowed flag", function()
         local tree = claude_pane(DEAD)
         tree.process.argv = { "claude", "--resume", DEAD, "--dangerously-skip-permissions" }
