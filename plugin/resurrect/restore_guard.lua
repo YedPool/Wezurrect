@@ -523,6 +523,10 @@ local function recently_claimed(session_id)
 	return claimed_at ~= nil and os.time() - claimed_at < pub.claim_ttl_seconds
 end
 
+--- True when this WezTerm process resumed or scheduled the session in the
+--- last claim_ttl_seconds.
+pub.is_claimed = recently_claimed
+
 local function claim(session_id)
 	local now = os.time()
 	local_claims[session_id] = now

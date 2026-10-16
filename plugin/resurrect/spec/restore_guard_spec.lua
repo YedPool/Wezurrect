@@ -12,7 +12,7 @@ local sep = "\\"
 -- earlier spec file left behind.
 for _, name in ipairs({
     "file_io", "utils", "state_manager", "instance_manager", "workspace_state", "window_state",
-    "tab_state", "fuzzy_loader", "process_handlers", "pane_tree", "json_text", "restore_guard",
+    "tab_state", "fuzzy_loader", "process_handlers", "pane_tree", "json_text", "restore_guard", "guard_probe",
 }) do
     package.loaded["resurrect." .. name] = nil
     package.preload["resurrect." .. name] = nil
@@ -1728,5 +1728,110 @@ describe("incident 2026-10-16: parked sessions", function()
         end
         local pane = restore_pane(claude_pane(OTHER))
         assert.equals("", all_sent(pane))
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- The guard probe: a dry run that types and opens nothing
+-- ---------------------------------------------------------------------------
+
+local guard_probe = require("resurrect.guard_probe")
+local PARKED = "eeeeeeee-5555-4555-8555-555555555555"
+local PLUGIN_DIR = "X:\\plugins\\wezurrect"
+local PROBE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+describe("guard probe", function()
+    local report_path
+
+    before_each(function()
+        reset()
+        guard_probe._test.reset()
+        instance_manager.instance_id = OWN_ID
+        guard_probe.plugin_dir = PLUGIN_DIR
+        file_store[PLUGIN_DIR .. sep .. ".git" .. sep .. "HEAD"] = PROBE_SHA .. "\n"
+        report_path = guard_probe.report_path()
+        -- LIVE runs, DEAD and PARKED do not, PARKED has a marker.
+        control_files({
+            { LIVE, 4242, START, true, START, "C:\\work\\live" },
+        }, { { PARKED, "parked", "fleet park" } })
+        save_instance_file(COPY_A, workspace_of(
+            claude_pane(LIVE, "C:\\work\\live"), claude_pane(DEAD, "C:\\work\\dead"),
+            claude_pane(PARKED, "C:\\work\\parked"), claude_pane(DEAD, "C:\\work\\dead")))
+    end)
+
+    local function probe(value)
+        guard_probe.on_user_var(guard_probe.USER_VAR, value or "newest|n0nce1")
+        return file_store[report_path]
+    end
+
+    it("lists every session with what a restore would do and why", function()
+        local report = probe()
+        assert.truthy(report, "the report file must be written")
+        assert.truthy(report:find("RESUME  " .. DEAD, 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. LIVE .. "  running: already running pid 4242", 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. PARKED .. "  parked: ", 1, true), report)
+        assert.truthy(report:find("fleet park", 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. DEAD .. "  duplicate", 1, true), report)
+        assert.truthy(report:find("4 sessions, 1 would resume, 1 refused (running), 1 refused (parked), 1 refused (duplicate)", 1, true), report)
+        assert.truthy(report:find("saved copy: " .. COPY_A, 1, true), report)
+        assert.truthy(report:find("nonce: n0nce1", 1, true))
+    end)
+
+    it("types nothing, opens nothing, claims nothing and keeps the saved copy", function()
+        probe()
+        run_timers()
+        assert.equals("", everything_sent())
+        assert.equals(0, spawned_windows)
+        assert.is_true(instance_file_exists(COPY_A))
+        -- A real restore afterwards still resumes DEAD: the probe took no claim.
+        instance_manager._test.restore_instances({ COPY_A }, new_gui_window(), busy_pane(), restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("names the guard version and the plugin commit", function()
+        local report = probe()
+        assert.truthy(report:find("guard version: " .. guard_probe.GUARD_VERSION, 1, true), report)
+        assert.truthy(report:find("plugin commit: " .. PROBE_SHA, 1, true), report)
+    end)
+
+    it("reads a commit through a branch ref", function()
+        file_store[PLUGIN_DIR .. sep .. ".git" .. sep .. "HEAD"] = "ref: refs/heads/main\n"
+        file_store[PLUGIN_DIR .. sep .. ".git" .. sep .. "refs" .. sep .. "heads" .. sep .. "main"] = PROBE_SHA .. "\n"
+        assert.equals(PROBE_SHA .. " (refs/heads/main)", guard_probe.commit())
+    end)
+
+    it("announce logs the version and commit once per config evaluation", function()
+        guard_probe.announce()
+        local line = logged("restore guard .* loaded from plugin commit")
+        assert.truthy(line and line:find(PROBE_SHA, 1, true), line)
+    end)
+
+    it("says when the copy is this terminal's own live copy", function()
+        save_instance_file(OWN_ID, workspace_of(claude_pane(LIVE, "C:\\work\\live")))
+        local report = probe(OWN_ID .. "|abc")
+        assert.truthy(report:find("this terminal's own live copy", 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. LIVE .. "  running", 1, true), report)
+    end)
+
+    it("ignores other user vars and malformed requests", function()
+        guard_probe.on_user_var("something_else", "newest|abc")
+        guard_probe.on_user_var(guard_probe.USER_VAR, "newest")
+        guard_probe.on_user_var(guard_probe.USER_VAR, "..\\evil|abc")
+        guard_probe.on_user_var(guard_probe.USER_VAR, "newest|" .. string.rep("a", 33))
+        assert.is_nil(file_store[report_path])
+    end)
+
+    it("ignores a second request within a few seconds", function()
+        probe("newest|first")
+        probe("newest|second")
+        assert.truthy(file_store[report_path]:find("nonce: first", 1, true))
+    end)
+
+    it("reports liveness that cannot be read, and resumes nothing in the list", function()
+        control_dir_unreadable()
+        local report = probe()
+        assert.truthy(report:find("liveness: UNREADABLE", 1, true), report)
+        assert.falsy(report:find("RESUME", 1, true), report)
     end)
 end)
