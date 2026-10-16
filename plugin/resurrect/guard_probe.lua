@@ -125,6 +125,8 @@ function pub.verdicts(state, get_command, snapshot)
 				entry.why, entry.detail = WORDS[pane_state] or pane_state, reason
 			elseif seen[target.session_id] then
 				entry.why, entry.detail = "duplicate", "the same session appears earlier in this saved copy"
+			elseif restore_guard.foreign_claim(target.session_id) then
+				entry.why, entry.detail = "already resumed", restore_guard.foreign_claim(target.session_id)
 			elseif restore_guard.is_claimed(target.session_id) then
 				entry.why, entry.detail = "already resumed", "this WezTerm resumed it within "
 					.. restore_guard.claim_ttl_seconds .. " seconds, or its pane is still open"

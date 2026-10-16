@@ -269,7 +269,9 @@ local search_paths = {
 }
 package.path = table.concat(search_paths, ";") .. ";" .. package.path
 
--- Override os.remove to track deletions (rawset avoids luacheck read-only warning)
+-- Override os.remove to track deletions (rawset avoids luacheck read-only warning).
+-- Put back after this file: busted runs every spec file in one process.
+local real_os_remove = os.remove
 rawset(os, "remove", function(path)
     table.insert(removed_files, path)
     file_store[path] = nil
@@ -284,6 +286,8 @@ local instance_manager = require("resurrect.instance_manager")
 -- ---------------------------------------------------------------------------
 
 describe("instance_manager", function()
+    teardown(function() rawset(os, "remove", real_os_remove) end)
+
     before_each(function()
         emitted_events = {}
         written_files = {}

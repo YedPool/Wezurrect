@@ -575,6 +575,229 @@ function pub.marked_now(session_id)
 	return code ~= 2 -- ENOENT
 end
 
+-- ---------------------------------------------------------------------------
+-- Claims across WezTerm processes: ~/.wezurrect/resuming/<session id>
+-- ---------------------------------------------------------------------------
+--
+-- wezterm.GLOBAL is per process; two wezterm-gui processes (a restore can
+-- start a second one) cannot see each other's claims. So a claim is also a
+-- file, created only if absent: the content is written to a temporary name
+-- and renamed onto the claim name, and on Windows a rename fails when the
+-- target exists, so exactly one process gets it.
+--
+-- The owner rewrites "at" in its claim files every claim_heartbeat_seconds
+-- for as long as the claim holds (TTL running or its pane still open), and
+-- deletes them when it no longer does. Another process treats a file whose
+-- "at" is older than claim_ttl_seconds as stale (owner gone, or it stopped
+-- holding it) and takes it over, logging that. A claim file that cannot be
+-- read is never taken over.
+
+pub.claim_heartbeat_seconds = 30
+
+local CLAIM_OWNER_KEY = "resurrect_claim_owner"
+local CLAIM_LIST_KEY = "resurrect_claim_files"
+local heartbeat_running = false
+
+--- The folder of cross-process claim files.
+---@return string
+function pub.claim_dir()
+	local sep = utils.separator
+	return home_dir() .. sep .. ".wezurrect" .. sep .. "resuming"
+end
+
+-- This process's owner id, kept in wezterm.GLOBAL (one per WezTerm process).
+local function claim_owner()
+	local ok, owner = pcall(function()
+		return wezterm.GLOBAL[CLAIM_OWNER_KEY]
+	end)
+	if ok and type(owner) == "string" and owner:match("^%d+_%d+$") then
+		return owner
+	end
+	owner = tostring(os.time()) .. "_" .. tostring(math.random(100000000, 999999999))
+	pcall(function()
+		wezterm.GLOBAL[CLAIM_OWNER_KEY] = owner
+	end)
+	return owner
+end
+
+local function claim_path(session_id)
+	return pub.claim_dir() .. utils.separator .. session_id
+end
+
+-- The claim file's contents: a table, "unreadable", or nil when absent.
+local function read_claim_file(path)
+	local handle, _, code = io.open(path, "rb")
+	if not handle then
+		if code == 2 then
+			return nil
+		end
+		return "unreadable"
+	end
+	local text = handle:read("a")
+	handle:close()
+	local ok, value = pcall(wezterm.json_parse, text)
+	if ok and type(value) == "table" and tonumber(value.at) and type(value.owner) == "string" then
+		return value
+	end
+	return "unreadable"
+end
+
+local function claim_content(session_id, pane_id)
+	return wezterm.json_encode({
+		v = 1, sessionId = session_id, owner = claim_owner(), pane = pane_id, at = os.time(),
+	})
+end
+
+-- Create path with content only if it does not exist yet.
+local function create_new(path, content)
+	local tmp = path .. ".tmp-" .. claim_owner() .. "-" .. tostring(math.random(100000000, 999999999))
+	local handle = io.open(tmp, "wb")
+	if not handle then
+		return false
+	end
+	handle:write(content)
+	handle:close()
+	local ok = os.rename(tmp, path)
+	if not ok then
+		os.remove(tmp)
+	end
+	return ok and true or false
+end
+
+local function claim_list()
+	local ok, list = pcall(function()
+		return wezterm.GLOBAL[CLAIM_LIST_KEY]
+	end)
+	local ids = {}
+	for id in ((ok and type(list) == "string") and list or ""):gmatch("[^,]+") do
+		ids[id] = true
+	end
+	return ids
+end
+
+local function store_claim_list(ids)
+	local names = {}
+	for id in pairs(ids) do
+		table.insert(names, id)
+	end
+	table.sort(names)
+	pcall(function()
+		wezterm.GLOBAL[CLAIM_LIST_KEY] = table.concat(names, ",")
+	end)
+end
+
+-- Keep this process's claim files fresh while they hold, delete them after.
+local function heartbeat()
+	local ids = claim_list()
+	local owner = claim_owner()
+	for id in pairs(ids) do
+		local path = claim_path(id)
+		local current = read_claim_file(path)
+		if type(current) ~= "table" or current.owner ~= owner then
+			ids[id] = nil -- taken over, removed by hand, or unreadable: not ours to touch
+		elseif recently_claimed(id) then
+			local handle = io.open(path, "wb")
+			if handle then
+				handle:write(claim_content(id, current.pane))
+				handle:close()
+			end
+		else
+			os.remove(path)
+			ids[id] = nil
+		end
+	end
+	store_claim_list(ids)
+	if next(ids) then
+		wezterm.time.call_after(pub.claim_heartbeat_seconds, heartbeat)
+	else
+		heartbeat_running = false
+	end
+end
+
+local function start_heartbeat()
+	if heartbeat_running then
+		return
+	end
+	heartbeat_running = true
+	wezterm.time.call_after(pub.claim_heartbeat_seconds, heartbeat)
+end
+
+--- Who else holds a claim on the session, read-only: a reason, or nil when
+--- this process could take it (no file, its own file, or a stale one).
+---@param session_id string
+---@return string|nil reason
+function pub.foreign_claim(session_id)
+	local current = read_claim_file(claim_path(session_id))
+	if current == nil then
+		return nil
+	end
+	if current == "unreadable" then
+		return "its resume claim file " .. claim_path(session_id) .. " cannot be read"
+			.. " - delete it if no WezTerm is resuming this session"
+	end
+	if current.owner == claim_owner() then
+		return nil
+	end
+	local age = os.time() - tonumber(current.at)
+	if age < pub.claim_ttl_seconds then
+		return "another WezTerm process is resuming it (claim " .. age .. " s old, owner "
+			.. tostring(current.owner) .. ")"
+	end
+	return nil
+end
+
+--- Take the cross-process claim file for a session.
+---@return boolean ok
+---@return string|nil reason when not ok
+local function claim_file(session_id, pane_id)
+	if not utils.is_windows then
+		return false, "cross-process claims are only implemented on Windows"
+	end
+	local dir = pub.claim_dir()
+	if not utils.ensure_folder_exists(dir) then
+		return false, "the resume claim folder " .. dir .. " cannot be created"
+	end
+	local path = claim_path(session_id)
+	local content = claim_content(session_id, pane_id)
+	local function taken()
+		local ids = claim_list()
+		ids[session_id] = true
+		store_claim_list(ids)
+		start_heartbeat()
+		return true
+	end
+	if create_new(path, content) then
+		return taken()
+	end
+	local current = read_claim_file(path)
+	if current == nil then
+		-- Released between our attempt and the read: one more try.
+		if create_new(path, content) then
+			return taken()
+		end
+		return false, "another WezTerm process claimed it at the same moment"
+	end
+	local foreign = pub.foreign_claim(session_id)
+	if foreign then
+		return false, foreign
+	end
+	-- Stale (or our own expired one): move it aside first, so of two
+	-- processes taking it over only one succeeds.
+	local aside = path .. ".stale-" .. claim_owner() .. "-" .. tostring(math.random(100000000, 999999999))
+	if not os.rename(path, aside) then
+		return false, "another WezTerm process is taking over its stale claim"
+	end
+	os.remove(aside)
+	if current.owner ~= claim_owner() then
+		wezterm.log_warn("resurrect: taking over the stale resume claim on session " .. session_id
+			.. " (owner " .. tostring(current.owner) .. ", " .. (os.time() - tonumber(current.at)) .. " s old)")
+	end
+	if create_new(path, content) then
+		return taken()
+	end
+	return false, "another WezTerm process claimed it at the same moment"
+end
+
 -- Compare working directories the way Windows does: slash direction, case and
 -- a trailing separator do not matter. WezTerm reports /C:/..., Claude C:\...
 local function normalize_cwd(cwd)
@@ -676,6 +899,10 @@ function pub.check_command(cmd, cwd, pane_id)
 			state = "live",
 			reason = "already resumed in another pane by this restore",
 		}
+	end
+	local taken, why = claim_file(target.session_id, pane_id)
+	if not taken then
+		return { allow = false, target = target, state = "live", reason = why }
 	end
 	claim(target.session_id, pane_id)
 	return { allow = true, target = target, state = "dead" }
@@ -960,6 +1187,7 @@ pub._test = {
 		cached_snapshot = nil
 		cached_at = nil
 		local_claims = {}
+		heartbeat_running = false
 		if type(wezterm.GLOBAL) == "table" then
 			for key in pairs(wezterm.GLOBAL) do
 				if type(key) == "string" and key:sub(1, #CLAIM_KEY_PREFIX) == CLAIM_KEY_PREFIX then
@@ -977,6 +1205,7 @@ pub._test = {
 		cached_snapshot = nil
 		cached_at = nil
 		local_claims = {}
+		heartbeat_running = false
 		tally = new_tally()
 		report_generation = 0
 	end,

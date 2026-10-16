@@ -14,6 +14,16 @@ local real_sep = package.config:sub(1, 1)
 local SPEC_MARKERS = (os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp") .. real_sep
     .. "wezurrect-spec-markers-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000))
 os.execute((real_sep == "\\" and 'mkdir "' or 'mkdir -p "') .. SPEC_MARKERS .. '"')
+-- A real folder for the cross-process resume claim files, emptied of every
+-- fixture session's claim before each test.
+local SPEC_CLAIMS = SPEC_MARKERS .. "-claims"
+os.execute((real_sep == "\\" and 'mkdir "' or 'mkdir -p "') .. SPEC_CLAIMS .. '"')
+local FIXTURE_IDS = {
+    "aaaaaaaa-1111-4111-8111-111111111111", "abababab-7777-4777-8777-777777777777",
+    "bbbbbbbb-2222-4222-8222-222222222222", "cccccccc-3333-4333-8333-333333333333",
+    "dddddddd-4444-4444-8444-444444444444", "eeeeeeee-5555-4555-8555-555555555555",
+    "ffffffff-6666-4666-8666-666666666666",
+}
 
 
 -- busted shares one Lua process: drop every module and preload stub an
@@ -298,6 +308,8 @@ local function reset()
     if guard_loaded then
         guard._test.reset()
         guard.marker_dir = function() return SPEC_MARKERS end
+        guard.claim_dir = function() return SPEC_CLAIMS end
+        for _, id in ipairs(FIXTURE_IDS) do os.remove(SPEC_CLAIMS .. real_sep .. id) end
     end
     usual_world()
 end
@@ -1972,5 +1984,114 @@ describe("PR 26 review: error labels", function()
             return tab_state.get_pane_restore_command(tree, true)
         end)
         assert.equals("no-restore markers unreadable", summary.error_label)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- Two WezTerm processes: wezterm.GLOBAL is per process, the claim files in
+-- ~/.wezurrect/resuming are shared.
+-- ---------------------------------------------------------------------------
+
+local function claim_file_text(session_id)
+    local f = io.open(SPEC_CLAIMS .. real_sep .. session_id, "rb")
+    if not f then return nil end
+    local text = f:read("a")
+    f:close()
+    return text
+end
+
+describe("two WezTerm processes sharing the claim folder", function()
+    local real_time = os.time
+    local now
+    local global_a, global_b
+    local gui, existing
+
+    -- Switch the stub to one process: its own GLOBAL and a fresh Lua state.
+    local function as_process(global)
+        wezterm_stub.GLOBAL = global
+        guard._test.new_lua_state()
+    end
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        global_a, global_b = {}, {}
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        as_process(global_a)
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD), "process A resumes it")
+        assert.truthy(claim_file_text(DEAD), "process A holds the claim file")
+    end)
+    after_each(function() rawset(os, "time", real_time) end)
+
+    it("the second process does not resume a session the first is resuming", function()
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("another WezTerm process is resuming it", 1, true), line)
+    end)
+
+    it("the owner keeps its claim fresh while the pane is open, beyond the TTL", function()
+        now = now + 100
+        run_timers() -- process A's heartbeat
+        now = now + 100 -- 200 s after the claim, 100 s after the heartbeat
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a stale claim (owner gone, TTL over) is taken over, and that is logged", function()
+        now = now + guard.claim_ttl_seconds + 60 -- process A died: no heartbeat
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        assert.truthy(logged("taking over the stale resume claim on session bbbbbbbb"))
+        run_timers()
+        assert.equals(2, resumes_of(DEAD))
+    end)
+
+    it("the owner deletes its claim file once the pane is closed and the TTL is over", function()
+        for id, pane in pairs(panes) do
+            if all_sent(pane):find(DEAD, 1, true) then panes[id] = nil end
+        end
+        now = now + guard.claim_ttl_seconds + 10
+        run_timers() -- process A's heartbeat
+        assert.is_nil(claim_file_text(DEAD))
+        log = {}
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD), "resumed again (A's pane is gone)")
+        assert.falsy(logged("taking over"))
+    end)
+
+    it("an unreadable claim file is never taken over", function()
+        local f = assert(io.open(SPEC_CLAIMS .. real_sep .. DEAD, "wb"))
+        f:write("not json {")
+        f:close()
+        now = now + guard.claim_ttl_seconds + 60
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("cannot be read", 1, true), line)
+    end)
+
+    it("the dry run reports a session another process is resuming", function()
+        as_process(global_b)
+        local entries = guard_probe.verdicts(workspace_of(claude_pane(DEAD)), function(tree)
+            return tab_state.get_pane_restore_command(tree, true)
+        end, guard.get_snapshot(true))
+        assert.is_nil(entries[1].resume)
+        assert.truthy(entries[1].detail:find("another WezTerm process", 1, true), entries[1].detail)
     end)
 end)

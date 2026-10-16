@@ -564,10 +564,13 @@ A restore types `claude --resume <session id>` only after
 - the session is already running (a control file in `~/.claude/sessions`
   names it, its pid runs, and the process start time matches), or whether it
   runs cannot be established;
-- this WezTerm process already resumed or scheduled the same session in the
-  last two minutes, in this restore or in another one. The record lives in
-  `wezterm.GLOBAL`, so a config reload does not forget it. Two saved copies,
-  or two windows of one copy, holding the same session resume it once;
+- a restore already resumed or scheduled the same session, and its claim
+  still holds: for two minutes, and for as long as the pane it was typed into
+  is open. Inside one WezTerm process the claim lives in `wezterm.GLOBAL`, so
+  a config reload does not forget it; across WezTerm processes it is a claim
+  file (below). Two saved copies, or two windows of one copy, or two GUI
+  processes, holding the same session resume it once. (A pane still open
+  after its Claude exited keeps the claim: resume that one by hand);
 - the session has a "do not restore" marker (below).
 
 Every refusal is logged (`resurrect: not resuming session ...`) with the
@@ -602,7 +605,27 @@ session away writes a marker; any tool that brings it back removes it first.
 - Wake: delete the marker, THEN resume the session. A wake that fails after
   deleting it should write it back.
 - Markers are read afresh at the start of every restore, by the same single
-  PowerShell query that reads the control files; there is no cache to clear.
+  PowerShell query that reads the control files, and once more just before
+  each resume line is typed.
+
+Nothing writes markers yet: this section is the contract the fleet's park
+verb, Horde's hibernate and Wake are to follow.
+
+### Resume claims across WezTerm processes
+
+- Folder: `%USERPROFILE%\.wezurrect\resuming\`; file: `<session-uuid>` (no
+  extension), JSON `{"v": 1, "sessionId", "owner", "pane", "at"}` where `at`
+  is seconds since the epoch.
+- A claim is created only if absent: written under a temporary name, then
+  renamed onto `<session-uuid>`; on Windows that rename fails when the file
+  exists, so one process wins.
+- The owner rewrites `at` every 30 seconds while the claim holds (two minutes
+  or its pane open, whichever is longer) and deletes the file after.
+- A file whose `at` is more than two minutes old is stale (owner gone) and is
+  taken over by the next restore, which logs it. A file that cannot be read is
+  never taken over: the session is refused until the file is deleted.
+- Wake can use the same file to keep a restore from racing it: create it the
+  same way before resuming, delete it once the session has its control file.
 
 ## State files
 
