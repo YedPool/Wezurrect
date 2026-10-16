@@ -1,3 +1,4 @@
+#Requires -Version 7
 # install-guard.ps1 - install a Wezurrect commit that carries the restore
 # guard into the plugin copy WezTerm loads.
 #
@@ -32,12 +33,15 @@
 #   3. git fetch origin (touches .git only)
 #   4. write the commit's tree to <BackupRoot>\<stamp>\staged (never inside
 #      the plugins folder) and compile-check every .lua file in it
-#   5. keep the hand edit as a stash commit without touching the file
-#      (git stash create + git stash store)
+#   5. keep the hand edit as hand-edit.patch in the backup folder (the
+#      backup copy holds the file too). No git stash: a stash would capture
+#      every modified tracked file, state\current_state included, and popping
+#      it later would overwrite live state.
 #   6. the swap: move each new or changed file from staged into place with one
-#      rename each (new files first, init.lua last), then delete tracked files
-#      the commit no longer has. Nothing under state\ is ever written. Any
-#      error rolls every moved file back from the backup.
+#      rename each, then delete tracked files the commit no longer has.
+#      Nothing under state\ is ever written. Any error puts every moved file
+#      back from the backup (each on its own; failures are listed) and
+#      touches init.lua so a reload loads the complete old set.
 #   7. point HEAD at the commit and reset the index (the working files are
 #      already the commit's); verify nothing outside state\ differs
 #   8. one deliberate reload: touch plugin\init.lua a second after the swap
@@ -46,9 +50,12 @@
 # and config/src/lib.rs, and wezterm-gui/src/main.rs):
 #   * Every file the config loads with require is added to the reload watch
 #     list, the plugin's files included. A change to any of them reloads the
-#     config 200 ms after the first change event. The swap renames a dozen
-#     files in a few milliseconds; the deliberate reload afterwards makes sure
-#     the last reload saw the complete tree.
+#     config 200 ms after the first change event, and every reload loads
+#     every module fresh from disk. A reload that lands mid-swap can load a
+#     mix of old and new files; the order of the renames does not prevent
+#     that. What protects you is the deliberate reload after the swap (the
+#     last reload sees the complete tree) and not restoring anything while
+#     the script runs.
 #   * A reload that fails (a syntax error in a half-written file) keeps the
 #     old config and its Lua state and shows the error. Step 4 checks every
 #     file compiles before anything is moved.
@@ -74,6 +81,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+trap {
+    Write-Host "RESULT: FAILED - $($_.Exception.Message) (check the plugin folder against the backup under $BackupRoot)"
+    exit 1
+}
 $prBranch = "origin/fix/windows-cr-enter-after-guard"
 $handEditFile = "plugin/resurrect/tab_state.lua"
 $mode = if ($DryRun) { "DRY-RUN" } else { "INSTALL" }
@@ -269,7 +280,7 @@ foreach ($rel in @(Invoke-Git ls-files)) {
     $target = Join-Path $PluginDir ($rel.Replace('/', '\'))
     if (Test-Path -LiteralPath $target) { $drop += [pscustomobject]@{ Rel = $rel; Target = $target } }
 }
-# New files first (nothing watches them yet), changed files next, init.lua last.
+# New files first (nothing watches them yet), then changed files.
 $plan = @($plan | Sort-Object @{ Expression = { -not $_.New } }, @{ Expression = { $_.Rel -eq "plugin/init.lua" } }, Rel)
 Say "plan: $(@($plan | Where-Object New).Count) new, $(@($plan | Where-Object { -not $_.New }).Count) changed, $($drop.Count) dropped"
 foreach ($p in $plan) { Say "  $(if ($p.New) { 'new    ' } else { 'replace' }) $($p.Rel)" }
@@ -285,13 +296,11 @@ if ($plan.Count -eq 0 -and $drop.Count -eq 0 -and $head -eq $sha) {
     exit 0
 }
 
-# 5. Keep the hand edit as a stash without touching the file.
+# 5. Keep the hand edit as a patch next to the backup (no git stash).
 if ($handEdited) {
-    $stashSha = (Invoke-Git stash create "hand edit: Windows bare CR on resume line (pre-guard, $stamp)").Trim()
-    if ($stashSha -ne "") {
-        Invoke-Git stash store -m "hand edit: Windows bare CR on resume line (pre-guard, $stamp)" $stashSha | Out-Null
-        Say "kept hand edit as stash $($stashSha.Substring(0,7)) (file not touched)"
-    }
+    $patch = Join-Path $backupDir "hand-edit.patch"
+    (Invoke-Git diff '--' $handEditFile) -join "`n" | Set-Content -LiteralPath $patch -Encoding ascii
+    Say "kept hand edit as $patch (the backup copy has the file too)"
 }
 
 # 6. The swap. One rename per file; roll everything back on any error.
@@ -310,12 +319,23 @@ try {
     }
 } catch {
     $err = $_.Exception.Message
+    $notRestored = @()
     foreach ($p in $done) {
         $orig = Join-Path $backupPlugin ($p.Rel.Replace('/', '\'))
-        if ($p.New) { Remove-Item -LiteralPath $p.Target -Force -ErrorAction SilentlyContinue }
-        else { Copy-Item -LiteralPath $orig -Destination $p.Target -Force }
+        try {
+            if ($p.New) { Remove-Item -LiteralPath $p.Target -Force -ErrorAction Stop }
+            else { Copy-Item -LiteralPath $orig -Destination $p.Target -Force -ErrorAction Stop }
+        } catch {
+            $notRestored += "$($p.Rel) ($($_.Exception.Message))"
+        }
     }
-    Fail "swap failed after $($done.Count) files ($err); every moved file was put back from $backupPlugin"
+    # A reload now loads the full old set (or shows which files are mixed).
+    try { (Get-Item -LiteralPath (Join-Path $PluginDir "plugin\init.lua")).LastWriteTime = Get-Date } catch { }
+    if ($notRestored.Count -gt 0) {
+        Fail ("swap failed after $($done.Count) files ($err); COULD NOT PUT BACK: $($notRestored -join '; '). " +
+            "Copy them from $backupPlugin by hand, then press Ctrl+Shift+R in WezTerm.")
+    }
+    Fail "swap failed after $($done.Count) files ($err); every moved file was put back from $backupPlugin and init.lua touched"
 }
 $sw.Stop()
 Say "swapped $($plan.Count) files and dropped $($drop.Count) in $($sw.ElapsedMilliseconds) ms"
