@@ -193,8 +193,11 @@ local query_calls = 0
 
 -- Answer the guard's one OS question with these control files.
 -- Each is { session, pid, proc_start, running (bool), start_time, cwd }.
-local function control_files(files)
+-- markers: the no-restore marker files, each { file base name, reason, by };
+-- reason and by are nil for a marker whose contents could not be read.
+local function control_files(files, markers)
     if not guard_loaded then return end
+    markers = markers or {}
     guard.run_query = function()
         query_calls = query_calls + 1
         local lines = {}
@@ -203,7 +206,10 @@ local function control_files(files)
                 "S", f[1], tostring(f[2]), f[3], f[4] and "1" or "0", f[5] or "?", f[6] or "",
             }, "\t"))
         end
-        table.insert(lines, "END\t" .. #files)
+        for _, m in ipairs(markers) do
+            table.insert(lines, table.concat({ "M", m[1], m[2] or "", m[3] or "" }, "\t"))
+        end
+        table.insert(lines, "END\t" .. #files .. "\t" .. #markers)
         return table.concat(lines, "\r\n") .. "\r\n"
     end
 end
@@ -1441,12 +1447,12 @@ describe("restore guard: the reason shown for each saved copy", function()
     for _, case in ipairs({
         { "control folder not found", function() return "ERR\tcontrol directory not found\r\n" end },
         { "control folder unreadable", function() return "ERR\tAccess to the path is denied.\r\n" end },
-        { "control folder is empty", function() return "END\t0\r\n" end },
+        { "control folder is empty", function() return "END\t0\t0\r\n" end },
         { "process query failed", function() return nil, "powershell.exe failed: boom" end },
         { "process query failed", function() return "S\tgarbage\r\n" end },
         { "process query timed out", function() return "ERR\tthe process query did not finish in 10 seconds\r\n" end },
         { "not supported on this system", function() return nil, "the running-session check is only implemented on Windows" end },
-        { "a control file is unreadable", function() return "S\t\t77\t\t1\t" .. START .. "\t\r\nEND\t1\r\n" end },
+        { "a control file is unreadable", function() return "S\t\t77\t\t1\t" .. START .. "\t\r\nEND\t1\t0\r\n" end },
     }) do
         it("cannot tell what is running: " .. case[1], function()
             guard.run_query = case[2]
@@ -1541,5 +1547,186 @@ describe("restore guard: the reason shown for each saved copy", function()
         instance_manager.auto_restore_on_startup()
         rawset(io, "open", real_open)
         assert.truthy(logged("not restoring workspace default at startup: its one session is already running"))
+    end)
+end)
+-- ---------------------------------------------------------------------------
+-- Incident 2026-10-16: after every pane died, a restore brought each Claude
+-- session back twice, and brought back sessions that had been parked.
+-- ---------------------------------------------------------------------------
+
+local COPY_A = "1700000005_55555"
+local COPY_B = "1700000006_66666"
+
+-- How many times "--resume <id>" was typed, over every pane.
+local function resumes_of(session_id)
+    local text, count, from = everything_sent(), 0, 1
+    while true do
+        local at = text:find("--resume " .. session_id, from, true)
+        if not at then return count end
+        count, from = count + 1, at + 1
+    end
+end
+
+-- A saved workspace with two windows, one tab each.
+local function two_windows_of(first, second)
+    local state = workspace_of(first)
+    table.insert(state.window_states, workspace_of(second).window_states[1])
+    return state
+end
+
+-- A fresh Lua state, as after a config reload: everything the module keeps
+-- in its own locals is gone, wezterm.GLOBAL is not.
+local function new_lua_state()
+    guard._test.new_lua_state()
+end
+
+describe("incident 2026-10-16: one session resumed twice", function()
+    local existing, gui
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        existing = busy_pane()
+        gui = new_gui_window()
+    end)
+
+    it("two saved copies holding the same session, restored together, resume it once", function()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        gui:pick(COPY_A, existing)
+        gui:pick(COPY_B, existing)
+        gui:pick("__RESTORE_SELECTED__", existing)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("one saved copy with the same session in two windows resumes it once", function()
+        save_instance_file(COPY_A, two_windows_of(claude_pane(DEAD), claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a second restore seconds later, before the first wrote its control file, does not resume it again", function()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers() -- the first resume line is typed; DEAD has no control file yet
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a config reload between two restores does not forget what was resumed", function()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        new_lua_state()
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("says in the log that the second copy of the session was not resumed", function()
+        save_instance_file(COPY_A, two_windows_of(claude_pane(DEAD), claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("already resumed", 1, true), line)
+    end)
+end)
+
+describe("incident 2026-10-16: parked sessions", function()
+    local existing, gui
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        existing = busy_pane()
+        gui = new_gui_window()
+    end)
+
+    -- DEAD and OTHER are not running; DEAD has been parked.
+    local function parked_world(marker)
+        control_files({
+            { LIVE, 4242, START, true, START, "C:\\work\\live" },
+        }, { marker or { DEAD, "parked", "fleet park" } })
+    end
+
+    it("does not resume a session that has a no-restore marker", function()
+        parked_world()
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("logs which session was refused and why", function()
+        parked_world()
+        restore_pane(claude_pane(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line, "the refusal must be logged")
+        assert.truthy(line:find("parked", 1, true), line)
+        assert.truthy(line:find("fleet park", 1, true), line)
+    end)
+
+    it("a marker whose contents cannot be read still counts", function()
+        parked_world({ DEAD })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("not resuming session bbbbbbbb"))
+    end)
+
+    it("a marker named in upper case still counts", function()
+        parked_world({ DEAD:upper(), "hibernated", "horde" })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("a session without a marker is still resumed", function()
+        parked_world()
+        local pane = restore_pane(claude_pane(OTHER))
+        assert.truthy(all_sent(pane):find(OTHER, 1, true))
+    end)
+
+    it("once the marker is removed (Wake) the session is resumed", function()
+        control_files({ { LIVE, 4242, START, true, START, "C:\\work\\live" } })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.truthy(all_sent(pane):find(DEAD, 1, true))
+    end)
+
+    it("a saved copy whose only session is parked cannot be restored", function()
+        parked_world()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(COPY_A).label
+        assert.truthy(label:find("parked", 1, true), label)
+        assert.truthy(label:find("cannot restore", 1, true), label)
+
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(0, resumes_of(DEAD))
+        assert.equals(0, spawned_windows)
+    end)
+
+    it("a partly parked copy resumes only the sessions that are not parked", function()
+        parked_world()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD), claude_pane(OTHER)))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(COPY_A).label
+        assert.truthy(label:find("1 parked", 1, true), label)
+        gui:pick(COPY_A, existing)
+        gui:pick("__RESTORE_SELECTED__", existing)
+        run_timers()
+        assert.equals(0, resumes_of(DEAD))
+        assert.equals(1, resumes_of(OTHER))
+    end)
+
+    it("a marker folder that cannot be read resumes nothing", function()
+        guard.run_query = function()
+            return "ERR\tthe no-restore marker folder could not be read\r\n"
+        end
+        local pane = restore_pane(claude_pane(OTHER))
+        assert.equals("", all_sent(pane))
     end)
 end)

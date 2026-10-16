@@ -68,7 +68,16 @@ local QUERY_WORK = table.concat({
 	"if ($p) { try { $st = [string]$p.StartTime.ToFileTimeUtc() } catch { $st = '?' } }",
 	"else { $run = 0 } };",
 	"('S', $sid, $id, $ps, $run, $st, $cwd) -join $t } };",
-	"('END', $n) -join $t }",
+	"$m = 0; $md = @MARKERS@;",
+	"if (Test-Path -LiteralPath $md) {",
+	"if (-not (Test-Path -LiteralPath $md -PathType Container)) { throw 'the no-restore marker path is not a folder' };",
+	"foreach ($f in @(Get-ChildItem -LiteralPath $md -Filter '*.json' -Force)) {",
+	"$m++; $r = ''; $by = '';",
+	"try { $j = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json;",
+	"$r = [string]$j.reason; $by = [string]$j.by } catch { };",
+	"$r = $r -replace '[^ -~]', ' '; $by = $by -replace '[^ -~]', ' ';",
+	"('M', $f.BaseName, $r, $by) -join $t } };",
+	"('END', $n, $m) -join $t }",
 	"catch { ('ERR', $_.Exception.Message) -join $t }",
 }, " ")
 
@@ -92,6 +101,8 @@ local QUERY_SCRIPT = table.concat({
 --- Contract:
 ---   dirs    control-file directories. The first MUST exist; later ones are
 ---           skipped when absent.
+---   marker_dir  the no-restore marker folder (pub.marker_dir() when nil).
+---           Absent means no markers; present but unreadable is an ERR.
 ---   returns stdout (string) on success, or nil and a reason.
 ---
 --- stdout is lines of tab-separated fields:
@@ -104,8 +115,12 @@ local QUERY_SCRIPT = table.concat({
 ---       startTime is that process's start time as a FILETIME in decimal --
 ---       the same encoding Claude writes to procStart on Windows -- or ? when
 ---       it could not be read.
----   END <n>     last line; n is the number of S lines. Its absence means the
----               output is incomplete and must not be trusted.
+---   M <name> <reason> <by>
+---       one per *.json entry in the marker folder, readable or not. name is
+---       the entry's base name; reason and by are copied from the file (only
+---       printable ASCII kept), empty when it could not be parsed.
+---   END <n> <m> last line; n is the number of S lines, m of M lines. Its
+---               absence means the output is incomplete and must not be trusted.
 ---   ERR <text>  the query failed (for example the first directory is gone).
 ---
 --- Time: wezterm.run_child_process takes no timeout. The script bounds its
@@ -117,9 +132,10 @@ local QUERY_SCRIPT = table.concat({
 --- Yields (wezterm.run_child_process), so it must be called from an event or
 --- key callback, never while the config file is being evaluated.
 ---@param dirs string[]
+---@param marker_dir string|nil
 ---@return string|nil stdout
 ---@return string|nil err
-function pub.run_query(dirs)
+function pub.run_query(dirs, marker_dir)
 	if not utils.is_windows then
 		-- procStart is encoded per platform and only the Windows encoding has
 		-- been checked against real files. Unknown means "do not resume".
@@ -130,8 +146,11 @@ function pub.run_query(dirs)
 		table.insert(quoted, "'" .. dir:gsub("'", "''") .. "'")
 	end
 	local dir_list = table.concat(quoted, ", ")
+	local markers = "'" .. (marker_dir or pub.marker_dir()):gsub("'", "''") .. "'"
 	local script = QUERY_SCRIPT:gsub("@DIRS@", function()
 		return dir_list
+	end):gsub("@MARKERS@", function()
+		return markers
 	end):gsub("@LIMIT@", tostring(math.floor(pub.query_time_limit_seconds)))
 	local success, stdout, stderr = wezterm.run_child_process({
 		"powershell.exe", "-NoProfile", "-NoLogo", "-NonInteractive", "-Command", script,
@@ -142,24 +161,35 @@ function pub.run_query(dirs)
 	return stdout
 end
 
+-- The user's home folder. On Windows Claude Code keeps its files under
+-- USERPROFILE. HOME may be set as well (Git Bash, MSYS) and point somewhere
+-- else; a stray .claude\sessions there would be read as "nothing is running".
+local function home_dir()
+	if utils.is_windows then
+		return os.getenv("USERPROFILE") or os.getenv("HOME") or ""
+	end
+	return os.getenv("HOME") or ""
+end
+
 --- The directories Claude Code writes control files to: ~/.claude/sessions,
 --- and ~/.claude-alt/sessions for the claude2 multi-account setup.
 ---@return string[]
 function pub.control_dirs()
-	-- On Windows Claude Code keeps its files under USERPROFILE. HOME may be
-	-- set as well (Git Bash, MSYS) and point somewhere else; a stray
-	-- .claude\sessions there would be read as "nothing is running".
-	local home
-	if utils.is_windows then
-		home = os.getenv("USERPROFILE") or os.getenv("HOME") or ""
-	else
-		home = os.getenv("HOME") or ""
-	end
+	local home = home_dir()
 	local sep = utils.separator
 	return {
 		home .. sep .. ".claude" .. sep .. "sessions",
 		home .. sep .. ".claude-alt" .. sep .. "sessions",
 	}
+end
+
+--- The "do not restore" marker folder, ~/.wezurrect/no-restore. A file
+--- <session id>.json in it means no restore may resume that session: it was
+--- parked or hibernated on purpose. The contract is in the README.
+---@return string
+function pub.marker_dir()
+	local sep = utils.separator
+	return home_dir() .. sep .. ".wezurrect" .. sep .. "no-restore"
 end
 
 -- ---------------------------------------------------------------------------
@@ -179,18 +209,23 @@ end
 ---@param stdout string
 ---@return table[]|nil records { session_id, pid, proc_start, running, start_time, cwd }
 ---@return string|nil err
+---@return table[]|nil markers { name, reason, by }
 local function parse_query_output(stdout)
 	if type(stdout) ~= "string" then
 		return nil, "no output"
 	end
 	local records = {}
-	local declared = nil
+	local markers = {}
+	local declared, declared_markers = nil, nil
 	for line in stdout:gmatch("[^\r\n]+") do
 		local fields = split_tabs(line)
 		if fields[1] == "ERR" then
 			return nil, fields[2] or "query failed"
 		elseif fields[1] == "END" then
 			declared = tonumber(fields[2])
+			declared_markers = tonumber(fields[3])
+		elseif fields[1] == "M" then
+			table.insert(markers, { name = fields[2] or "", reason = fields[3] or "", by = fields[4] or "" })
 		elseif fields[1] == "S" then
 			table.insert(records, {
 				session_id = fields[2] or "",
@@ -203,10 +238,10 @@ local function parse_query_output(stdout)
 			})
 		end
 	end
-	if declared == nil or declared ~= #records then
+	if declared == nil or declared ~= #records or declared_markers ~= #markers then
 		return nil, "incomplete answer from the process query"
 	end
-	return records
+	return records, nil, markers
 end
 
 -- A decimal string as an integer, or nil when it is not one (or overflows).
@@ -251,12 +286,28 @@ local function is_session_id(s)
 end
 pub.is_session_id = is_session_id
 
+-- Only letters, digits and a few punctuation marks of a marker's text reach
+-- the log, at most 40 characters.
+local function marker_text(s)
+	return (tostring(s or ""):gsub("[^%w %.:_@/%-]", ""):sub(1, 40))
+end
+
 --- Turn records into a snapshot: sessions[<id>] = { state, pid }, the records
---- with their state, and .error when nothing in it may be trusted.
+--- with their state, parked[<id>] = { reason, by } for every no-restore
+--- marker, and .error when nothing in it may be trusted.
 ---@param records table[]
+---@param markers table[]|nil
 ---@return table snapshot
-local function build_snapshot(records)
-	local snapshot = { sessions = {}, records = records }
+local function build_snapshot(records, markers)
+	local snapshot = { sessions = {}, records = records, parked = {} }
+	for _, marker in ipairs(markers or {}) do
+		-- Windows file names ignore case. A name that is not a session id
+		-- cannot match one a restore would resume, so it is ignored.
+		local id = marker.name:lower():gsub("%.json$", "")
+		if is_session_id(id) then
+			snapshot.parked[id] = { reason = marker_text(marker.reason), by = marker_text(marker.by) }
+		end
+	end
 	if #records == 0 then
 		-- The folder was listed and holds no control file. Where Claude
 		-- sessions run that most likely means the wrong folder was read (a
@@ -301,6 +352,8 @@ local function error_label(err)
 		return "not supported on this system"
 	elseif err:find("control file of running process", 1, true) then
 		return "a control file is unreadable"
+	elseif err:find("marker", 1, true) then
+		return "no-restore markers unreadable"
 	end
 	return "process query failed"
 end
@@ -316,21 +369,21 @@ function pub.get_snapshot(force)
 	if not force and cached_snapshot and os.time() - cached_at < pub.snapshot_ttl_seconds then
 		return cached_snapshot
 	end
-	local records
+	local records, markers
 	local asked_at = os.time()
-	local stdout, err = pub.run_query(pub.control_dirs())
+	local stdout, err = pub.run_query(pub.control_dirs(), pub.marker_dir())
 	local took = os.time() - asked_at
 	if stdout and took > pub.query_time_limit_seconds then
 		-- Too old to act on, and a sign that something is wrong.
 		stdout, err = nil, "the process query took " .. took .. " seconds"
 	end
 	if stdout then
-		records, err = parse_query_output(stdout)
+		records, err, markers = parse_query_output(stdout)
 	end
 	if records then
-		cached_snapshot = build_snapshot(records)
+		cached_snapshot = build_snapshot(records, markers)
 	else
-		cached_snapshot = { sessions = {}, records = {}, error = err or "unknown error" }
+		cached_snapshot = { sessions = {}, records = {}, parked = {}, error = err or "unknown error" }
 	end
 	if cached_snapshot.error then
 		cached_snapshot.error_label = error_label(cached_snapshot.error)
@@ -441,12 +494,41 @@ function pub.resume_target(cmd)
 	end
 	return { session_id = session_id, line = table.concat(parts, " ") }
 end
--- Sessions this plugin has just sent a resume command for: id -> os.time().
-local claims = {}
+-- Sessions this plugin has just scheduled a resume command for. Kept in
+-- wezterm.GLOBAL, one flat key per session id holding os.time(), because a
+-- config reload starts a new Lua state and every module local is lost with
+-- it; GLOBAL lives as long as the WezTerm process and is shared by every
+-- restore in it. The module-local copy is used only if GLOBAL cannot be
+-- written.
+local CLAIM_KEY_PREFIX = "resurrect_resume_claim_"
+local local_claims = {}
+
+local function claim_time(session_id)
+	local ok, value = pcall(function()
+		return wezterm.GLOBAL[CLAIM_KEY_PREFIX .. session_id]
+	end)
+	local global_time = ok and type(value) == "number" and value or nil
+	local local_time = local_claims[session_id]
+	if global_time and local_time then
+		return math.max(global_time, local_time)
+	end
+	return global_time or local_time
+end
 
 local function recently_claimed(session_id)
-	local claimed_at = claims[session_id]
+	if type(session_id) ~= "string" then
+		return false
+	end
+	local claimed_at = claim_time(session_id)
 	return claimed_at ~= nil and os.time() - claimed_at < pub.claim_ttl_seconds
+end
+
+local function claim(session_id)
+	local now = os.time()
+	local_claims[session_id] = now
+	pcall(function()
+		wezterm.GLOBAL[CLAIM_KEY_PREFIX .. session_id] = now
+	end)
 end
 
 -- Compare working directories the way Windows does: slash direction, case and
@@ -480,13 +562,14 @@ end
 ---@param target table from resume_target
 ---@param cwd string|nil the pane's working directory
 ---@param snapshot table from get_snapshot
----@return string state "dead" (safe to resume), "live" or "unknown"
+---@return string state "dead" (safe to resume), "live", "parked" or "unknown"
 ---@return string|nil reason why it is not "dead"
 ---@return number|nil pid
 ---@return string|nil kind why, as a word: "live", "malformed" (the saved
 ---  command or directory is not usable), "reading" (the running sessions
----  could not be read), "rotated" (maybe running under a new id) or
----  "unconfirmed" (a process is there but its start time is not known)
+---  could not be read), "rotated" (maybe running under a new id),
+---  "unconfirmed" (a process is there but its start time is not known) or
+---  "parked" (a no-restore marker names it)
 function pub.inspect(target, cwd, snapshot)
 	if target.unreadable then
 		return "unknown", "the saved command is not exactly 'claude --resume <session id>', so it is not typed",
@@ -497,6 +580,13 @@ function pub.inspect(target, cwd, snapshot)
 	end
 	if snapshot.error then
 		return "unknown", "liveness unreadable (" .. snapshot.error .. ")", nil, "reading"
+	end
+	local marker = snapshot.parked and snapshot.parked[target.session_id]
+	if marker then
+		local why = marker.reason ~= "" and marker.reason or "a marker whose contents could not be read"
+		local by = marker.by ~= "" and (" by " .. marker.by) or ""
+		return "parked", "session " .. target.session_id .. " has a no-restore marker (" .. why .. by
+			.. "); wake it to resume it", nil, "parked"
 	end
 	local session = snapshot.sessions[target.session_id]
 	if not session or session.state == "dead" then
@@ -542,7 +632,7 @@ function pub.check_command(cmd, cwd)
 			reason = "already resumed in another pane by this restore",
 		}
 	end
-	claims[target.session_id] = os.time()
+	claim(target.session_id)
 	return { allow = true, target = target, state = "dead" }
 end
 -- ---------------------------------------------------------------------------
@@ -550,7 +640,7 @@ end
 -- ---------------------------------------------------------------------------
 
 local function new_tally()
-	return { resumed = 0, skipped_live = 0, skipped_unknown = 0 }
+	return { resumed = 0, skipped_live = 0, skipped_parked = 0, skipped_unknown = 0 }
 end
 
 local tally = new_tally()
@@ -592,6 +682,8 @@ end
 function pub.note_skipped(verdict, pane_id)
 	if verdict.state == "live" then
 		tally.skipped_live = tally.skipped_live + 1
+	elseif verdict.state == "parked" then
+		tally.skipped_parked = tally.skipped_parked + 1
 	else
 		tally.skipped_unknown = tally.skipped_unknown + 1
 	end
@@ -607,11 +699,15 @@ end
 local function report()
 	local done = tally
 	tally = new_tally()
-	if done.resumed + done.skipped_live + done.skipped_unknown == 0 then
+	if done.resumed + done.skipped_live + done.skipped_parked + done.skipped_unknown == 0 then
 		return
 	end
 	local message = "restore finished: " .. plural(done.resumed, "session", "sessions") .. " resumed, "
 		.. plural(done.skipped_live, "pane", "panes") .. " left alone because the session is already running"
+	if done.skipped_parked > 0 then
+		message = message .. ", " .. plural(done.skipped_parked, "pane", "panes")
+			.. " left alone because the session is parked"
+	end
 	if done.skipped_unknown > 0 then
 		message = message .. ", " .. plural(done.skipped_unknown, "pane", "panes")
 			.. " left alone as uncertain (each has its own line above saying why)"
@@ -649,7 +745,7 @@ function pub.summarize(state, get_command)
 		panes = 0, sessions = 0,
 		-- Of the sessions: will be resumed / already running / maybe running
 		-- under a new id / process there but not confirmed / unusable command.
-		resumable = 0, live = 0, rotated = 0, unconfirmed = 0, malformed = 0,
+		resumable = 0, live = 0, parked = 0, rotated = 0, unconfirmed = 0, malformed = 0,
 		-- Everything that is neither resumable nor known to be running.
 		unknown = 0,
 		error = snapshot.error, error_label = snapshot.error_label,
@@ -675,6 +771,8 @@ function pub.summarize(state, get_command)
 				summary.resumable = summary.resumable + 1
 			elseif pane_state == "live" then
 				summary.live = summary.live + 1
+			elseif pane_state == "parked" then
+				summary.parked = summary.parked + 1
 			else
 				summary.unknown = summary.unknown + 1
 				if summary[kind] then
@@ -745,6 +843,14 @@ function pub.refusal(summary)
 	if summary.resumable > 0 then
 		return nil
 	end
+	if summary.parked == summary.sessions then
+		if summary.sessions == 1 then
+			return "its session is parked - cannot restore",
+				"its one session has a no-restore marker (parked or hibernated); wake it to resume it"
+		end
+		return "all " .. summary.sessions .. " sessions parked - cannot restore",
+			"all " .. summary.sessions .. " of its sessions have no-restore markers (parked or hibernated)"
+	end
 	if summary.live == summary.sessions then
 		if summary.sessions == 1 then
 			return "its session is already running - cannot restore",
@@ -758,6 +864,10 @@ function pub.refusal(summary)
 	if summary.live > 0 then
 		table.insert(label, summary.live .. " already running")
 		table.insert(detail, summary.live .. " already running")
+	end
+	if summary.parked > 0 then
+		table.insert(label, summary.parked .. " parked")
+		table.insert(detail, count_of(summary.parked, "has", "have") .. " a no-restore marker (parked or hibernated)")
 	end
 	if summary.rotated > 0 then
 		table.insert(label, summary.rotated .. " may be running under a new id")
@@ -788,6 +898,9 @@ function pub.running_note(summary)
 	if summary.live > 0 then
 		table.insert(parts, summary.live .. " already running")
 	end
+	if summary.parked > 0 then
+		table.insert(parts, summary.parked .. " parked, left alone")
+	end
 	if summary.unknown > 0 then
 		table.insert(parts, summary.unknown .. " uncertain, left alone")
 	end
@@ -801,7 +914,24 @@ pub._test = {
 	reset = function()
 		cached_snapshot = nil
 		cached_at = nil
-		claims = {}
+		local_claims = {}
+		if type(wezterm.GLOBAL) == "table" then
+			for key in pairs(wezterm.GLOBAL) do
+				if type(key) == "string" and key:sub(1, #CLAIM_KEY_PREFIX) == CLAIM_KEY_PREFIX then
+					wezterm.GLOBAL[key] = nil
+				end
+			end
+		end
+		tally = new_tally()
+		report_generation = 0
+	end,
+
+	-- What a config reload does: a new Lua state, so every module local
+	-- starts empty; wezterm.GLOBAL is kept.
+	new_lua_state = function()
+		cached_snapshot = nil
+		cached_at = nil
+		local_claims = {}
 		tally = new_tally()
 		report_generation = 0
 	end,
