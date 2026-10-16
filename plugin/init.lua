@@ -29,6 +29,10 @@ local function init()
 	pub.process_handlers = require("resurrect.process_handlers")
 	pub.instance_manager = require("resurrect.instance_manager")
 	pub.restore_guard = require("resurrect.restore_guard")
+	pub.guard_probe = require("resurrect.guard_probe")
+	pub.guard_probe.plugin_dir = plugin_path
+	-- One log line per config evaluation: which guard and commit are loaded.
+	pub.guard_probe.announce()
 end
 
 init()
@@ -88,6 +92,12 @@ function pub.setup(config, opts)
 	if opts.restore_delay then
 		pub.tab_state.process_restore_delay_seconds = opts.restore_delay
 	end
+
+	-- A dry run of a restore, triggered by the user var resurrect_guard_probe
+	-- (tools/guard-probe.ps1). Reads and reports only.
+	wezterm.on("user-var-changed", function(_, _, name, value)
+		pub.guard_probe.on_user_var(name, value)
+	end)
 
 	-- Restore on startup: show instance selector if saved instances exist,
 	-- otherwise fall back to current_state mechanism for backward compat

@@ -8,11 +8,36 @@
 
 local sep = "\\"
 
+-- A temporary home folder for everything the guard reads or writes on disk
+-- (no-restore markers, resume claim files, the probe report): os.getenv
+-- answers USERPROFILE and HOME with it, so no spec touches the real
+-- ~/.wezurrect. Tests that replace os.getenv themselves wrap this one.
+local real_sep = package.config:sub(1, 1)
+local SPEC_HOME = (os.getenv("TEMP") or os.getenv("TMPDIR") or "/tmp") .. real_sep
+    .. "wezurrect-spec-home-" .. tostring(os.time()) .. "-" .. tostring(math.random(100000))
+local SPEC_MARKERS = SPEC_HOME .. real_sep .. ".wezurrect" .. real_sep .. "no-restore"
+local SPEC_CLAIMS = SPEC_HOME .. real_sep .. ".wezurrect" .. real_sep .. "resuming"
+for _, dir in ipairs({ SPEC_MARKERS, SPEC_CLAIMS }) do
+    os.execute((real_sep == "\\" and 'mkdir "' or 'mkdir -p "') .. dir .. '"')
+end
+local process_getenv = os.getenv
+rawset(os, "getenv", function(name)
+    if name == "USERPROFILE" or name == "HOME" then return SPEC_HOME end
+    return process_getenv(name)
+end)
+local FIXTURE_IDS = {
+    "aaaaaaaa-1111-4111-8111-111111111111", "abababab-7777-4777-8777-777777777777",
+    "bbbbbbbb-2222-4222-8222-222222222222", "cccccccc-3333-4333-8333-333333333333",
+    "dddddddd-4444-4444-8444-444444444444", "eeeeeeee-5555-4555-8555-555555555555",
+    "ffffffff-6666-4666-8666-666666666666",
+}
+
+
 -- busted shares one Lua process: drop every module and preload stub an
 -- earlier spec file left behind.
 for _, name in ipairs({
     "file_io", "utils", "state_manager", "instance_manager", "workspace_state", "window_state",
-    "tab_state", "fuzzy_loader", "process_handlers", "pane_tree", "json_text", "restore_guard",
+    "tab_state", "fuzzy_loader", "process_handlers", "pane_tree", "json_text", "restore_guard", "guard_probe",
 }) do
     package.loaded["resurrect." .. name] = nil
     package.preload["resurrect." .. name] = nil
@@ -193,8 +218,11 @@ local query_calls = 0
 
 -- Answer the guard's one OS question with these control files.
 -- Each is { session, pid, proc_start, running (bool), start_time, cwd }.
-local function control_files(files)
+-- markers: the no-restore marker files, each { file base name, reason, by };
+-- reason and by are nil for a marker whose contents could not be read.
+local function control_files(files, markers)
     if not guard_loaded then return end
+    markers = markers or {}
     guard.run_query = function()
         query_calls = query_calls + 1
         local lines = {}
@@ -203,7 +231,10 @@ local function control_files(files)
                 "S", f[1], tostring(f[2]), f[3], f[4] and "1" or "0", f[5] or "?", f[6] or "",
             }, "\t"))
         end
-        table.insert(lines, "END\t" .. #files)
+        for _, m in ipairs(markers) do
+            table.insert(lines, table.concat({ "M", m[1], m[2] or "", m[3] or "" }, "\t"))
+        end
+        table.insert(lines, "END\t" .. #files .. "\t" .. #markers)
         return table.concat(lines, "\r\n") .. "\r\n"
     end
 end
@@ -281,7 +312,12 @@ local function reset()
     spawned_windows = 0
     query_calls = 0
     wezterm_stub.GLOBAL = {}
-    if guard_loaded then guard._test.reset() end
+    if guard_loaded then
+        guard._test.reset()
+        guard.marker_dir = function() return SPEC_MARKERS end
+        guard.claim_dir = function() return SPEC_CLAIMS end
+        for _, id in ipairs(FIXTURE_IDS) do os.remove(SPEC_CLAIMS .. real_sep .. id) end
+    end
     usual_world()
 end
 
@@ -1441,12 +1477,12 @@ describe("restore guard: the reason shown for each saved copy", function()
     for _, case in ipairs({
         { "control folder not found", function() return "ERR\tcontrol directory not found\r\n" end },
         { "control folder unreadable", function() return "ERR\tAccess to the path is denied.\r\n" end },
-        { "control folder is empty", function() return "END\t0\r\n" end },
+        { "control folder is empty", function() return "END\t0\t0\r\n" end },
         { "process query failed", function() return nil, "powershell.exe failed: boom" end },
         { "process query failed", function() return "S\tgarbage\r\n" end },
         { "process query timed out", function() return "ERR\tthe process query did not finish in 10 seconds\r\n" end },
         { "not supported on this system", function() return nil, "the running-session check is only implemented on Windows" end },
-        { "a control file is unreadable", function() return "S\t\t77\t\t1\t" .. START .. "\t\r\nEND\t1\r\n" end },
+        { "a control file is unreadable", function() return "S\t\t77\t\t1\t" .. START .. "\t\r\nEND\t1\t0\r\n" end },
     }) do
         it("cannot tell what is running: " .. case[1], function()
             guard.run_query = case[2]
@@ -1541,5 +1577,713 @@ describe("restore guard: the reason shown for each saved copy", function()
         instance_manager.auto_restore_on_startup()
         rawset(io, "open", real_open)
         assert.truthy(logged("not restoring workspace default at startup: its one session is already running"))
+    end)
+end)
+-- ---------------------------------------------------------------------------
+-- Incident 2026-10-16: after every pane died, a restore brought each Claude
+-- session back twice, and brought back sessions that had been parked.
+-- ---------------------------------------------------------------------------
+
+local COPY_A = "1700000005_55555"
+local COPY_B = "1700000006_66666"
+
+-- How many times "--resume <id>" was typed, over every pane.
+local function resumes_of(session_id)
+    local text, count, from = everything_sent(), 0, 1
+    while true do
+        local at = text:find("--resume " .. session_id, from, true)
+        if not at then return count end
+        count, from = count + 1, at + 1
+    end
+end
+
+-- A saved workspace with two windows, one tab each.
+local function two_windows_of(first, second)
+    local state = workspace_of(first)
+    table.insert(state.window_states, workspace_of(second).window_states[1])
+    return state
+end
+
+-- A fresh Lua state, as after a config reload: everything the module keeps
+-- in its own locals is gone, wezterm.GLOBAL is not.
+local function new_lua_state()
+    guard._test.new_lua_state()
+end
+
+describe("incident 2026-10-16: one session resumed twice", function()
+    local existing, gui
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        existing = busy_pane()
+        gui = new_gui_window()
+    end)
+
+    it("two saved copies holding the same session, restored together, resume it once", function()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        gui:pick(COPY_A, existing)
+        gui:pick(COPY_B, existing)
+        gui:pick("__RESTORE_SELECTED__", existing)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("one saved copy with the same session in two windows resumes it once", function()
+        save_instance_file(COPY_A, two_windows_of(claude_pane(DEAD), claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a second restore seconds later, before the first wrote its control file, does not resume it again", function()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers() -- the first resume line is typed; DEAD has no control file yet
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a config reload between two restores does not forget what was resumed", function()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        new_lua_state()
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("says in the log that the second copy of the session was not resumed", function()
+        save_instance_file(COPY_A, two_windows_of(claude_pane(DEAD), claude_pane(DEAD)))
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("already resumed", 1, true), line)
+    end)
+end)
+
+describe("incident 2026-10-16: parked sessions", function()
+    local existing, gui
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        existing = busy_pane()
+        gui = new_gui_window()
+    end)
+
+    -- DEAD and OTHER are not running; DEAD has been parked.
+    local function parked_world(marker)
+        control_files({
+            { LIVE, 4242, START, true, START, "C:\\work\\live" },
+        }, { marker or { DEAD, "parked", "fleet park" } })
+    end
+
+    it("does not resume a session that has a no-restore marker", function()
+        parked_world()
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("logs which session was refused and why", function()
+        parked_world()
+        restore_pane(claude_pane(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line, "the refusal must be logged")
+        assert.truthy(line:find("parked", 1, true), line)
+        assert.truthy(line:find("fleet park", 1, true), line)
+    end)
+
+    it("a marker whose contents cannot be read still counts", function()
+        parked_world({ DEAD })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("not resuming session bbbbbbbb"))
+    end)
+
+    it("a marker named in upper case still counts", function()
+        parked_world({ DEAD:upper(), "hibernated", "horde" })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+    end)
+
+    it("a session without a marker is still resumed", function()
+        parked_world()
+        local pane = restore_pane(claude_pane(OTHER))
+        assert.truthy(all_sent(pane):find(OTHER, 1, true))
+    end)
+
+    it("once the marker is removed (Wake) the session is resumed", function()
+        control_files({ { LIVE, 4242, START, true, START, "C:\\work\\live" } })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.truthy(all_sent(pane):find(DEAD, 1, true))
+    end)
+
+    it("a saved copy whose only session is parked cannot be restored", function()
+        parked_world()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(COPY_A).label
+        assert.truthy(label:find("parked", 1, true), label)
+        assert.truthy(label:find("cannot restore", 1, true), label)
+
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(0, resumes_of(DEAD))
+        assert.equals(0, spawned_windows)
+    end)
+
+    it("a partly parked copy resumes only the sessions that are not parked", function()
+        parked_world()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD), claude_pane(OTHER)))
+        instance_manager.show_instance_selector(gui, existing, restore_opts)
+        local label = gui:choice(COPY_A).label
+        assert.truthy(label:find("1 parked", 1, true), label)
+        gui:pick(COPY_A, existing)
+        gui:pick("__RESTORE_SELECTED__", existing)
+        run_timers()
+        assert.equals(0, resumes_of(DEAD))
+        assert.equals(1, resumes_of(OTHER))
+    end)
+
+    it("a marker folder that cannot be read resumes nothing", function()
+        guard.run_query = function()
+            return "ERR\tthe no-restore marker folder could not be read\r\n"
+        end
+        local pane = restore_pane(claude_pane(OTHER))
+        assert.equals("", all_sent(pane))
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- The guard probe: a dry run that types and opens nothing
+-- ---------------------------------------------------------------------------
+
+local guard_probe = require("resurrect.guard_probe")
+local PARKED = "eeeeeeee-5555-4555-8555-555555555555"
+local PLUGIN_DIR = "X:\\plugins\\wezurrect"
+local PROBE_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+describe("guard probe", function()
+    local report_path
+
+    before_each(function()
+        reset()
+        guard_probe._test.reset()
+        instance_manager.instance_id = OWN_ID
+        guard_probe.plugin_dir = PLUGIN_DIR
+        file_store[PLUGIN_DIR .. sep .. ".git" .. sep .. "HEAD"] = PROBE_SHA .. "\n"
+        report_path = guard_probe.report_path()
+        -- LIVE runs, DEAD and PARKED do not, PARKED has a marker.
+        control_files({
+            { LIVE, 4242, START, true, START, "C:\\work\\live" },
+        }, { { PARKED, "parked", "fleet park" } })
+        save_instance_file(COPY_A, workspace_of(
+            claude_pane(LIVE, "C:\\work\\live"), claude_pane(DEAD, "C:\\work\\dead"),
+            claude_pane(PARKED, "C:\\work\\parked"), claude_pane(DEAD, "C:\\work\\dead")))
+    end)
+
+    local function probe(value)
+        guard_probe.on_user_var(guard_probe.USER_VAR, value or "newest|n0nce1")
+        return file_store[report_path]
+    end
+
+    it("lists every session with what a restore would do and why", function()
+        local report = probe()
+        assert.truthy(report, "the report file must be written")
+        assert.truthy(report:find("RESUME  " .. DEAD, 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. LIVE .. "  running: already running pid 4242", 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. PARKED .. "  parked: ", 1, true), report)
+        assert.truthy(report:find("fleet park", 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. DEAD .. "  duplicate", 1, true), report)
+        assert.truthy(report:find("4 sessions, 1 would resume, 1 refused (running), 1 refused (parked), 1 refused (duplicate)", 1, true), report)
+        assert.truthy(report:find("saved copy: " .. COPY_A, 1, true), report)
+        assert.truthy(report:find("nonce: n0nce1", 1, true))
+    end)
+
+    it("types nothing, opens nothing, claims nothing and keeps the saved copy", function()
+        probe()
+        run_timers()
+        assert.equals("", everything_sent())
+        assert.equals(0, spawned_windows)
+        assert.is_true(instance_file_exists(COPY_A))
+        -- A real restore afterwards still resumes DEAD: the probe took no claim.
+        instance_manager._test.restore_instances({ COPY_A }, new_gui_window(), busy_pane(), restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("names the guard version and the plugin commit", function()
+        local report = probe()
+        assert.truthy(report:find("guard version: " .. guard_probe.GUARD_VERSION, 1, true), report)
+        assert.truthy(report:find("plugin commit: " .. PROBE_SHA, 1, true), report)
+    end)
+
+    it("reads a commit through a branch ref", function()
+        file_store[PLUGIN_DIR .. sep .. ".git" .. sep .. "HEAD"] = "ref: refs/heads/main\n"
+        file_store[PLUGIN_DIR .. sep .. ".git" .. sep .. "refs" .. sep .. "heads" .. sep .. "main"] = PROBE_SHA .. "\n"
+        assert.equals(PROBE_SHA .. " (refs/heads/main)", guard_probe.commit())
+    end)
+
+    it("announce logs the version and commit once per config evaluation", function()
+        guard_probe.announce()
+        local line = logged("restore guard .* loaded from plugin commit")
+        assert.truthy(line and line:find(PROBE_SHA, 1, true), line)
+    end)
+
+    it("says when the copy is this terminal's own live copy", function()
+        save_instance_file(OWN_ID, workspace_of(claude_pane(LIVE, "C:\\work\\live")))
+        local report = probe(OWN_ID .. "|abc")
+        assert.truthy(report:find("this terminal's own live copy", 1, true), report)
+        assert.truthy(report:find("REFUSE  " .. LIVE .. "  running", 1, true), report)
+    end)
+
+    it("ignores other user vars and malformed requests", function()
+        guard_probe.on_user_var("something_else", "newest|abc")
+        guard_probe.on_user_var(guard_probe.USER_VAR, "newest")
+        guard_probe.on_user_var(guard_probe.USER_VAR, "..\\evil|abc")
+        guard_probe.on_user_var(guard_probe.USER_VAR, "newest|" .. string.rep("a", 33))
+        assert.is_nil(file_store[report_path])
+    end)
+
+    it("ignores a second request within a few seconds", function()
+        probe("newest|first")
+        probe("newest|second")
+        assert.truthy(file_store[report_path]:find("nonce: first", 1, true))
+    end)
+
+    it("reports liveness that cannot be read, and resumes nothing in the list", function()
+        control_dir_unreadable()
+        local report = probe()
+        assert.truthy(report:find("liveness: UNREADABLE", 1, true), report)
+        assert.falsy(report:find("RESUME", 1, true), report)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- PR 26 review: a claim holds while its pane lives; a marker written while
+-- the resume line waits to be typed still stops it.
+-- ---------------------------------------------------------------------------
+
+local function write_marker(session_id, text)
+    local f = assert(io.open(SPEC_MARKERS .. real_sep .. session_id .. ".json", "w"))
+    f:write(text or '{"v":1}')
+    f:close()
+end
+
+-- os.remove is replaced (and not put back) by instance_manager_spec, which
+-- busted may have run first in this process; delete through the shell.
+local function remove_marker(session_id)
+    local path = SPEC_MARKERS .. real_sep .. session_id .. ".json"
+    if real_sep == "\\" then
+        os.execute('if exist "' .. path .. '" del /q "' .. path .. '"')
+    else
+        os.execute('rm -f "' .. path .. '"')
+    end
+end
+
+-- The pane a session's resume line was typed into.
+local function pane_resuming(session_id)
+    for _, pane in pairs(panes) do
+        if all_sent(pane):find("--resume " .. session_id, 1, true) then return pane end
+    end
+    return nil
+end
+
+describe("PR 26 review: a claim holds while its pane lives", function()
+    local real_time = os.time
+    local now
+    local existing, gui
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+    end)
+    after_each(function() rawset(os, "time", real_time) end)
+
+    it("a slow resume that has not written its control file after the TTL is not resumed again", function()
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        now = now + guard.claim_ttl_seconds + 60 -- still no control file for DEAD
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("the pane rule holds across a config reload", function()
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        now = now + guard.claim_ttl_seconds + 60
+        guard._test.new_lua_state()
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("once that pane is closed and the TTL is over, the session can be resumed again", function()
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        local first = pane_resuming(DEAD)
+        assert.truthy(first)
+        panes[first.id] = nil -- the pane was closed
+        now = now + guard.claim_ttl_seconds + 60
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        -- The closed pane is gone from the mux, so only the new one counts.
+        assert.equals(1, resumes_of(DEAD))
+        assert.are_not.equal(first, pane_resuming(DEAD))
+    end)
+end)
+
+describe("PR 26 review: the marker is checked again just before typing", function()
+    before_each(function()
+        reset()
+        remove_marker(DEAD)
+    end)
+    after_each(function() remove_marker(DEAD) end)
+
+    it("a marker written while the resume line waits stops it", function()
+        local tree = claude_pane(DEAD)
+        tree.pane = new_pane()
+        tab_state.default_on_pane_restore(tree)
+        write_marker(DEAD)
+        run_timers()
+        assert.equals("", all_sent(tree.pane))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("no-restore marker", 1, true), line)
+    end)
+
+    it("an unreadable marker written meanwhile stops it too", function()
+        local tree = claude_pane(DEAD)
+        tree.pane = new_pane()
+        tab_state.default_on_pane_restore(tree)
+        write_marker(DEAD, "not json {")
+        run_timers()
+        assert.equals("", all_sent(tree.pane))
+    end)
+
+    it("without a marker the line is typed", function()
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.truthy(all_sent(pane):find(DEAD, 1, true))
+    end)
+end)
+
+describe("PR 26 review: error labels", function()
+    before_each(reset)
+
+    it("an unreadable marker folder is labelled as such", function()
+        guard.run_query = function()
+            return "ERR\tno-restore marker folder unreadable: Access to the path 'X' is denied.\r\n"
+        end
+        local summary = guard.summarize(workspace_of(claude_pane(DEAD)), function(tree)
+            return tab_state.get_pane_restore_command(tree, true)
+        end)
+        assert.equals("no-restore markers unreadable", summary.error_label)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- Two WezTerm processes: wezterm.GLOBAL is per process, the claim files in
+-- ~/.wezurrect/resuming are shared.
+-- ---------------------------------------------------------------------------
+
+local function claim_file_text(session_id)
+    local f = io.open(SPEC_CLAIMS .. real_sep .. session_id, "rb")
+    if not f then return nil end
+    local text = f:read("a")
+    f:close()
+    return text
+end
+
+describe("two WezTerm processes sharing the claim folder", function()
+    local real_time = os.time
+    local now
+    local global_a, global_b
+    local gui, existing
+
+    -- Switch the stub to one process: its own GLOBAL and a fresh Lua state.
+    local function as_process(global)
+        wezterm_stub.GLOBAL = global
+        guard._test.new_lua_state()
+    end
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        global_a, global_b = {}, {}
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        as_process(global_a)
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD), "process A resumes it")
+        assert.truthy(claim_file_text(DEAD), "process A holds the claim file")
+    end)
+    after_each(function() rawset(os, "time", real_time) end)
+
+    it("the second process does not resume a session the first is resuming", function()
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("another WezTerm process is resuming it", 1, true), line)
+    end)
+
+    it("the owner keeps its claim fresh while the pane is open, beyond the TTL", function()
+        now = now + 100
+        run_timers() -- process A's heartbeat
+        now = now + 100 -- 200 s after the claim, 100 s after the heartbeat
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a stale claim (owner gone, TTL over) is taken over, and that is logged", function()
+        now = now + guard.claim_ttl_seconds + 60 -- process A died: no heartbeat
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        assert.truthy(logged("taking over the stale resume claim on session bbbbbbbb"))
+        run_timers()
+        assert.equals(2, resumes_of(DEAD))
+    end)
+
+    it("the owner deletes its claim file once the pane is closed and the TTL is over", function()
+        for id, pane in pairs(panes) do
+            if all_sent(pane):find(DEAD, 1, true) then panes[id] = nil end
+        end
+        now = now + guard.claim_ttl_seconds + 10
+        run_timers() -- process A's heartbeat
+        assert.is_nil(claim_file_text(DEAD))
+        log = {}
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD), "resumed again (A's pane is gone)")
+        assert.falsy(logged("taking over"))
+    end)
+
+    it("an unreadable claim file is never taken over", function()
+        local f = assert(io.open(SPEC_CLAIMS .. real_sep .. DEAD, "wb"))
+        f:write("not json {")
+        f:close()
+        now = now + guard.claim_ttl_seconds + 60
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("cannot be read", 1, true), line)
+    end)
+
+    it("the dry run reports a session another process is resuming", function()
+        as_process(global_b)
+        local entries = guard_probe.verdicts(workspace_of(claude_pane(DEAD)), function(tree)
+            return tab_state.get_pane_restore_command(tree, true)
+        end, guard.get_snapshot(true))
+        assert.is_nil(entries[1].resume)
+        assert.truthy(entries[1].detail:find("another WezTerm process", 1, true), entries[1].detail)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- PR 26 re-review: the heartbeat survives a config reload; an empty claim
+-- file does not block a session forever.
+-- ---------------------------------------------------------------------------
+
+local COPY_C = "1700000007_77777"
+
+local function claim_file_json(session_id)
+    local text = claim_file_text(session_id)
+    return text and json.decode(text) or nil
+end
+
+describe("claim files across a config reload and a crash", function()
+    local real_time = os.time
+    local now
+    local global_a, global_b
+    local gui, existing
+
+    local function as_process(global)
+        wezterm_stub.GLOBAL = global
+        guard._test.new_lua_state()
+    end
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        global_a, global_b = {}, {}
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_C, workspace_of(claude_pane(DEAD)))
+        as_process(global_a)
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+    end)
+    after_each(function()
+        rawset(os, "time", real_time)
+        package.loaded["resurrect.restore_guard"] = guard
+    end)
+
+    it("a config reload with held claims keeps the heartbeat running and the files fresh", function()
+        -- The reload: WezTerm drops every call_after scheduled before it and
+        -- evaluates the config, so the module loads again in a new Lua state.
+        timers = {}
+        package.loaded["resurrect.restore_guard"] = nil
+        local reloaded = require("resurrect.restore_guard")
+        reloaded.claim_dir = function() return SPEC_CLAIMS end
+        assert.is_true(#timers > 0, "loading the module with held claims must schedule the heartbeat")
+
+        now = now + guard.claim_ttl_seconds + 10 -- past the TTL; the pane is still open
+        run_timers()
+        assert.equals(now, claim_file_json(DEAD).at, "the heartbeat refreshed the claim file")
+
+        now = now + 100 -- the refresh is 100 s old: still held
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+    end)
+
+    it("a module load with no held claims schedules nothing", function()
+        wezterm_stub.GLOBAL = {}
+        timers = {}
+        package.loaded["resurrect.restore_guard"] = nil
+        require("resurrect.restore_guard")
+        assert.equals(0, #timers)
+    end)
+
+    it("an empty claim file (a crash mid-write) is refused, then taken over once the TTL has passed", function()
+        local f = assert(io.open(SPEC_CLAIMS .. real_sep .. DEAD, "wb"))
+        f:close()
+        as_process(global_b)
+        instance_manager._test.restore_instances({ COPY_B }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD))
+        local line = logged("not resuming session bbbbbbbb")
+        assert.truthy(line and line:find("empty", 1, true), line)
+
+        now = now + guard.claim_ttl_seconds + 1
+        instance_manager._test.restore_instances({ COPY_C }, gui, existing, restore_opts)
+        assert.truthy(logged("taking over the empty resume claim on session bbbbbbbb"))
+        run_timers()
+        assert.equals(2, resumes_of(DEAD))
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- PR 26 focused check: an empty-file stamp never outlives a non-empty read,
+-- and the heartbeat never leaves a claim file empty or short.
+-- ---------------------------------------------------------------------------
+
+describe("claim files: no takeover of a live claim through an empty read", function()
+    local real_time = os.time
+    local real_open = io.open
+    local now
+    local global_a, global_b
+    local gui, existing
+
+    local function as_process(global)
+        wezterm_stub.GLOBAL = global
+        guard._test.new_lua_state()
+    end
+
+    local function write_claim_raw(text)
+        local f = assert(real_open(SPEC_CLAIMS .. real_sep .. DEAD, "wb"))
+        f:write(text)
+        f:close()
+    end
+
+    before_each(function()
+        reset()
+        now = real_time()
+        rawset(os, "time", function() return now end)
+        instance_manager.instance_id = OWN_ID
+        global_a, global_b = {}, {}
+        existing = busy_pane()
+        gui = new_gui_window()
+        save_instance_file(COPY_A, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_B, workspace_of(claude_pane(DEAD)))
+        save_instance_file(COPY_C, workspace_of(claude_pane(DEAD)))
+        as_process(global_a)
+        instance_manager._test.restore_instances({ COPY_A }, gui, existing, restore_opts)
+        run_timers()
+    end)
+    after_each(function()
+        rawset(os, "time", real_time)
+        rawset(io, "open", real_open)
+    end)
+
+    it("an empty read, a non-empty read, then an empty read past the TTL does not take over", function()
+        local live = claim_file_text(DEAD) -- process A's claim, held
+        as_process(global_b)
+        write_claim_raw("") -- B catches A's file empty once
+        assert.truthy(guard.foreign_claim(DEAD):find("empty", 1, true))
+        write_claim_raw(live) -- A's file is whole again; B reads it
+        now = now + 10
+        assert.truthy(guard.foreign_claim(DEAD):find("another WezTerm process", 1, true))
+        now = now + guard.claim_ttl_seconds + 1
+        write_claim_raw("") -- and catches it empty once more, long after the first time
+        instance_manager._test.restore_instances({ COPY_C }, gui, existing, restore_opts)
+        run_timers()
+        assert.equals(1, resumes_of(DEAD), "a live claim must not be taken over")
+        assert.falsy(logged("taking over the empty resume claim"))
+    end)
+
+    it("the heartbeat never truncates a claim file and keeps its length", function()
+        local path = SPEC_CLAIMS .. real_sep .. DEAD
+        local before = #claim_file_text(DEAD)
+        local modes = {}
+        rawset(io, "open", function(p, mode)
+            if p == path then table.insert(modes, mode or "r") end
+            return real_open(p, mode)
+        end)
+        now = now + 30
+        run_timers() -- process A's heartbeat
+        rawset(io, "open", real_open)
+        for _, mode in ipairs(modes) do
+            assert.falsy(mode:find("w", 1, true), "opened the claim file with mode " .. mode)
+        end
+        assert.equals(before, #claim_file_text(DEAD))
+        assert.equals(now, json.decode(claim_file_text(DEAD)).at, "the heartbeat refreshed it")
+    end)
+
+    it("the heartbeat recreates a claim file of the wrong length through a rename", function()
+        local text = claim_file_text(DEAD)
+        write_claim_raw((text:gsub("%s+$", ""))) -- an old, unpadded record
+        now = now + 30
+        run_timers()
+        assert.equals(#text, #claim_file_text(DEAD))
+        assert.equals(now, json.decode(claim_file_text(DEAD)).at)
+    end)
+end)
+
+-- busted runs every spec file in one process: put the environment back.
+describe("restore guard spec cleanup", function()
+    it("puts os.getenv back and deletes the temporary home", function()
+        rawset(os, "getenv", process_getenv)
+        assert.equals(process_getenv, os.getenv)
+        os.execute(real_sep == "\\" and ('rmdir /s /q "' .. SPEC_HOME .. '"') or ('rm -rf "' .. SPEC_HOME .. '"'))
     end)
 end)

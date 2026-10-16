@@ -556,6 +556,87 @@ for _, event in ipairs(resurrect_event_listeners) do
 end
 ```
 
+## Claude sessions a restore will not resume
+
+A restore types `claude --resume <session id>` only after
+`restore_guard.lua` has cleared it. It is never typed when:
+
+- the session is already running (a control file in `~/.claude/sessions`
+  names it, its pid runs, and the process start time matches), or whether it
+  runs cannot be established;
+- a restore already resumed or scheduled the same session, and its claim
+  still holds: for two minutes, and for as long as the pane it was typed into
+  is open. Inside one WezTerm process the claim lives in `wezterm.GLOBAL`, so
+  a config reload does not forget it; across WezTerm processes it is a claim
+  file (below). Two saved copies, or two windows of one copy, or two GUI
+  processes, holding the same session resume it once. (A pane still open
+  after its Claude exited keeps the claim: resume that one by hand);
+- the session has a "do not restore" marker (below).
+
+Every refusal is logged (`resurrect: not resuming session ...`) with the
+reason, and the restore ends with a summary toast.
+
+### The "do not restore" marker contract
+
+A session that was put away on purpose (parked, hibernated) must not come
+back when a saved copy that still holds it is restored. Any tool that puts a
+session away writes a marker; any tool that brings it back removes it first.
+
+- Folder: `%USERPROFILE%\.wezurrect\no-restore\` (`$HOME/.wezurrect/no-restore/`
+  elsewhere). Create it if it does not exist.
+- File: `<session-uuid>.json`, the session id in lower case.
+- Contents (JSON, ASCII):
+
+  ```json
+  {"v": 1, "sessionId": "<session-uuid>", "by": "<tool>", "reason": "parked", "at": "2026-10-16T12:00:00Z"}
+  ```
+
+  `reason` is `"parked"` or `"hibernated"`. `by` names the tool that wrote
+  it (for example `fleet park`, `horde hibernate`). `at` is an ISO 8601 UTC
+  time.
+- Rule: a restore refuses every session whose marker file EXISTS. The
+  contents are only used for the log line. A marker that cannot be read or
+  parsed, a file name in upper case, or a folder named `<session-uuid>.json`
+  all still count as present. If the marker folder itself exists but cannot
+  be listed, the restore resumes no Claude session at all.
+- Writers (park, hibernate): write the marker BEFORE the session's process
+  is stopped, so no restore can slip in between. Write it whole (write to a
+  temporary name in the same folder, then rename).
+- Wake: delete the marker, THEN resume the session. A wake that fails after
+  deleting it should write it back.
+- Markers are read afresh at the start of every restore, by the same single
+  PowerShell query that reads the control files, and once more just before
+  each resume line is typed.
+
+Nothing writes markers yet: this section is the contract the fleet's park
+verb, Horde's hibernate and Wake are to follow.
+
+### Resume claims across WezTerm processes
+
+- Folder: `%USERPROFILE%\.wezurrect\resuming\`; file: `<session-uuid>` (no
+  extension), JSON `{"v": 1, "sessionId", "owner", "pane", "at"}` where `at`
+  is seconds since the epoch.
+- A claim is created only if absent: written under a temporary name, then
+  renamed onto `<session-uuid>`; on Windows that rename fails when the file
+  exists, so one process wins.
+- The owner rewrites `at` every 30 seconds while the claim holds (two minutes
+  or its pane open, whichever is longer) and deletes the file after.
+- A file whose `at` is more than two minutes old is stale (owner gone) and is
+  taken over by the next restore, which logs it. A file that cannot be read is
+  never taken over: the session is refused until the file is deleted.
+- A config reload drops WezTerm's pending timers; the plugin restarts the
+  heartbeat whenever it loads with claims held.
+- An EMPTY claim file (the in-place heartbeat rewrite was cut short) is
+  refused at first and taken over, with a log line, once it has stayed empty
+  for two minutes as seen by the process that finds it.
+- Limits: a GUI frozen for over two minutes stops refreshing its claims, and
+  a mux pane that outlives its GUI is not seen by anyone; either can lose its
+  claim. The control-file check (is the session running?) still runs first,
+  so this matters only before the resumed Claude has written its control
+  file.
+- Wake can use the same file to keep a restore from racing it: create it the
+  same way before resuming, delete it once the session has its control file.
+
 ## State files
 
 State files are json files, which will be decoded into lua tables.
