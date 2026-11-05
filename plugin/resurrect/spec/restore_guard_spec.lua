@@ -220,9 +220,12 @@ local query_calls = 0
 -- Each is { session, pid, proc_start, running (bool), start_time, cwd, file_time }.
 -- markers: the no-restore marker files, each { file base name, reason, by };
 -- reason and by are nil for a marker whose contents could not be read.
-local function control_files(files, markers)
+-- resuming: live claude processes whose command line has --resume <id>, each
+-- { session id, pid }.
+local function control_files(files, markers, resuming)
     if not guard_loaded then return end
     markers = markers or {}
+    resuming = resuming or {}
     guard.run_query = function()
         query_calls = query_calls + 1
         local lines = {}
@@ -234,7 +237,10 @@ local function control_files(files, markers)
         for _, m in ipairs(markers) do
             table.insert(lines, table.concat({ "M", m[1], m[2] or "", m[3] or "" }, "\t"))
         end
-        table.insert(lines, "END\t" .. #files .. "\t" .. #markers)
+        for _, p in ipairs(resuming) do
+            table.insert(lines, table.concat({ "P", p[1], tostring(p[2]) }, "\t"))
+        end
+        table.insert(lines, "END\t" .. #files .. "\t" .. #markers .. "\t" .. #resuming)
         return table.concat(lines, "\r\n") .. "\r\n"
     end
 end
@@ -1193,60 +1199,163 @@ describe("restore guard: the control folder", function()
     end)
 end)
 -- ---------------------------------------------------------------------------
--- A session whose id has changed since the copy was saved
+-- An unrelated running session in the same folder is not evidence
 -- ---------------------------------------------------------------------------
 
-describe("restore guard: a running session in the same directory", function()
+describe("restore guard: a running session in the same folder", function()
     before_each(reset)
 
-    -- Claude can give a conversation a new id (compaction, /resume). A saved
-    -- copy then holds the old id, which has no control file. The only trace
-    -- is that a running session sits in the same directory.
+    -- The guard used to refuse a saved id with no control file whenever any
+    -- session ran in that folder, as "maybe the same conversation under a new
+    -- id". Nearly all of one user's sessions share a folder, so that refused
+    -- 13 of 18 panes on 2026-11-05. Ids were never seen to change that way.
     for _, saved_cwd in ipairs({ "C:\\work\\live", "c:/WORK/Live/", "C:\\work\\live\\", "/C:/work/live" }) do
-        it("does not resume an id with no control file when a session runs in " .. saved_cwd, function()
+        it("resumes an id with no control file when another session runs in " .. saved_cwd, function()
             local pane = restore_pane(claude_pane(OTHER, saved_cwd))
-            assert.equals("", all_sent(pane))
-            local line = logged("not resuming session dddddddd")
-            assert.truthy(line and line:find("same folder", 1, true), line)
-            assert.truthy(line:find("pid 4242", 1, true), line)
+            assert.truthy(all_sent(pane):find("claude --resume " .. OTHER, 1, true))
+            assert.falsy(logged("not resuming session dddddddd"))
         end)
     end
 
-    it("resumes it when the running sessions are in other directories", function()
-        local pane = restore_pane(claude_pane(OTHER, "C:\\work\\livelier"))
-        assert.truthy(all_sent(pane):find(OTHER, 1, true))
-    end)
-
-    it("does not resume when the pane has no directory and a session is running", function()
+    it("resumes it when the pane has no directory and a session is running", function()
         local tree = claude_pane(OTHER)
         tree.cwd = nil
         tree.process.cwd = nil
         local pane = restore_pane(tree)
-        assert.equals("", all_sent(pane))
+        assert.truthy(all_sent(pane):find(OTHER, 1, true))
     end)
 
-    it("a session this restore resumed does not block the next pane of the same directory", function()
-        local first = restore_pane(claude_pane(DEAD, "C:\\work\\shared"))
-        assert.truthy(all_sent(first):find(DEAD, 1, true))
-        -- DEAD has started and written its control file; the reading is renewed.
-        control_files({ { DEAD, 9090, START, true, START, "C:\\work\\shared" } })
-        guard.get_snapshot(true)
-        local second = restore_pane(claude_pane(OTHER, "C:\\work\\shared"))
-        assert.truthy(all_sent(second):find(OTHER, 1, true))
+    it("one record of unknown state refuses that id only, not its whole folder", function()
+        local shared = "C:\\work\\shared"
+        control_files({ { LIVE, 4242, START, true, "?", shared } })
+        assert.equals("", all_sent(restore_pane(claude_pane(LIVE, shared))))
+        for _, id in ipairs({ DEAD, REUSED, OTHER }) do
+            assert.truthy(all_sent(restore_pane(claude_pane(id, shared))):find(id, 1, true), id)
+        end
     end)
 
-    it("a saved copy holding only such ids cannot be restored", function()
+    it("a saved copy holding only such ids can be restored", function()
         instance_manager.instance_id = OWN_ID
         save_instance_file(MIXED_ID, workspace_of(claude_pane(OTHER, "C:\\work\\live")))
         local existing = busy_pane()
         local gui = new_gui_window()
         instance_manager.show_instance_selector(gui, existing, restore_opts)
-        assert.truthy(gui:choice(MIXED_ID).label:find("may be running under a new id", 1, true))
+        assert.truthy(gui:choice(MIXED_ID).label:find("^%[ %]"), gui:choice(MIXED_ID).label)
+        assert.falsy(gui:choice(MIXED_ID).label:find("new id", 1, true))
         instance_manager._test.restore_instances({ MIXED_ID }, gui, existing, restore_opts)
         run_timers()
-        assert.equals(0, spawned_windows)
-        assert.equals("", everything_sent())
+        run_timers()
+        assert.equals(1, spawned_windows)
+        assert.truthy(everything_sent():find(OTHER, 1, true))
     end)
+
+    it("still resumes two panes that hold one id only once", function()
+        local first = restore_pane(claude_pane(OTHER, "C:\\work\\live"))
+        local second = restore_pane(claude_pane(OTHER, "C:\\work\\live"))
+        assert.truthy(all_sent(first):find(OTHER, 1, true))
+        assert.equals("", all_sent(second))
+    end)
+
+    it("still refuses a parked session", function()
+        control_files({ { LIVE, 4242, START, true, START, "C:\\work\\live" } },
+            { { OTHER, "parked", "fleet park" } })
+        local pane = restore_pane(claude_pane(OTHER, "C:\\work\\live"))
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("not resuming session dddddddd.*no%-restore marker"))
+    end)
+
+    it("still refuses a live control file", function()
+        local pane = restore_pane(claude_pane(LIVE, "C:\\work\\live"))
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("not resuming session aaaaaaaa.*already running pid 4242"))
+    end)
+end)
+-- ---------------------------------------------------------------------------
+-- A saved id named on a live claude command line
+-- ---------------------------------------------------------------------------
+
+describe("restore guard: a session named on a live command line", function()
+    before_each(reset)
+
+    -- Measured on 2026-11-05: pid 13132 (claude --resume 99e10737-...) had no
+    -- control file, so the control files alone read it as not running.
+    it("reads live with no control file, and says which pid", function()
+        control_files({ { LIVE, 4242, START, true, START } }, nil, { { OTHER, 13132 } })
+        local pane = restore_pane(claude_pane(OTHER))
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("not resuming session dddddddd.*already running pid 13132"))
+    end)
+
+    it("reads live when its control file reads dead", function()
+        control_files({ { DEAD, 5151, START, false, "?" } }, nil, { { DEAD, 13132 } })
+        assert.equals("", all_sent(restore_pane(claude_pane(DEAD))))
+        assert.truthy(logged("not resuming session bbbbbbbb.*already running pid 13132"))
+    end)
+
+    it("reads live when its control file reads unknown", function()
+        control_files({ { OTHER, 7171, START, true, "?" } }, nil, { { OTHER, 13132 } })
+        assert.equals("", all_sent(restore_pane(claude_pane(OTHER))))
+        assert.truthy(logged("not resuming session dddddddd.*already running pid 13132"))
+    end)
+
+    it("keeps the pid of a live control file", function()
+        control_files({ { LIVE, 4242, START, true, START } }, nil, { { LIVE, 4242 } })
+        assert.equals("", all_sent(restore_pane(claude_pane(LIVE))))
+        assert.truthy(logged("not resuming session aaaaaaaa.*already running pid 4242"))
+    end)
+
+    it("a process naming a different id does not count", function()
+        control_files({ { LIVE, 4242, START, true, START } }, nil, { { DEAD, 13132 } })
+        local pane = restore_pane(claude_pane(OTHER))
+        assert.truthy(all_sent(pane):find(OTHER, 1, true))
+    end)
+
+    it("a parked session stays parked, not live", function()
+        control_files({ { LIVE, 4242, START, true, START } }, { { OTHER, "parked", "fleet park" } },
+            { { OTHER, 13132 } })
+        assert.equals("", all_sent(restore_pane(claude_pane(OTHER))))
+        assert.truthy(logged("not resuming session dddddddd.*no%-restore marker"))
+    end)
+
+    it("the selector counts it as already running", function()
+        instance_manager.instance_id = OWN_ID
+        control_files({ { LIVE, 4242, START, true, START } }, nil, { { OTHER, 13132 } })
+        save_instance_file(MIXED_ID, workspace_of(claude_pane(OTHER)))
+        local gui = new_gui_window()
+        instance_manager.show_instance_selector(gui, busy_pane(), restore_opts)
+        assert.truthy(gui:choice(MIXED_ID).label:find("its session is already running", 1, true),
+            gui:choice(MIXED_ID).label)
+    end)
+
+    it("a command-line process does not make an empty control folder trustworthy", function()
+        control_files({}, nil, { { OTHER, 13132 } })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.equals("", all_sent(pane))
+        assert.truthy(logged("no control files"))
+    end)
+
+    -- The process list is parsed strictly: any doubt about it is an error for
+    -- the whole answer, the same as for the marker folder.
+    local S_LINE = "S\t" .. LIVE .. "\t4242\t" .. START .. "\t1\t" .. START .. "\tC:\\work\r\n"
+    for name, answer in pairs({
+        ["P lines fewer than END declares"] = S_LINE .. "P\t" .. OTHER .. "\t13132\r\nEND\t1\t0\t2\r\n",
+        ["P lines more than END declares"] = S_LINE .. "P\t" .. OTHER .. "\t13132\r\nEND\t1\t0\t0\r\n",
+        ["an END with no process count"] = S_LINE .. "END\t1\t0\r\n",
+        ["no END at all"] = S_LINE .. "P\t" .. OTHER .. "\t13132\r\n",
+        ["a P line whose id is not a session id"] = S_LINE .. "P\tnot-an-id\t13132\r\nEND\t1\t0\t1\r\n",
+        ["a P line whose id is upper case"] = S_LINE .. "P\t" .. OTHER:upper() .. "\t13132\r\nEND\t1\t0\t1\r\n",
+        ["a P line with no pid"] = S_LINE .. "P\t" .. OTHER .. "\r\nEND\t1\t0\t1\r\n",
+        ["a P line whose pid is not a number"] = S_LINE .. "P\t" .. OTHER .. "\tx\r\nEND\t1\t0\t1\r\n",
+        ["the process query reporting failure"] = "ERR\tprocess list unreadable: boom\r\n",
+    }) do
+        it("resumes nothing on " .. name, function()
+            guard.run_query = function() return answer end
+            local pane = restore_pane(claude_pane(DEAD))
+            assert.equals("", all_sent(pane))
+            local snapshot = guard.get_snapshot(true)
+            assert.truthy(snapshot.error, "the whole answer must be an error")
+        end)
+    end
 end)
 -- ---------------------------------------------------------------------------
 -- Browse named saves
@@ -1474,8 +1583,8 @@ describe("restore guard: the reason shown for each saved copy", function()
         return logged("cannot be selected") or ""
     end
 
-    local ROTATED = "eeeeeeee-5555-4555-8555-555555555555"
-    local ROTATED2 = "ffffffff-6666-4666-8666-666666666666"
+    -- No control file, saved in folder A where LIVE runs. Nothing says it is running.
+    local NEIGHBOUR = "eeeeeeee-5555-4555-8555-555555555555"
 
     before_each(function()
         reset()
@@ -1510,12 +1619,16 @@ describe("restore guard: the reason shown for each saved copy", function()
     for _, case in ipairs({
         { "control folder not found", function() return "ERR\tcontrol directory not found\r\n" end },
         { "control folder unreadable", function() return "ERR\tAccess to the path is denied.\r\n" end },
-        { "control folder is empty", function() return "END\t0\t0\r\n" end },
+        { "control folder is empty", function() return "END\t0\t0\t0\r\n" end },
+        { "process list unreadable", function() return "ERR\tprocess list unreadable: Access denied\r\n" end },
+        { "process list unreadable", function()
+            return "S\t" .. LIVE .. "\t4242\t" .. START .. "\t1\t" .. START .. "\t\r\nP\tnot-an-id\t1\r\nEND\t1\t0\t1\r\n"
+        end },
         { "process query failed", function() return nil, "powershell.exe failed: boom" end },
         { "process query failed", function() return "S\tgarbage\r\n" end },
         { "process query timed out", function() return "ERR\tthe process query did not finish in 10 seconds\r\n" end },
         { "not supported on this system", function() return nil, "the running-session check is only implemented on Windows" end },
-        { "a control file is unreadable", function() return "S\t\t77\t\t1\t" .. START .. "\t\r\nEND\t1\t0\r\n" end },
+        { "a control file is unreadable", function() return "S\t\t77\t\t1\t" .. START .. "\t\r\nEND\t1\t0\t0\r\n" end },
     }) do
         it("cannot tell what is running: " .. case[1], function()
             guard.run_query = case[2]
@@ -1526,16 +1639,10 @@ describe("restore guard: the reason shown for each saved copy", function()
         end)
     end
 
-    it("sessions that may be running under a new id, none resumable", function()
-        local reason, label = reason_for(claude_pane(ROTATED, A), claude_pane(ROTATED2, "c:/work/A/"), claude_pane(LIVE, A))
-        assert.equals(
-            "nothing to resume: 1 already running, 2 may be running under a new id - cannot restore",
-            reason
-        )
-        assert.truthy(label:find("^%[%-%]"))
-        local line = log_when_picked()
-        assert.truthy(line:find("share a working folder with a running session", 1, true), line)
-        assert.truthy(line:find("resume those by hand", 1, true), line)
+    it("a session in the folder of a running one is counted as resumable", function()
+        local reason, label = reason_for(claude_pane(NEIGHBOUR, A), claude_pane(LIVE, A))
+        assert.equals("resumes 1; 1 already running", reason)
+        assert.truthy(label:find("^%[ %]"), "it can be selected")
     end)
 
     it("a session whose process could not be checked, none resumable", function()
@@ -1556,9 +1663,9 @@ describe("restore guard: the reason shown for each saved copy", function()
     it("a partly restorable copy says what will be resumed, what runs and what is uncertain", function()
         local reason, label = reason_for(
             claude_pane(DEAD, C), claude_pane("abababab-7777-4777-8777-777777777777", "C:\\work\\d"),
-            claude_pane(LIVE, A), claude_pane(ROTATED, A), claude_pane(OTHER, B)
+            claude_pane(LIVE, A), claude_pane(NEIGHBOUR, A), claude_pane(OTHER, B)
         )
-        assert.equals("resumes 2; 1 already running; 2 uncertain, left alone", reason)
+        assert.equals("resumes 3; 1 already running; 1 uncertain, left alone", reason)
         assert.truthy(label:find("^%[ %]"), "it can be selected")
     end)
 
@@ -1573,26 +1680,26 @@ describe("restore guard: the reason shown for each saved copy", function()
     end)
 
     it("restoring a partly restorable copy resumes the certain ones and logs why each other was left", function()
-        reason_for(claude_pane(DEAD, C), claude_pane(LIVE, A), claude_pane(ROTATED, A))
+        reason_for(claude_pane(DEAD, C), claude_pane(LIVE, A), claude_pane(OTHER, B))
         gui:pick(COPY, existing)
         gui:pick("__RESTORE_SELECTED__", existing)
         run_timers()
         run_timers()
         assert.truthy(everything_sent():find(DEAD, 1, true))
         assert.falsy(everything_sent():find(LIVE, 1, true))
-        assert.falsy(everything_sent():find(ROTATED, 1, true))
+        assert.falsy(everything_sent():find(OTHER, 1, true))
         assert.truthy(logged("not resuming session aaaaaaaa.*already running pid 4242"))
-        assert.truthy(logged("not resuming session eeeeeeee.*same folder as running pid 4242.*resume it by hand"))
+        assert.truthy(logged("not resuming session dddddddd.*start time could not be confirmed"))
         assert.truthy(logged("1 session resumed, 1 pane left alone because the session is already running, "
             .. "1 pane left alone as uncertain"))
     end)
 
     it("restore_instances gives the same plain reason when asked to restore a refused copy", function()
-        reason_for(claude_pane(ROTATED, A))
+        reason_for(claude_pane(OTHER, B))
         log = {}
         instance_manager._test.restore_instances({ COPY }, gui, existing, restore_opts)
         local line = logged("refusing to restore instance " .. COPY)
-        assert.truthy(line and line:find("share a working folder with a running session", 1, true), line)
+        assert.truthy(line and line:find("start time could not be confirmed", 1, true), line)
         assert.equals(0, spawned_windows)
     end)
 

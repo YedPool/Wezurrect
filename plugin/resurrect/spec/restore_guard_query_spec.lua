@@ -153,6 +153,107 @@ describe_windows("restore guard: the real process query", function()
         assert.equals("dead", aged.records[1].state)
     end)
 
+    -- Real processes with real command lines. The script reads the whole
+    -- machine, so these only look at ids made up here. The stand-in sleeps
+    -- and ignores its arguments; it ends by itself if teardown never runs.
+    describe("live claude command lines", function()
+        local ON_CLAUDE = "a1a1a1a1-0000-4000-8000-000000000001"
+        local ON_CLAUDE2 = "a1a1a1a1-0000-4000-8000-000000000002"
+        local ON_DASHED = "a1a1a1a1-0000-4000-8000-000000000003"
+        local QUOTED = "a1a1a1a1-0000-4000-8000-000000000004"
+        local ON_HOST = "a1a1a1a1-0000-4000-8000-000000000005"
+        local ON_STRANGER = "a1a1a1a1-0000-4000-8000-000000000006"
+        local ON_LOOKALIKE = "a1a1a1a1-0000-4000-8000-000000000007"
+        local SUFFIXED = "a1a1a1a1-0000-4000-8000-000000000008"
+        local PREFIXED_FLAG = "a1a1a1a1-0000-4000-8000-000000000009"
+        local UPPER = "A1A1A1A1-0000-4000-8000-00000000000A"
+        local pids = {}
+        local dir = ROOT .. "\\bin"
+
+        local function start(exe, arguments)
+            return 'Start-Process -PassThru -WindowStyle Hidden -FilePath "' .. dir .. "\\" .. exe .. '" '
+                .. "-ArgumentList '" .. arguments .. "' | ForEach-Object { $_.Id };"
+        end
+
+        setup(function()
+            mkdir(dir)
+            local out = run_powershell(table.concat({
+                "Add-Type -OutputAssembly '" .. dir .. "\\sleeper.exe' -OutputType ConsoleApplication",
+                " -TypeDefinition 'class P { static void Main() { System.Threading.Thread.Sleep(120000); } }';",
+                "foreach ($n in 'claude-wezspec.exe', 'claude2.exe', 'wezspec-other.exe', 'claudette-wezspec.exe') {",
+                " Copy-Item -LiteralPath '" .. dir .. "\\sleeper.exe' -Destination (Join-Path '" .. dir .. "' $n) };",
+                start("claude-wezspec.exe", "--resume " .. ON_CLAUDE .. " --dangerously-skip-permissions"),
+                start("claude2.exe", "--resume " .. ON_CLAUDE2),
+                start("claude-wezspec.exe", "--verbose --resume " .. ON_DASHED),
+                start("claude-wezspec.exe", '--resume "' .. QUOTED .. '"'),
+                start("claude-wezspec.exe", "--chrome-native-host --resume " .. ON_HOST),
+                start("wezspec-other.exe", "--resume " .. ON_STRANGER),
+                start("claudette-wezspec.exe", "--resume " .. ON_LOOKALIKE),
+                start("claude-wezspec.exe", "--resume " .. SUFFIXED .. "-extra"),
+                start("claude-wezspec.exe", "--no--resume " .. PREFIXED_FLAG),
+                start("claude-wezspec.exe", "--resume " .. UPPER),
+            }, " "))
+            for pid in out:gmatch("%d+") do table.insert(pids, pid) end
+            assert.equals(10, #pids, "the stand-in processes did not start: " .. out)
+        end)
+
+        teardown(function()
+            if #pids > 0 then
+                -- Only the pids this spec started, and wait so the folder can go.
+                local list = table.concat(pids, ",")
+                run_powershell("Stop-Process -Id " .. list .. " -ErrorAction SilentlyContinue;"
+                    .. "Wait-Process -Id " .. list .. " -Timeout 10 -ErrorAction SilentlyContinue")
+            end
+        end)
+
+        before_each(function()
+            guard.control_dirs = function() return { CTL } end
+            guard.marker_dir = function() return ROOT .. "\\missing" end
+        end)
+
+        local function live_pid(snapshot, id)
+            local session = snapshot.sessions[id]
+            return session and session.state == "live" and session.pid or nil
+        end
+
+        it("reads each supported claude variant as live, whatever else is on the line", function()
+            local snapshot = guard.get_snapshot(true)
+            assert.is_nil(snapshot.error)
+            assert.equals(tonumber(pids[1]), live_pid(snapshot, ON_CLAUDE))
+            assert.equals(tonumber(pids[2]), live_pid(snapshot, ON_CLAUDE2))
+            assert.equals(tonumber(pids[3]), live_pid(snapshot, ON_DASHED))
+            assert.equals(tonumber(pids[4]), live_pid(snapshot, QUOTED))
+        end)
+
+        it("ignores a native host, another program, a lookalike name and a word that is not the id", function()
+            local snapshot = guard.get_snapshot(true)
+            assert.is_nil(snapshot.error)
+            assert.is_nil(snapshot.sessions[ON_HOST], "--chrome-native-host")
+            assert.is_nil(snapshot.sessions[ON_STRANGER], "a program not named claude")
+            assert.is_nil(snapshot.sessions[ON_LOOKALIKE], "claudette is not a claude variant")
+            assert.is_nil(snapshot.sessions[SUFFIXED], "more text after the id")
+            assert.is_nil(snapshot.sessions[PREFIXED_FLAG], "a flag that only ends in --resume")
+            assert.is_nil(snapshot.sessions[UPPER:lower()], "not a lower-case id")
+        end)
+
+        it("a process list that cannot be read makes the whole answer an error", function()
+            local original = wezterm_stub.run_child_process
+            wezterm_stub.run_child_process = function(args)
+                -- A real CIM failure, through the script's real error path.
+                local script = args[#args]
+                local broken, hits = script:gsub("Win32_Process %-Filter 'Name", "NoSuchClassWezspec -Filter 'Name")
+                assert.equals(1, hits, "the process list query was not found")
+                args[#args] = broken
+                return original(args)
+            end
+            local ok, snapshot = pcall(guard.get_snapshot, true)
+            wezterm_stub.run_child_process = original
+            assert.is_true(ok, snapshot)
+            assert.truthy(snapshot.error and snapshot.error:find("process list unreadable", 1, true), snapshot.error)
+            assert.equals("process list unreadable", snapshot.error_label)
+        end)
+    end)
+
     it("passes the query as one argument without double quotes or newlines", function()
         local seen
         local original = wezterm_stub.run_child_process
