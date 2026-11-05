@@ -2,6 +2,7 @@ local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes 
 local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
 local restore_guard = require("resurrect.restore_guard")
+local ps_quote = require("resurrect.ps_quote")
 
 local pub = {}
 
@@ -9,6 +10,14 @@ local pub = {}
 -- pub.backup_retention_count = N from the user's wezterm.lua. Set to 0 to
 -- disable dated backups (the rolling .bak still runs).
 pub.backup_retention_count = 10
+
+-- Upper bound on dated backups deleted by ONE save. Pruning runs inside the
+-- periodic save on WezTerm's Lua thread, so a large backlog (tens of thousands
+-- of files from before name matching worked) must drain gradually instead of
+-- in one long burst of os.remove calls. Steady state needs only about one
+-- deletion per save; the one-off backlog is better cleared with
+-- tools/prune-backups.ps1.
+pub.max_prunes_per_save = 25
 
 ---@param file_name string
 ---@param type string
@@ -51,8 +60,16 @@ local function list_dated_backups(backups_dir, basename)
 		local ok, output = wezterm.run_child_process({
 			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
 			string.format(
-				"Get-ChildItem -Path '%s' -Filter '%s' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }",
-				backups_dir:gsub("'", "''"), pattern:gsub("'", "''")
+				-- Force UTF-8 on stdout. powershell.exe otherwise uses the OEM
+				-- code page and replaces every non-ASCII byte with "?". The
+				-- caller matches these names against the save's base name, so
+				-- corrupted output matches nothing, the prune list comes back
+				-- empty, and backups accumulate without bound -- observed at
+				-- 2,979 files for a single base against a retention of 10.
+				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+					.. "Get-ChildItem -Path %s -Filter %s -File -ErrorAction SilentlyContinue "
+					.. "| ForEach-Object { $_.Name }",
+				ps_quote.quote(backups_dir), ps_quote.quote(pattern)
 			),
 		})
 		if ok then stdout = output end
@@ -109,9 +126,12 @@ local function rotate_backup(file_path)
 
 		-- Prune oldest beyond retention.
 		local entries = list_dated_backups(backups_dir, base)
-		while #entries > pub.backup_retention_count do
+		-- Oldest first, at most max_prunes_per_save per call.
+		local removed = 0
+		while #entries > pub.backup_retention_count and removed < pub.max_prunes_per_save do
 			local oldest = table.remove(entries, 1)
 			os.remove(oldest.path)
+			removed = removed + 1
 		end
 	end
 end

@@ -12,6 +12,7 @@ local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
 local restore_guard = require("resurrect.restore_guard")
 local restore_report = require("resurrect.restore_report")
+local ps_quote = require("resurrect.ps_quote")
 
 local pub = {}
 
@@ -437,8 +438,14 @@ function pub.list_instances()
 		local success, output = wezterm.run_child_process({
 			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
 			string.format(
-				"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName }",
-				instances_dir:gsub("'", "''")
+				-- Force UTF-8 on stdout; powershell.exe otherwise emits the OEM
+				-- code page and turns every non-ASCII byte into "?". Instance
+				-- ids are numeric so they cannot be corrupted today, but the
+				-- same helper shape is used for name-bearing directories.
+				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+					.. "Get-ChildItem -Path %s -Filter '*.json' -File -ErrorAction SilentlyContinue "
+					.. "| ForEach-Object { $_.BaseName }",
+				ps_quote.quote(instances_dir)
 			),
 		})
 		if success then
@@ -556,8 +563,14 @@ local function list_ids_in_dir(dir)
 		local ok, output = wezterm.run_child_process({
 			"powershell.exe", "-NoProfile", "-NoLogo", "-Command",
 			string.format(
-				"Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | ForEach-Object { $_.BaseName }",
-				dir:gsub("'", "''")
+				-- Force UTF-8 on stdout; powershell.exe otherwise emits the OEM
+				-- code page and turns every non-ASCII byte into "?". Instance
+				-- ids are numeric so they cannot be corrupted today, but the
+				-- same helper shape is used for name-bearing directories.
+				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+					.. "Get-ChildItem -Path %s -Filter '*.json' -File -ErrorAction SilentlyContinue "
+					.. "| ForEach-Object { $_.BaseName }",
+				ps_quote.quote(dir)
 			),
 		})
 		if ok then stdout = output end

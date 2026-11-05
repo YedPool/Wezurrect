@@ -1,12 +1,14 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local utils = require("resurrect.utils")
 local file_io = require("resurrect.file_io")
+local ps_quote = require("resurrect.ps_quote")
 local pub = {}
 
 ---@alias fmt_fun fun(label: string): string
 ---@alias fuzzy_load_opts {title: string, description: string, fuzzy_description: string, is_fuzzy: boolean,
----ignore_workspaces: boolean, ignore_tabs: boolean, ignore_windows: boolean, fmt_window: fmt_fun, fmt_workspace: fmt_fun,
----fmt_tab: fmt_fun, fmt_date: fmt_fun, show_state_with_date: boolean, date_format: string, ignore_screen_width: boolean,
+---ignore_workspaces: boolean, ignore_tabs: boolean, ignore_windows: boolean, ignore_shelfs: boolean,
+---fmt_window: fmt_fun, fmt_workspace: fmt_fun, fmt_tab: fmt_fun, fmt_shelf: fmt_fun,
+---fmt_date: fmt_fun, show_state_with_date: boolean, date_format: string, ignore_screen_width: boolean,
 ---name_truncature: string, min_filename_size: number}
 
 ---Default fuzzy loading options
@@ -19,6 +21,8 @@ pub.default_fuzzy_load_opts = {
 	ignore_workspaces = false,
 	ignore_windows = false,
 	ignore_tabs = false,
+	-- Not a typo: the ignore flag is looked up as "ignore_" .. type .. "s".
+	ignore_shelfs = false,
 	ignore_instances = true,
 	ignore_screen_width = true,
 	date_format = "%d-%m-%Y %H:%M:%S",
@@ -49,24 +53,63 @@ pub.default_fuzzy_load_opts = {
 			{ Text = "󰓩 : " .. label:gsub("(.*)%.json(.*)", "%1%2") },
 		})
 	end,
+	fmt_shelf = function(label)
+		return wezterm.format({
+			{ Foreground = { AnsiColor = "Fuchsia" } },
+			{ Text = wezterm.nerdfonts.md_pin .. " : " .. label:gsub("(.*)%.json(.*)", "%1%2") },
+		})
+	end,
 }
 
--- Recursive JSON file finder using wezterm.run_child_process (no os.execute, no VBS).
--- Returns lines of "epoch filepath" for each .json file found.
----@param base_path string starting path from which the recursive search takes place
+-- State directories scanned by the loader, relative to save_state_dir.
+-- insert_choices derives a file's state type from its immediate parent
+-- directory, so "window/shelf" correctly yields the type "shelf".
+local STATE_SUBDIRS = { "workspace", "window", "window/shelf", "tab", "instances" }
+
+-- Non-recursive JSON file finder using wezterm.run_child_process (no os.execute,
+-- no VBS). Returns lines of "epoch filepath" for each .json file directly inside
+-- base_path.
+--
+-- This deliberately does NOT recurse. Recursing from save_state_dir also swept
+-- .backups/ (which rotate_backup fills with a dated copy per save, unbounded
+-- across base names), .trash/ and instances/restored/. Those parent directory
+-- names became state "types" that insert_choices has no formatting entry for,
+-- which crashed the picker -- and on a well-used store they outnumber real saves
+-- by more than 100:1.
+---@param base_path string directory to list (non-recursively)
 ---@return string|nil
-local function find_json_files_recursive(base_path)
+local function find_json_files(base_path)
 	local success, stdout, stderr
 
 	if utils.is_windows then
 		-- Use PowerShell via run_child_process -- no visible window, no VBS temp files.
 		-- PowerShell Get-ChildItem is available on all modern Windows.
+		-- Test-Path guard: with -ErrorAction SilentlyContinue a missing directory
+		-- produces no error record but still leaves $? false, so powershell exits
+		-- non-zero and the caller reports a failed scan. A state directory that
+		-- does not exist yet is normal (nothing has been saved of that type), so
+		-- it must contribute nothing quietly rather than raise resurrect.error.
 		local ps_cmd = string.format(
-			"Get-ChildItem -Path '%s' -Recurse -Filter '*.json' -File | "
+			-- Force UTF-8 on stdout. powershell.exe otherwise encodes output in
+			-- the OEM code page, which replaces every non-ASCII byte with "?".
+			-- Save names routinely contain non-ASCII (status glyphs, Hebrew,
+			-- CJK), so without this the scan returns corrupted paths: the picker
+			-- displays "?" and the id it hands back does not name a real file.
+			"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+				.. "if (Test-Path -LiteralPath %s) { "
+				.. "Get-ChildItem -LiteralPath %s -Filter '*.json' -File -ErrorAction SilentlyContinue | "
 				.. "ForEach-Object { "
-				.. "[int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds) "
-				.. ".ToString() + ' ' + $_.FullName }",
-			base_path:gsub("'", "''")
+				-- The cast must be parenthesised before .ToString(). Without the
+				-- outer parens "[int][double]::Parse(x).ToString() + ' ' + y"
+				-- applies the [int] cast to the whole concatenated expression;
+				-- and a space before .ToString() is a hard parse error in both
+				-- Windows PowerShell 5.1 and PowerShell 7. Either mistake makes
+				-- the command exit non-zero, so the scan silently returns
+				-- nothing and the picker reports "no existing state files".
+				.. "([int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds))"
+				.. ".ToString() + ' ' + $_.FullName } }",
+			ps_quote.quote(base_path),
+			ps_quote.quote(base_path)
 		)
 		success, stdout, stderr = wezterm.run_child_process({
 			"powershell.exe",
@@ -81,7 +124,8 @@ local function find_json_files_recursive(base_path)
 		success, stdout, stderr = wezterm.run_child_process({
 			"sh",
 			"-c",
-			"find '" .. safe_path .. "' -type f -name '*.json' -print0 | xargs -0 stat -f '%m %N'",
+			"find '" .. safe_path .. "' -maxdepth 1 -type f -name '*.json' -print0 2>/dev/null"
+				.. " | xargs -0 stat -f '%m %N'",
 		})
 	else
 		-- Use single-quote escaping to prevent shell injection via $() and backticks
@@ -89,16 +133,40 @@ local function find_json_files_recursive(base_path)
 		success, stdout, stderr = wezterm.run_child_process({
 			"sh",
 			"-c",
-			"find '" .. safe_path .. "' -type f -name '*.json' -printf '%T@ %p\\n' | awk '{split($1, a, \".\"); print a[1], $2}'",
+			"find '" .. safe_path .. "' -maxdepth 1 -type f -name '*.json' -printf '%T@ %p\\n' 2>/dev/null"
+				.. " | awk '{split($1, a, \".\"); print a[1], $2}'",
 		})
 	end
 
 	if success then
-		return stdout
+		-- Normalise line endings. powershell.exe emits CRLF, and insert_choices
+		-- splits on "[^\n]+" while anchoring its filename pattern with "%.json$",
+		-- so a surviving CR makes every line fail to match. The failure is nearly
+		-- invisible: the only lines that still parse are those whose CR happened
+		-- to be trimmed, so the picker silently shows a handful of entries
+		-- instead of erroring.
+		return (stdout or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
 	else
 		wezterm.emit("resurrect.error", stderr or "Failed to list state files")
 		return nil
 	end
+end
+
+-- List every state file across STATE_SUBDIRS, concatenated into one blob in the
+-- same "epoch filepath" line format insert_choices expects. A missing
+-- subdirectory contributes nothing rather than failing the whole scan.
+---@param base_path string save_state_dir (with trailing separator)
+---@return string
+local function find_state_files(base_path)
+	local parts = {}
+	for _, subdir in ipairs(STATE_SUBDIRS) do
+		local dir = base_path .. (subdir:gsub("/", utils.separator))
+		local out = find_json_files(dir)
+		if out and out ~= "" then
+			table.insert(parts, (out:gsub("%s+$", "")))
+		end
+	end
+	return table.concat(parts, "\n")
 end
 
 -- build a table with the output of the file finder function
@@ -109,11 +177,12 @@ local function insert_choices(stdout, opts)
 	-- this structure will contain the formatting costs for each elements
 	local fmt_cost = {}
 	-- pre-calculation of formatting cost
-	local types = { "workspace", "window", "tab" }
+	local types = { "workspace", "window", "shelf", "tab" }
 	local state_files = {}
 	local files = {
 		workspace = {},
 		window = {},
+		shelf = {},
 		tab = {},
 	}
 	local max_length = 0
@@ -124,16 +193,24 @@ local function insert_choices(stdout, opts)
 
 	-- Parse the stdout and construct the file table
 	for line in stdout:gmatch("[^\n]+") do
+		-- Trim a trailing CR: the pattern below is anchored with "$", so a CRLF
+		-- source would otherwise fail to match every single line. Handled here as
+		-- well as at the scan, because this parser must not depend on which
+		-- platform's line endings its caller happens to hand it.
+		line = line:gsub("\r+$", "")
 		local epoch, type, file = line:match("%s*(%d+)%s+.+[/\\]([^/\\]+)[/\\]([^/\\]+%.json)$")
 		-- epoch in this case represents the last modified date/time according to the OS
 		-- For Unix/POSIX Epoch is counted from January 1st, 1970 0 UTC
 		-- MacOS it is from January 1st, 1904 0 UTC
 		-- Windows NTFS (up to Win 11) it is from January 1st, 1601 0 UTC
 		-- The function `os.date()` used later on will convert the date according to the host OS
-		-- Skip instance files when ignore_instances is set (they use their own selector)
-		if type == "instances" and opts.ignore_instances then
-			-- fall through: do not add instance files to the fuzzy loader
-		elseif epoch and file and type and not opts[string.format("ignore_%ss", type)] then
+		-- Skip instance files when ignore_instances is set (they use their own selector).
+		-- Also skip an unknown state type: `files` and `fmt_cost` are keyed by the supported
+		-- types only, so anything else (a .backups/, .trash/ or restored/ directory, or a
+		-- future subdirectory) would index them as nil and raise an arithmetic error below,
+		-- taking the whole picker down. Skipping keeps the loader forward-compatible.
+		local skip_type = (type == "instances" and opts.ignore_instances) or type == nil or files[type] == nil
+		if not skip_type and epoch and file and not opts[string.format("ignore_%ss", type)] then
 			-- consider the "cost" of the formatting of the filename, i.e., if the format function adds characters
 			-- to the visible part of the file section, we test the three possible formatter to get the highest cost
 			-- we use a real entry instead of an empty string to prevent formatting error if the format function has
@@ -273,8 +350,8 @@ function pub.fuzzy_load(window, pane, callback, opts)
 
 	local folder = require("resurrect.state_manager").save_state_dir
 
-	-- Always use the recursive search function
-	local stdout = find_json_files_recursive(folder)
+	-- Scan each state directory rather than recursing the whole tree
+	local stdout = find_state_files(folder)
 
 	-- build the choice list for the InputSelector
 	local state_files = insert_choices(stdout, opts)
@@ -301,5 +378,12 @@ function pub.fuzzy_load(window, pane, callback, opts)
 		pane
 	)
 end
+
+-- Expose internals for unit testing only
+pub._test = {
+	insert_choices = insert_choices,
+	find_state_files = find_state_files,
+	STATE_SUBDIRS = STATE_SUBDIRS,
+}
 
 return pub
