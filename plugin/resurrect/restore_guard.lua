@@ -57,7 +57,8 @@ local QUERY_WORK = table.concat({
 	"if (-not (Test-Path -LiteralPath $d -PathType Container)) {",
 	"if ($i -eq 0) { throw 'control directory not found' } else { continue } };",
 	"foreach ($f in @(Get-ChildItem -LiteralPath $d -Filter '*.json' -File)) {",
-	"$n++; $sid = ''; $id = ''; $ps = ''; $cwd = '';",
+	"$n++; $sid = ''; $id = ''; $ps = ''; $cwd = ''; $wt = '';",
+	"try { $wt = [string]$f.LastWriteTimeUtc.ToFileTimeUtc() } catch { };",
 	"try { $j = [IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json;",
 	"$sid = [string]$j.sessionId; $id = [string]$j.pid;",
 	"$ps = [string]$j.procStart; $cwd = [string]$j.cwd } catch { };",
@@ -65,9 +66,12 @@ local QUERY_WORK = table.concat({
 	"$run = 1; $st = '?';",
 	"if ($id -match '^[0-9]+$') {",
 	"$p = Get-Process -Id ([int]$id) -ErrorAction SilentlyContinue;",
-	"if ($p) { try { $st = [string]$p.StartTime.ToFileTimeUtc() } catch { $st = '?' } }",
+	"if ($p) { try { $st = [string]$p.StartTime.ToFileTimeUtc() } catch { $st = '?' };",
+	"if ($st -eq '?') { try { $c = Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId=' + [int]$id);",
+	"$st = [string]$c.CreationDate.ToFileTimeUtc() } catch { $st = '?' } };",
+	"if ($st -notmatch '^[0-9]+$') { $st = '?' } }",
 	"else { $run = 0 } };",
-	"('S', $sid, $id, $ps, $run, $st, $cwd) -join $t } };",
+	"('S', $sid, $id, $ps, $run, $st, $cwd, $wt) -join $t } };",
 	"$m = 0; $md = @MARKERS@; $mk = @();",
 	"try { if (Test-Path -LiteralPath $md) {",
 	"if (-not (Test-Path -LiteralPath $md -PathType Container)) { throw 'the path is not a folder' };",
@@ -108,7 +112,7 @@ local QUERY_SCRIPT = table.concat({
 ---   returns stdout (string) on success, or nil and a reason.
 ---
 --- stdout is lines of tab-separated fields:
----   S <sessionId> <pid> <procStart> <running> <startTime> <cwd>
+---   S <sessionId> <pid> <procStart> <running> <startTime> <cwd> <fileTime>
 ---       one per *.json control file. sessionId, procStart and cwd are copied
 ---       from the file (empty when the file could not be parsed; pid then
 ---       falls back to the file's base name, which Claude sets to the pid).
@@ -116,7 +120,14 @@ local QUERY_SCRIPT = table.concat({
 ---       and 1 when the pid is unknown (so it can never read as "gone").
 ---       startTime is that process's start time as a FILETIME in decimal --
 ---       the same encoding Claude writes to procStart on Windows -- or ? when
----       it could not be read.
+---       it could not be read. Get-Process cannot read StartTime of some
+---       processes from a non-elevated caller (for example SYSTEM services);
+---       for those only, Win32_Process.CreationDate is used instead, so a pid
+---       Windows reused after a reboot still shows a start time and reads as
+---       dead. If both fail the value stays ? (fail closed).
+---       fileTime is the control file's last write time (LastWriteTimeUtc) as
+---       a FILETIME in decimal, empty when it could not be read. A file last
+---       written before its process started cannot belong to it (classify).
 ---   M <name> <reason> <by>
 ---       one per *.json entry in the marker folder, readable or not. name is
 ---       the entry's base name; reason and by are copied from the file (only
@@ -209,7 +220,7 @@ end
 
 --- Parse the text returned by run_query into records.
 ---@param stdout string
----@return table[]|nil records { session_id, pid, proc_start, running, start_time, cwd }
+---@return table[]|nil records { session_id, pid, proc_start, running, start_time, cwd, file_time }
 ---@return string|nil err
 ---@return table[]|nil markers { name, reason, by }
 local function parse_query_output(stdout)
@@ -237,6 +248,9 @@ local function parse_query_output(stdout)
 				running = fields[5] ~= "0",
 				start_time = fields[6] or "?",
 				cwd = fields[7] or "",
+				-- Last write time of the control file (FILETIME); nil when
+				-- the query did not give one.
+				file_time = fields[8],
 			})
 		end
 	end
@@ -264,6 +278,14 @@ local function classify(record)
 	end
 	local expected = to_integer(record.proc_start)
 	local actual = to_integer(record.start_time)
+	local written = to_integer(record.file_time)
+	if actual and written and written < actual - pub.start_time_tolerance then
+		-- Claude creates its control file after the process has started and
+		-- keeps writing it. A file last written before the process its pid
+		-- names started was left by an earlier process: the pid was reused.
+		-- This holds whether or not the file could be parsed.
+		return "dead"
+	end
 	if not record.pid or not expected or not actual then
 		return "unknown"
 	end

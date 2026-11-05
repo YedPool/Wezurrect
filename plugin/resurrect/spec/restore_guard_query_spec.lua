@@ -98,4 +98,74 @@ describe_windows("restore guard: the real process query", function()
         assert.truthy(snapshot.error and snapshot.error:find("marker", 1, true), snapshot.error)
         assert.equals("no-restore markers unreadable", snapshot.error_label)
     end)
+
+    -- Windows hides StartTime of other users' processes from a non-elevated
+    -- caller (Get-Process returns the process, StartTime is empty). A pid
+    -- reused by such a process after a reboot made a stale control file read
+    -- as "running, start time unknown". Needs a live pid like that.
+    local function find_unreadable_pid()
+        local out = run_powershell(
+            "foreach ($p in Get-Process) { $ok = $true; "
+            .. "try { [void]$p.StartTime.ToFileTimeUtc() } catch { $ok = $false }; "
+            .. "if (-not $ok) { $p.Id; break } }")
+        return tonumber(out:match("%d+"))
+    end
+
+    it("a pid whose StartTime cannot be read still gets a start time and a reused pid reads dead", function()
+        local pid = find_unreadable_pid()
+        if not pid then
+            return pending("no running process with an unreadable StartTime on this machine")
+        end
+        local dir = ROOT .. "\\ctl-reused"
+        local sid = "ce19dc26-7a4b-4c1e-9d2f-3b5a6c7d8e9f"
+        mkdir(dir)
+        write(dir .. "\\" .. pid .. ".json", '{"sessionId":"' .. sid .. '","pid":' .. pid
+            .. ',"procStart":"134369884913177861","cwd":"C:\\\\work"}')
+        guard.control_dirs = function() return { dir } end
+        guard.marker_dir = function() return ROOT .. "\\missing" end
+        local snapshot = guard.get_snapshot(true)
+        assert.is_nil(snapshot.error)
+        local record = snapshot.records[1]
+        assert.equals(pid, record.pid)
+        assert.is_true(record.running)
+        assert.is_truthy(record.start_time:match("^%d+$"), "start time was " .. tostring(record.start_time))
+        assert.equals("dead", snapshot.sessions[sid].state)
+    end)
+
+    it("an unparseable control file older than the process of its pid reads dead, a fresh one does not", function()
+        local pid = find_unreadable_pid()
+        if not pid then
+            return pending("no running process with an unreadable StartTime on this machine")
+        end
+        local dir = ROOT .. "\\ctl-garbage"
+        mkdir(dir)
+        local file = dir .. "\\" .. pid .. ".json"
+        write(file, "not json {")
+        guard.control_dirs = function() return { dir } end
+        guard.marker_dir = function() return ROOT .. "\\missing" end
+        -- Just written: after the process started, so it may be that process's file.
+        local fresh = guard.get_snapshot(true)
+        assert.truthy(fresh.error and fresh.error:find("could not be read", 1, true), tostring(fresh.error))
+        guard._test.reset()
+        run_powershell("(Get-Item -LiteralPath '" .. file .. "').LastWriteTimeUtc = [datetime]'2000-01-01 00:00:00Z'")
+        local aged = guard.get_snapshot(true)
+        assert.is_nil(aged.error)
+        assert.equals("dead", aged.records[1].state)
+    end)
+
+    it("passes the query as one argument without double quotes or newlines", function()
+        local seen
+        local original = wezterm_stub.run_child_process
+        wezterm_stub.run_child_process = function(args)
+            seen = args[#args]
+            return original(args)
+        end
+        guard.control_dirs = function() return { CTL } end
+        guard.marker_dir = function() return MARKERS end
+        local ok = pcall(guard.get_snapshot, true)
+        wezterm_stub.run_child_process = original
+        assert.is_true(ok)
+        assert.is_nil(seen:find('"', 1, true))
+        assert.is_nil(seen:find("%c"))
+    end)
 end)
