@@ -167,6 +167,12 @@ describe_windows("restore guard: the real process query", function()
         local SUFFIXED = "a1a1a1a1-0000-4000-8000-000000000008"
         local PREFIXED_FLAG = "a1a1a1a1-0000-4000-8000-000000000009"
         local UPPER = "A1A1A1A1-0000-4000-8000-00000000000A"
+        local HOST_IN_TEXT = "a1a1a1a1-0000-4000-8000-00000000000b"
+        local HOST_AFTER = "a1a1a1a1-0000-4000-8000-00000000000c"
+        local IN_TEXT = "a1a1a1a1-0000-4000-8000-00000000000d"
+        local WHOLE_VALUE = "a1a1a1a1-0000-4000-8000-00000000000e"
+        local ESCAPED = "a1a1a1a1-0000-4000-8000-00000000000f"
+        local AFTER_DASHES = "a1a1a1a1-0000-4000-8000-000000000010"
         local pids = {}
         local dir = ROOT .. "\\bin"
 
@@ -192,9 +198,17 @@ describe_windows("restore guard: the real process query", function()
                 start("claude-wezspec.exe", "--resume " .. SUFFIXED .. "-extra"),
                 start("claude-wezspec.exe", "--no--resume " .. PREFIXED_FLAG),
                 start("claude-wezspec.exe", "--resume " .. UPPER),
+                start("claude-wezspec.exe", "--resume " .. HOST_IN_TEXT
+                    .. ' --append-system-prompt "about --chrome-native-host here"'),
+                start("claude-wezspec.exe", "--resume " .. HOST_AFTER .. " --chrome-native-host"),
+                start("claude-wezspec.exe", '--append-system-prompt "see --resume ' .. IN_TEXT .. ' for more"'),
+                start("claude-wezspec.exe", '--append-system-prompt "--resume ' .. WHOLE_VALUE .. '"'),
+                start("claude-wezspec.exe", '--append-system-prompt "say \\" --resume ' .. ESCAPED
+                    .. ' \\" now"'),
+                start("claude-wezspec.exe", "-- --resume " .. AFTER_DASHES),
             }, " "))
             for pid in out:gmatch("%d+") do table.insert(pids, pid) end
-            assert.equals(10, #pids, "the stand-in processes did not start: " .. out)
+            assert.equals(16, #pids, "the stand-in processes did not start: " .. out)
         end)
 
         teardown(function()
@@ -234,6 +248,28 @@ describe_windows("restore guard: the real process query", function()
             assert.is_nil(snapshot.sessions[SUFFIXED], "more text after the id")
             assert.is_nil(snapshot.sessions[PREFIXED_FLAG], "a flag that only ends in --resume")
             assert.is_nil(snapshot.sessions[UPPER:lower()], "not a lower-case id")
+        end)
+
+        it("a --chrome-native-host that is not the first argument does not hide a real resume", function()
+            local snapshot = guard.get_snapshot(true)
+            assert.is_nil(snapshot.error)
+            assert.equals(tonumber(pids[11]), live_pid(snapshot, HOST_IN_TEXT), "inside another flag's text")
+            assert.equals(tonumber(pids[12]), live_pid(snapshot, HOST_AFTER), "a word of its own, after --resume")
+        end)
+
+        it("an id quoted inside another flag's text is not a resume of it", function()
+            local snapshot = guard.get_snapshot(true)
+            assert.is_nil(snapshot.error)
+            assert.is_nil(snapshot.sessions[IN_TEXT], "inside a sentence")
+            assert.is_nil(snapshot.sessions[WHOLE_VALUE], "the whole of one quoted argument")
+            assert.is_nil(snapshot.sessions[AFTER_DASHES], "after --, where nothing is a flag")
+        end)
+
+        it("splits arguments the way Windows does, escaped quotes included", function()
+            -- The escaped quotes close nothing: the id is inside the text.
+            local snapshot = guard.get_snapshot(true)
+            assert.is_nil(snapshot.error)
+            assert.is_nil(snapshot.sessions[ESCAPED])
         end)
 
         it("a process list that cannot be read makes the whole answer an error", function()

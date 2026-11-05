@@ -89,11 +89,29 @@ local QUERY_WORK = table.concat({
 	"$q = 0; $pl = @();",
 	"try { $pl = @(Get-CimInstance -ClassName Win32_Process -Filter 'Name LIKE ''claude%''' -Property ProcessId,Name,CommandLine) }",
 	"catch { throw ('process list unreadable: ' + $_.Exception.Message) };",
+	-- Windows' own argument splitter, shell32 CommandLineToArgvW, declared at
+	-- run time (no compiler process, about 50 ms). Its memory is not freed: the
+	-- process ends right after this.
+	"try { $tb = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName 'WezArgv'), 'Run');",
+	"$tb = $tb.DefineDynamicModule('WezArgv').DefineType('WezArgv', 'Public,Class');",
+	"$pm = $tb.DefinePInvokeMethod('CommandLineToArgvW', 'shell32.dll',",
+	"[Reflection.MethodAttributes]'Public,Static,PinvokeImpl', [Reflection.CallingConventions]::Standard,",
+	"[IntPtr], @([string], [int].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi,",
+	"[Runtime.InteropServices.CharSet]::Unicode);",
+	"$pm.SetImplementationFlags('PreserveSig'); $split = $tb.CreateType() }",
+	"catch { throw ('process list unreadable, no argument splitter: ' + $_.Exception.Message) };",
 	"foreach ($c in $pl) { $cl = [string]$c.CommandLine;",
 	"if ($c.Name -notmatch '^claude(\\d*|-[a-z0-9-]+)(\\.exe)?$') { continue };",
-	"if ($cl -match '(^|\\s)--chrome-native-host(\\s|$)') { continue };",
-	"foreach ($x in [regex]::Matches($cl, '(?:^|\\s)--resume\\s+\\x22?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\x22?(?=\\s|$)')) {",
-	"$q++; ('P', $x.Groups[1].Value, $c.ProcessId) -join $t } };",
+	"if (-not $cl) { continue };",
+	"$ac = 0; $ap = $split::CommandLineToArgvW($cl, [ref]$ac);",
+	"if ($ap -eq [IntPtr]::Zero) { throw 'process list unreadable: a command line could not be split' };",
+	"$av = @(for ($k = 0; $k -lt $ac; $k++) {",
+	"[Runtime.InteropServices.Marshal]::PtrToStringUni(",
+	"[Runtime.InteropServices.Marshal]::ReadIntPtr($ap, $k * [IntPtr]::Size)) });",
+	"if ($av.Count -ge 2 -and $av[1] -ceq '--chrome-native-host') { continue };",
+	"for ($k = 1; $k -lt $av.Count - 1; $k++) { if ($av[$k] -ceq '--') { break };",
+	"if ($av[$k] -ceq '--resume' -and $av[$k + 1] -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z') {",
+	"$q++; ('P', $av[$k + 1], $c.ProcessId) -join $t } } };",
 	"('END', $n, $m, $q) -join $t }",
 	"catch { ('ERR', $_.Exception.Message) -join $t }",
 }, " ")
@@ -149,10 +167,15 @@ local QUERY_SCRIPT = table.concat({
 ---   P <sessionId> <pid>
 ---       one per "--resume <lower-case UUID>" on the command line of a live
 ---       process named claude, claude<digits> or claude-<name>, from one bulk
----       Win32_Process query. A process with --chrome-native-host on its line
----       is not a session and is left out. A process whose command line is
----       unreadable (elevated, or another user's) names nothing and gives no P
----       line: refusing every restore because of one would be worse than
+---       Win32_Process query. The line is split by Windows' own
+---       CommandLineToArgvW and --resume and the id must be two whole arguments
+---       before any "--", so text inside another flag's value does not count.
+---       A native host (--chrome-native-host as the first argument, its only
+---       shape) is not a session and is left out. Which flags take a value is
+---       not known here: "--some-flag --resume <id>" as separate arguments still
+---       reads as a resume, which can only refuse that one id. A process whose
+---       command line is unreadable (elevated, or another user's) names nothing
+---       and gives no P line: refusing every restore because of one would be worse than
 ---       relying on its control file. A failed query is an ERR for the whole
 ---       answer.
 ---   END <n> <m> <p> last line; n is the number of S lines, m of M lines, p of
