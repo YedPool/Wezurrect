@@ -11,6 +11,7 @@ local wezterm = require("wezterm") --[[@as Wezterm]]
 local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
 local restore_guard = require("resurrect.restore_guard")
+local restore_report = require("resurrect.restore_report")
 
 local pub = {}
 
@@ -495,6 +496,7 @@ function pub.delete_instance(instance_id)
 
 	os.remove(json_path)
 	os.remove(meta_file)
+	os.remove(restore_report.path(instance_id))
 
 	wezterm.log_info("resurrect: deleted instance " .. instance_id)
 	wezterm.emit("resurrect.instance_manager.delete_instance.finished", instance_id)
@@ -519,7 +521,7 @@ local function tombstone_meta_path(instance_id)
 end
 
 --- Move an instance to the tombstone directory instead of deleting it.
---- Used by restore_instances after a successful restore. The files persist
+--- Used after a restore that left nothing waiting (see settle_copy). The files persist
 --- for retention_days, after which cleanup_old_tombstones removes them.
 ---@param instance_id string
 ---@return boolean
@@ -593,6 +595,7 @@ function pub.cleanup_old_tombstones(cutoff)
 		if last_save_epoch < cutoff then
 			os.remove(dir .. utils.separator .. id .. ".json")
 			os.remove(meta_p)
+			os.remove(restore_report.path(id))
 			wezterm.log_info("resurrect: pruned tombstoned instance " .. id)
 		end
 	end
@@ -811,6 +814,7 @@ end
 ---@return string|nil reason a few words for the selector entry
 ---@return string|nil note for a restorable instance: what restoring it will and will not resume
 ---@return string|nil detail the reason as a full sentence, for the log and the toast
+---@return table|nil summary restore_guard.summarize's answer, when it was asked
 local function restore_refusal(instance_id, workspace_state)
 	if pub.is_own_instance(instance_id) then
 		return "this terminal's own live copy - cannot restore", nil,
@@ -821,7 +825,220 @@ local function restore_refusal(instance_id, workspace_state)
 	end
 	local summary = restore_guard.summarize(workspace_state, quiet_restore_command)
 	local reason, detail = restore_guard.refusal(summary)
-	return reason, restore_guard.running_note(summary), detail
+	return reason, restore_guard.running_note(summary), detail, summary
+end
+
+-- ---------------------------------------------------------------------------
+-- After a restore: retire or keep the copy, and say what happened
+-- ---------------------------------------------------------------------------
+
+--- The sessions of a kept copy that "resume the rest" is for. Read from a file:
+--- only what has the form of a session id counts, and a session it names is
+--- resumed only if the saved state holds it and the guard allows it.
+---@param meta table|nil
+---@return string[]
+local function held_back_ids(meta)
+	local ids = {}
+	for _, id in ipairs(meta and type(meta.held_back) == "table" and meta.held_back or {}) do
+		if restore_guard.is_session_id(id) then
+			table.insert(ids, id)
+		end
+	end
+	return ids
+end
+
+--- Retire the saved copy, or keep it and note what is left to do in its .meta.
+--- A kept copy's last_save_epoch is left as it is: retention_days counts from
+--- the last save, so repeated restores cannot keep it alive. No copy is ever
+--- added here, so restarting can only leave the copies that already existed.
+---@param id string
+---@param meta table|nil
+---@param report table from restore_report
+local function settle_copy(id, meta, report)
+	if restore_report.keeps_copy(report) then
+		-- Without a .meta, cleanup_old_instances would take it for ancient.
+		meta = meta or { instance_id = id, last_save_epoch = os.time(), tab_count = 0, tab_summaries = {} }
+		local held = restore_report.held_ids(report)
+		meta.held_back = #held > 0 and held or nil
+		meta.restore_failed = #report.failures > 0 or nil
+		write_meta(id, meta)
+		report.kept = true
+	else
+		-- Tombstone the old instance: move to restored/ subdirectory rather
+		-- than delete, so a crash before the next save still leaves a
+		-- recoverable copy on disk. Tombstones are filtered out of the
+		-- selector and pruned by cleanup_old_tombstones (retention_days).
+		pub.tombstone_instance(id)
+	end
+	restore_report.write(report)
+end
+
+local function copy_name(id, meta)
+	if meta and type(meta.display_name) == "string" and meta.display_name ~= "" then
+		return sanitize_display_string(meta.display_name)
+	end
+	return id
+end
+
+-- The window in front now (the restore may have opened others over the one
+-- the selector was in), or the given one if none is focused.
+local function front_window(window, pane)
+	local ok, focused, focused_pane = pcall(function()
+		for _, candidate in ipairs(wezterm.gui.gui_windows()) do
+			if candidate:is_focused() then
+				return candidate, candidate:active_pane()
+			end
+		end
+	end)
+	if ok and focused then
+		return focused, focused_pane
+	end
+	return window, pane
+end
+
+local resume_rest -- defined below; the outcome selector offers it
+
+--- Show what a restore held back. A toast is gone in 10 seconds, and the log and
+--- the report have to be looked for. An InputSelector stays over the pane until
+--- a key dismisses it, needs nothing but WezTerm itself, is what this plugin
+--- already uses and has been working from action callbacks and call_after
+--- timers, and can carry the "resume the rest" entry as well. Nothing is shown
+--- when nothing is waiting: it would only teach people to dismiss it.
+---@param reports table[]
+---@param window table GuiWindow to fall back on
+---@param pane table Pane in it
+local function show_outcome(reports, window, pane)
+	local target_window, target_pane = front_window(window, pane)
+	local spec = restore_report.outcome_selector(reports)
+	local ok, err = pcall(function()
+		target_window:perform_action(
+			wezterm.action.InputSelector({
+				action = wezterm.action_callback(function(inner_win, inner_pane, id)
+					local rest_id = id and id:match("^" .. restore_report.REST_PREFIX .. "(%d+_%d+)$")
+					if rest_id then
+						resume_rest(rest_id, inner_win, inner_pane)
+					end
+				end),
+				title = spec.title,
+				description = spec.description,
+				choices = spec.choices,
+				fuzzy = false,
+			}),
+			target_pane
+		)
+	end)
+	if not ok then
+		wezterm.log_error("resurrect: could not show the restore outcome: " .. tostring(err))
+		restore_guard.notify(spec.title .. ". " .. spec.description)
+	end
+end
+
+-- Every delayed line has gone out by now: report what really happened.
+local function finish_run(reports, window, pane)
+	for _, report in ipairs(reports) do
+		restore_report.settle(report)
+		restore_report.write(report)
+	end
+	if restore_report.needs_attention(reports) then
+		show_outcome(reports, window, pane)
+	end
+end
+
+local function finish_run_after_typing(reports, window, pane)
+	local delay = require("resurrect.tab_state").process_restore_delay_seconds or 3
+	wezterm.time.call_after(delay + 1, function()
+		finish_run(reports, window, pane)
+	end)
+end
+
+--- Resume the sessions a kept copy held back that the guard now allows, each
+--- in a new tab of one new window. A restore may only type into panes it
+--- created, and the guarded default_on_pane_restore is what types, so this has
+--- no way past the guard: it asks it again from a fresh reading and only leaves
+--- out what would be refused anyway, to not open empty shells for them. Only the
+--- held-back sessions: one that was resumed and has since been closed stays closed.
+---@param id string
+---@param window table GuiWindow
+---@param pane table Pane
+resume_rest = function(id, window, pane)
+	restore_guard.get_snapshot(true)
+	local meta = read_meta(id)
+	local workspace_state = not pub.is_own_instance(id) and pub.load_instance(id) or nil
+	if not workspace_state then
+		restore_guard.notify("cannot resume the rest of instance " .. id .. ": it could not be loaded")
+		return
+	end
+	local summary = restore_guard.summarize(workspace_state, quiet_restore_command)
+	if summary.malformed > 0 then
+		local _, detail = restore_guard.refusal(summary)
+		restore_guard.notify("refusing to resume the rest of instance " .. id .. ": " .. tostring(detail))
+		return
+	end
+
+	local wanted = {}
+	for _, session_id in ipairs(held_back_ids(meta)) do
+		wanted[session_id] = true
+	end
+	local entries = {}
+	for _, entry in ipairs(summary.entries) do
+		local session_id = entry.target.session_id
+		if wanted[session_id] then
+			wanted[session_id] = nil -- each session once, however many panes it was saved in
+			table.insert(entries, entry)
+		end
+	end
+	if #entries == 0 then
+		-- The list names nothing the saved state holds. Retiring the copy over
+		-- that would be wrong; it can still be restored as a whole.
+		meta.held_back = nil
+		write_meta(id, meta)
+		restore_guard.notify("instance " .. id .. " has no held-back session left to resume")
+		return
+	end
+
+	local tab_state = require("resurrect.tab_state")
+	local opened = 0
+	local new_window
+	for _, entry in ipairs(entries) do
+		local session_id = entry.target.session_id
+		local foreign = entry.state == "dead" and restore_guard.foreign_claim(session_id)
+		if entry.state == "dead" and restore_guard.is_claimed(session_id) then
+			entry.state, entry.kind = "live", "claimed"
+			entry.reason = "already resumed by this terminal"
+		elseif foreign then
+			entry.state, entry.kind, entry.reason = "unknown", "claim_file", foreign
+		end
+		if entry.state == "dead" then
+			local ok, err = pcall(function()
+				local node = entry.node
+				local args = { cwd = node.cwd }
+				if node.domain then
+					args.domain = { DomainName = node.domain }
+				end
+				local _, new_pane
+				if new_window then
+					_, new_pane = new_window:spawn_tab(args)
+				else
+					_, new_pane, new_window = wezterm.mux.spawn_window(args)
+				end
+				node.pane = new_pane
+				tab_state.default_on_pane_restore(node)
+			end)
+			if ok then
+				opened = opened + 1
+			else
+				entry.error = tostring(err)
+			end
+		end
+	end
+
+	local report = restore_report.new(id, copy_name(id, meta), "resume the rest", entries, {})
+	settle_copy(id, meta, report)
+	if opened > 0 then
+		finish_run_after_typing({ report }, window, pane)
+	else
+		finish_run({ report }, window, pane)
+	end
 end
 
 --- Restore one or more instances. Each gets its own new windows, except that
@@ -833,14 +1050,15 @@ end
 ---@param restore_opts table options passed to restore_workspace
 local function restore_instances(instance_ids, window, pane, restore_opts)
 	local restored = 0
+	local reports = {}
 	-- Decide on what is running now, not on what the selector saw.
 	restore_guard.get_snapshot(true)
 	for _, id in ipairs(instance_ids) do
 		local old_meta = read_meta(id)
 		local workspace_state = pub.load_instance(id)
-		local refusal, detail
+		local refusal, detail, summary
 		if workspace_state then
-			refusal, _, detail = restore_refusal(id, workspace_state)
+			refusal, _, detail, summary = restore_refusal(id, workspace_state)
 		end
 		if refusal then
 			-- Checked here, not only in the selector: this is the function
@@ -860,19 +1078,27 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 			restore_opts.startup_pane_id = nil
 			opts.startup_pane_id = nil
 
-			require("resurrect.workspace_state").restore_workspace(workspace_state, opts)
+			-- One instance that throws must not stop the next, or retire this one.
+			local ok, failures = pcall(require("resurrect.workspace_state").restore_workspace, workspace_state, opts)
+			if not ok then
+				wezterm.log_error("resurrect: restoring instance " .. id .. " failed: " .. tostring(failures))
+				wezterm.emit("resurrect.error", "Restoring instance " .. id .. " failed: " .. tostring(failures))
+				failures = { { error = tostring(failures) } }
+			end
 
 			-- Carry over display_name from first restored instance
 			if restored == 1 and old_meta and old_meta.display_name and old_meta.display_name ~= "" then
 				set_display_name(old_meta.display_name)
 			end
 
-			-- Tombstone the old instance: move to restored/ subdirectory rather
-			-- than delete, so a crash before the next save still leaves a
-			-- recoverable copy on disk. Tombstones are filtered out of the
-			-- selector and pruned by cleanup_old_tombstones (retention_days).
-			pub.tombstone_instance(id)
+			local report = restore_report.new(id, copy_name(id, old_meta), "restore", summary.entries, failures or {},
+				summary.panes - summary.sessions)
+			settle_copy(id, old_meta, report)
+			table.insert(reports, report)
 		end
+	end
+	if #reports > 0 then
+		finish_run_after_typing(reports, window, pane)
 	end
 end
 
@@ -905,6 +1131,10 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 	-- only in part says how many sessions will be resumed, how many are
 	-- already running and how many are left alone as uncertain.
 	local refusals = {}
+	-- A copy a restore has kept also says so, and those with sessions to retry
+	-- get a "resume the rest" entry: refused as a whole or not, the guard is
+	-- asked again for each of those sessions.
+	local rest_choices = {}
 	for _, entry in ipairs(instances) do
 		local workspace_state = nil
 		if not pub.is_own_instance(entry.instance_id) then
@@ -920,6 +1150,18 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 			label = label .. "  (" .. refusal .. ")"
 		elseif note then
 			label = label .. "  (" .. note .. ")"
+		end
+		local held = #held_back_ids(entry.meta)
+		if entry.meta.restore_failed then
+			label = label .. "  [restore failed - restore it again to retry]"
+		elseif held > 0 then
+			label = label .. "  [restored in part: " .. held .. " held back]"
+		end
+		if held > 0 and not pub.is_own_instance(entry.instance_id) then
+			table.insert(rest_choices, {
+				id = restore_report.REST_PREFIX .. entry.instance_id,
+				label = restore_report.rest_label(copy_name(entry.instance_id, entry.meta), held),
+			})
 		end
 		table.insert(choices, {
 			id = entry.instance_id,
@@ -940,6 +1182,9 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 	end
 
 	-- Action entries at the bottom
+	for _, choice in ipairs(rest_choices) do
+		table.insert(choices, choice)
+	end
 	table.insert(choices, { id = "__BROWSE_NAMED__", label = "[Browse named saves]" })
 	table.insert(choices, { id = "__RENAME_MODE__", label = "[Rename an instance]" })
 	table.insert(choices, { id = "__DELETE_MODE__", label = "[Delete saved instances]" })
@@ -961,6 +1206,12 @@ function pub.show_instance_selector(window, pane, restore_opts, selected)
 						end
 					end
 					restore_instances(ids, inner_win, inner_pane, restore_opts)
+					return
+				end
+
+				local rest_id = id:match("^" .. restore_report.REST_PREFIX .. "(%d+_%d+)$")
+				if rest_id then
+					resume_rest(rest_id, inner_win, inner_pane)
 					return
 				end
 

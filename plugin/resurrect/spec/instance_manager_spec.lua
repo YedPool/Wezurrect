@@ -19,6 +19,7 @@ package.loaded["resurrect.workspace_state"] = nil
 package.loaded["resurrect.window_state"] = nil
 package.loaded["resurrect.tab_state"] = nil
 package.loaded["resurrect.fuzzy_loader"] = nil
+package.loaded["resurrect.restore_report"] = nil
 
 local emitted_events = {}
 local written_files = {}

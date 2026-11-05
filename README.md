@@ -385,6 +385,27 @@ If you use `setup()`, startup restoration is automatic. On startup:
 
 You can dismiss the selector (Esc) to start fresh.
 
+### When a restore holds sessions back
+
+The restore guard leaves a session alone when it cannot be sure it is not already
+running. A saved instance is only retired when nothing of it is waiting:
+
+- If a session was held back or failed, or the restore threw, the saved instance stays
+  in the Alt+R selector, marked `[restored in part: N held back]`. Parked sessions and
+  sessions already running do not keep it, and `retention_days` still counts from its
+  last save.
+- A selector that stays until you dismiss it lists each session and why. The same goes
+  to `~/.wezurrect/restore-reports/<instance id>.txt`, newest run first, with the lines
+  to resume a held-back session by hand.
+- `[Resume the rest of ...]`, in that selector and in Alt+R, asks the guard again for
+  the held-back sessions only and resumes those it now allows, in new tabs of one new
+  window. It is not a way around the guard: what it still refuses stays held back.
+- Restoring the kept instance as a whole also works; the guard and its claims stop
+  anything from being resumed twice.
+
+One window that throws during a restore no longer stops the others: the error is logged
+and emitted as `resurrect.error`, and `restore_workspace` returns the list of failures.
+
 For manual configuration without `setup()`, you can still use the legacy approach:
 
 ```lua

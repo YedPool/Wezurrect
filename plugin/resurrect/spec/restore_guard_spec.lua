@@ -38,6 +38,7 @@ local FIXTURE_IDS = {
 for _, name in ipairs({
     "file_io", "utils", "state_manager", "instance_manager", "workspace_state", "window_state",
     "tab_state", "fuzzy_loader", "process_handlers", "pane_tree", "json_text", "restore_guard", "guard_probe",
+    "restore_report",
 }) do
     package.loaded["resurrect." .. name] = nil
     package.preload["resurrect." .. name] = nil
@@ -2276,6 +2277,621 @@ describe("claim files: no takeover of a live claim through an empty read", funct
         run_timers()
         assert.equals(#text, #claim_file_text(DEAD))
         assert.equals(now, json.decode(claim_file_text(DEAD)).at)
+    end)
+end)
+
+-- ---------------------------------------------------------------------------
+-- A restore that holds sessions back stays recoverable
+-- ---------------------------------------------------------------------------
+
+describe("safe partial restore", function()
+    local INCIDENT = "1700000100_50000"
+    local RUNNER = "99999999-9999-4999-8999-999999999999" -- another terminal's session
+    local FREE, BUSY = "C:\\work\\free", "C:\\work\\busy"
+    local real_os_remove = os.remove
+    local existing, gui
+
+    local function sid(n)
+        return string.format("%08x-1111-4111-8111-111111111111", 0x10000000 + n)
+    end
+
+    local function report_text(id)
+        return file_store[guard.report_dir() .. sep .. id .. ".txt"]
+    end
+
+    local function meta_of(id)
+        return json.decode(file_store[instance_manager.get_instances_dir() .. sep .. id .. ".meta"])
+    end
+
+    local function is_kept(id)
+        return file_store[instance_manager.get_instances_dir() .. sep .. id .. ".json"] ~= nil
+    end
+
+    local function is_tombstoned(id)
+        return file_store[instance_manager.get_tombstone_dir() .. sep .. id .. ".json"] ~= nil
+    end
+
+    -- How many times a resume line for the session was typed, in any pane.
+    local function typed(id)
+        local count = 0
+        for _, pane in pairs(panes) do
+            for _, text in ipairs(pane.sent) do
+                if text:find("--resume " .. id, 1, true) then count = count + 1 end
+            end
+        end
+        return count
+    end
+
+    -- The saved copy of the incident: 18 panes. Run as the incident ran, the
+    -- guard allows 1-2, refuses 3-17 as uncertain and 18 as parked.
+    local function incident_trees()
+        local trees = {}
+        for n = 1, 18 do
+            trees[n] = claude_pane(sid(n), (n >= 3 and n <= 17) and BUSY or FREE)
+        end
+        return workspace_of(table.unpack(trees))
+    end
+
+    local function incident_world()
+        control_files(
+            { { RUNNER, 7000, START, true, START, BUSY } },
+            { { sid(18), "hibernated", "thrall" } }
+        )
+    end
+
+    -- What the guard sees after a restart: the two sessions the first restore
+    -- resumed are running, in their own folder. The runner may have gone.
+    local function restarted_world(runner_alive)
+        wezterm_stub.GLOBAL = {}
+        guard._test.new_lua_state()
+        local files = {
+            { sid(1), 7101, START, true, START, FREE },
+            { sid(2), 7102, START, true, START, FREE },
+        }
+        if runner_alive then
+            table.insert(files, { RUNNER, 7000, START, true, START, BUSY })
+        end
+        control_files(files, { { sid(18), "hibernated", "thrall" } })
+    end
+
+    local function restore(id)
+        instance_manager._test.restore_instances({ id }, gui, existing, restore_opts)
+        run_timers()
+    end
+
+    before_each(function()
+        reset()
+        instance_manager.instance_id = OWN_ID
+        for n = 1, 40 do real_os_remove(SPEC_CLAIMS .. real_sep .. sid(n)) end
+        incident_world()
+        existing = busy_pane()
+        gui = new_gui_window()
+    end)
+
+    after_each(function()
+        rawset(os, "remove", real_os_remove)
+    end)
+
+    describe("the incident: 18 panes, 2 resumed, 15 uncertain, 1 parked", function()
+        before_each(function()
+            save_instance_file(INCIDENT, incident_trees())
+            restore(INCIDENT)
+        end)
+
+        it("does not retire the saved copy", function()
+            assert.is_true(is_kept(INCIDENT), "the copy must stay in the selector")
+            assert.is_false(is_tombstoned(INCIDENT))
+        end)
+
+        it("types only the two sessions the guard allows", function()
+            for n = 1, 18 do
+                assert.equals(n <= 2 and 1 or 0, typed(sid(n)), "session " .. n)
+            end
+        end)
+
+        it("records the held-back sessions, not the resumed or parked ones, with the copy", function()
+            local held = meta_of(INCIDENT).held_back
+            assert.equals(15, #held)
+            local set = {}
+            for _, id in ipairs(held) do set[id] = true end
+            for n = 3, 17 do assert.is_true(set[sid(n)], "session " .. n) end
+            assert.is_nil(set[sid(1)])
+            assert.is_nil(set[sid(18)])
+        end)
+
+        it("writes a report under ~/.wezurrect, outside state/, listing every session", function()
+            local dir = guard.report_dir()
+            assert.truthy(dir:find(".wezurrect", 1, true), dir)
+            assert.falsy(dir:find(state_manager.save_state_dir, 1, true), "the state lister scans state/")
+            local text = report_text(INCIDENT)
+            assert.truthy(text, "no report written")
+            assert.truthy(text:find("Resumed: 2", 1, true), text)
+            assert.truthy(text:find("Held back: 15", 1, true), text)
+            assert.truthy(text:find("Parked: 1", 1, true), text)
+            assert.truthy(text:find("Failed: 0", 1, true), text)
+            for n = 1, 18 do
+                assert.truthy(text:find(sid(n), 1, true), "session " .. n .. " missing")
+            end
+            assert.truthy(text:find("in the same folder as running pid 7000", 1, true), "the guard's reason")
+            assert.truthy(text:find("no-restore marker", 1, true), "the parked reason")
+        end)
+
+        it("gives a held-back session the line to resume it by hand", function()
+            assert.truthy(report_text(INCIDENT):find("claude --resume " .. sid(3), 1, true))
+        end)
+
+        it("shows the outcome in a selector that stays until dismissed", function()
+            assert.truthy(gui.selector, "nothing shown")
+            assert.truthy(gui.selector.title:find("held back", 1, true), gui.selector.title)
+            assert.equals("__CLOSE__", gui.selector.choices[1].id, "a stray Enter must only close it")
+            assert.truthy(gui:choice("__RESUME_REST__" .. INCIDENT), "no resume-the-rest entry")
+            assert.truthy(gui.selector.description:find(guard.report_dir(), 1, true), "no report path")
+        end)
+
+        it("the selector says why a line was held back", function()
+            local found = false
+            for _, choice in ipairs(gui.selector.choices) do
+                if choice.label:find(sid(3), 1, true) and choice.label:find("same folder", 1, true) then
+                    found = true
+                end
+            end
+            assert.is_true(found)
+        end)
+
+        it("Alt+R offers the kept copy and a way to resume the rest", function()
+            instance_manager.show_instance_selector(gui, existing, restore_opts)
+            assert.truthy(gui:choice(INCIDENT), "the copy left the selector")
+            local rest = gui:choice("__RESUME_REST__" .. INCIDENT)
+            assert.truthy(rest, "no resume-the-rest entry")
+            assert.truthy(rest.label:find("15", 1, true), rest.label)
+        end)
+
+        it("does not touch the saved time, so retention still counts from the last save", function()
+            local dir = instance_manager.get_instances_dir()
+            local meta = meta_of(INCIDENT)
+            meta.last_save_epoch = 1700000100
+            file_store[dir .. sep .. INCIDENT .. ".meta"] = json.encode(meta)
+            restore(INCIDENT)
+            assert.equals(1700000100, meta_of(INCIDENT).last_save_epoch)
+        end)
+    end)
+
+    describe("what still retires a copy", function()
+        it("all sessions resumed: tombstoned, nothing to dismiss, report written", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.is_true(is_tombstoned(INCIDENT))
+            assert.is_false(is_kept(INCIDENT))
+            assert.is_nil(gui.selector)
+            assert.truthy(report_text(INCIDENT):find("Resumed: 2", 1, true))
+        end)
+
+        it("only parked sessions held back: tombstoned", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(18), FREE)))
+            restore(INCIDENT)
+            assert.is_true(is_tombstoned(INCIDENT))
+            assert.is_nil(gui.selector)
+            assert.truthy(report_text(INCIDENT):find("Parked: 1", 1, true))
+        end)
+
+        it("a running session is not held back: it would keep the copy forever", function()
+            control_files({ { sid(2), 7102, START, true, START, FREE } })
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), BUSY), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.is_true(is_tombstoned(INCIDENT))
+            assert.truthy(report_text(INCIDENT):find("Already running: 1", 1, true))
+        end)
+
+        it("a session in two panes of one copy counts as resumed, not held back", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(1), FREE)))
+            restore(INCIDENT)
+            assert.equals(1, typed(sid(1)))
+            assert.is_true(is_tombstoned(INCIDENT))
+        end)
+
+        it("a report that cannot be written does not change the decision", function()
+            local file_io = require("resurrect.file_io")
+            local real_write = file_io.write_file
+            file_io.write_file = function() return false, "disk full" end
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            local ok, err = pcall(restore, INCIDENT)
+            file_io.write_file = real_write
+            assert.is_true(ok, tostring(err))
+            assert.is_true(is_tombstoned(INCIDENT))
+        end)
+    end)
+
+    describe("refusals the summary cannot foresee", function()
+        it("a claim file that cannot be read keeps the copy", function()
+            local f = assert(io.open(SPEC_CLAIMS .. real_sep .. sid(1), "wb"))
+            f:write("not json")
+            f:close()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.equals(0, typed(sid(1)))
+            assert.equals(1, typed(sid(2)))
+            assert.is_true(is_kept(INCIDENT))
+            assert.same({ sid(1) }, meta_of(INCIDENT).held_back)
+            assert.truthy(report_text(INCIDENT):find("cannot be read", 1, true))
+        end)
+
+        it("a marker that appears before the line is typed moves the session to parked in the report", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            instance_manager._test.restore_instances({ INCIDENT }, gui, existing, restore_opts)
+            local path = SPEC_MARKERS .. real_sep .. sid(1) .. ".json"
+            local f = assert(io.open(path, "wb"))
+            f:close()
+            run_timers()
+            real_os_remove(path)
+            assert.equals(0, typed(sid(1)))
+            assert.truthy(report_text(INCIDENT):find("Parked: 1", 1, true), report_text(INCIDENT))
+        end)
+    end)
+
+    describe("a restore that throws", function()
+        local real_spawn
+        before_each(function() real_spawn = wezterm_stub.mux.spawn_window end)
+        after_each(function() wezterm_stub.mux.spawn_window = real_spawn end)
+
+        local function three_windows()
+            local state = workspace_of(claude_pane(sid(1), FREE))
+            local second = workspace_of(claude_pane(sid(2), FREE)).window_states[1]
+            local third = workspace_of(claude_pane(sid(3), FREE)).window_states[1]
+            table.insert(state.window_states, second)
+            table.insert(state.window_states, third)
+            return state
+        end
+
+        local function fail_second_spawn()
+            local calls = 0
+            wezterm_stub.mux.spawn_window = function(...)
+                calls = calls + 1
+                if calls == 2 then error("no such domain") end
+                return real_spawn(...)
+            end
+        end
+
+        it("restore_workspace goes on with the next window and returns what failed", function()
+            fail_second_spawn()
+            local failures = workspace_state_mod.restore_workspace(three_windows(), {
+                on_pane_restore = tab_state.default_on_pane_restore,
+            })
+            run_timers()
+            assert.equals(1, #failures)
+            assert.equals(2, failures[1].window)
+            assert.truthy(failures[1].error:find("no such domain", 1, true))
+            assert.equals(1, typed(sid(1)))
+            assert.equals(0, typed(sid(2)))
+            assert.equals(1, typed(sid(3)))
+        end)
+
+        it("one bad window keeps the copy, and the others are still restored", function()
+            fail_second_spawn()
+            save_instance_file(INCIDENT, three_windows())
+            restore(INCIDENT)
+            assert.is_true(is_kept(INCIDENT))
+            assert.is_false(is_tombstoned(INCIDENT))
+            assert.equals(1, typed(sid(1)))
+            assert.equals(1, typed(sid(3)))
+            assert.same({ sid(2) }, meta_of(INCIDENT).held_back)
+            local text = report_text(INCIDENT)
+            assert.truthy(text:find("Failed: 1", 1, true), text)
+            assert.truthy(text:find("no such domain", 1, true), text)
+            assert.truthy(gui.selector, "a failure must be shown")
+        end)
+
+        it("a throw from the restore itself keeps the copy", function()
+            local real = workspace_state_mod.restore_workspace
+            workspace_state_mod.restore_workspace = function() error("boom") end
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            local ok, err = pcall(restore, INCIDENT)
+            workspace_state_mod.restore_workspace = real
+            assert.is_true(ok, tostring(err))
+            assert.is_true(is_kept(INCIDENT))
+            assert.same({ sid(1) }, meta_of(INCIDENT).held_back)
+            assert.truthy(report_text(INCIDENT):find("boom", 1, true))
+        end)
+
+        it("every window failing does not name a workspace that does not exist", function()
+            wezterm_stub.mux.spawn_window = function() error("no spawn") end
+            local real_rename = wezterm_stub.mux.rename_workspace
+            local renamed = false
+            wezterm_stub.mux.rename_workspace = function() renamed = true end
+            local failures = workspace_state_mod.restore_workspace(three_windows(), {})
+            wezterm_stub.mux.rename_workspace = real_rename
+            assert.equals(3, #failures)
+            assert.is_false(renamed)
+        end)
+
+        it("a throw with no sessions in it keeps the copy without a resume-the-rest entry", function()
+            fail_second_spawn()
+            local state = workspace_of({ cwd = "C:\\a", text = "x" })
+            table.insert(state.window_states, workspace_of({ cwd = "C:\\b", text = "y" }).window_states[1])
+            save_instance_file(INCIDENT, state)
+            restore(INCIDENT)
+            assert.is_true(is_kept(INCIDENT))
+            assert.is_nil(gui:choice("__RESUME_REST__" .. INCIDENT))
+            instance_manager.show_instance_selector(gui, existing, restore_opts)
+            assert.truthy(gui:choice(INCIDENT).label:find("restore failed", 1, true), gui:choice(INCIDENT).label)
+            assert.is_nil(gui:choice("__RESUME_REST__" .. INCIDENT))
+        end)
+    end)
+
+    describe("a kept copy restored again", function()
+        before_each(function()
+            save_instance_file(INCIDENT, incident_trees())
+            restore(INCIDENT)
+        end)
+
+        it("in the same terminal resumes nothing twice: claims still apply", function()
+            restore(INCIDENT)
+            for n = 1, 18 do
+                assert.equals(n <= 2 and 1 or 0, typed(sid(n)), "session " .. n)
+            end
+            assert.is_true(is_kept(INCIDENT))
+        end)
+
+        it("after a restart resumes nothing twice: the guard still applies", function()
+            restarted_world(true)
+            restore(INCIDENT)
+            for n = 1, 18 do
+                assert.equals(n <= 2 and 1 or 0, typed(sid(n)), "session " .. n)
+            end
+            assert.equals(15, #meta_of(INCIDENT).held_back)
+        end)
+
+        it("retires once nothing is held back any more, parked and running sessions aside", function()
+            restarted_world(false)
+            restore(INCIDENT)
+            assert.is_true(is_tombstoned(INCIDENT))
+            assert.is_false(is_kept(INCIDENT))
+            for n = 1, 18 do
+                assert.equals(n <= 17 and 1 or 0, typed(sid(n)), "session " .. n)
+            end
+        end)
+
+        it("does not pile up: repeated restarts leave the one copy, one report", function()
+            for _ = 1, 3 do
+                restarted_world(true)
+                restore(INCIDENT)
+            end
+            local copies, reports = 0, 0
+            for path in pairs(file_store) do
+                if path:find(INCIDENT .. ".json", 1, true) then copies = copies + 1 end
+                if path:find(INCIDENT .. ".txt", 1, true) then reports = reports + 1 end
+            end
+            assert.equals(1, copies)
+            assert.equals(1, reports)
+        end)
+
+        it("retention prunes it and its report", function()
+            local dir = instance_manager.get_instances_dir()
+            local meta = meta_of(INCIDENT)
+            meta.last_save_epoch = os.time() - (instance_manager.retention_days + 1) * 86400
+            file_store[dir .. sep .. INCIDENT .. ".meta"] = json.encode(meta)
+            rawset(os, "remove", function(path)
+                file_store[path] = nil
+                return true
+            end)
+            instance_manager.cleanup_old_instances()
+            assert.is_false(is_kept(INCIDENT))
+            assert.is_nil(report_text(INCIDENT))
+        end)
+
+        it("deleting it in the selector takes its report too", function()
+            rawset(os, "remove", function(path)
+                file_store[path] = nil
+                return true
+            end)
+            instance_manager.delete_instance(INCIDENT)
+            assert.is_nil(report_text(INCIDENT))
+        end)
+
+        it("a report of a retired copy goes when its tombstone is pruned", function()
+            restarted_world(false)
+            restore(INCIDENT)
+            assert.is_true(is_tombstoned(INCIDENT))
+            local tomb = instance_manager.get_tombstone_dir()
+            file_store[tomb .. sep .. INCIDENT .. ".meta"] = '{"last_save_epoch":1700000000}'
+            rawset(os, "remove", function(path)
+                file_store[path] = nil
+                return true
+            end)
+            instance_manager.cleanup_old_tombstones(os.time())
+            assert.is_false(is_tombstoned(INCIDENT))
+            assert.is_nil(report_text(INCIDENT))
+        end)
+    end)
+
+    describe("resume the rest", function()
+        local function pick_rest(id)
+            instance_manager.show_instance_selector(gui, existing, restore_opts)
+            gui:pick("__RESUME_REST__" .. id, existing)
+            run_timers()
+        end
+
+        -- A copy with three held-back sessions: 3 in BUSY, 4 and 5 in OTHER_BUSY.
+        local OTHER_BUSY = "C:\\work\\busy2"
+        local function held_copy()
+            control_files({
+                { RUNNER, 7000, START, true, START, BUSY },
+                { sid(30), 7030, START, true, START, OTHER_BUSY },
+            })
+            save_instance_file(INCIDENT, workspace_of(
+                claude_pane(sid(1), FREE), claude_pane(sid(3), BUSY),
+                claude_pane(sid(4), OTHER_BUSY), claude_pane(sid(5), OTHER_BUSY)
+            ))
+            restore(INCIDENT)
+        end
+
+        it("resumes what the guard now allows, each in a new pane, and nothing else", function()
+            held_copy()
+            local windows_before = spawned_windows
+            local panes_before = {}
+            for id in pairs(panes) do panes_before[id] = #panes[id].sent end
+            -- OTHER_BUSY's session has ended; RUNNER is still there.
+            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            pick_rest(INCIDENT)
+
+            assert.equals(windows_before + 1, spawned_windows, "new panes go in one new window")
+            assert.equals(1, typed(sid(1)), "a resumed session is not part of the rest")
+            assert.equals(0, typed(sid(3)), "the guard still refuses this one")
+            assert.equals(1, typed(sid(4)))
+            assert.equals(1, typed(sid(5)))
+            for id, count in pairs(panes_before) do
+                assert.equals(count, #panes[id].sent, "typed into pane " .. id .. ", which already existed")
+            end
+            assert.same({ sid(3) }, meta_of(INCIDENT).held_back)
+            assert.is_true(is_kept(INCIDENT))
+        end)
+
+        it("retires the copy when the rest is done", function()
+            held_copy()
+            control_files({ { sid(1), 7001, START, true, START, FREE } })
+            pick_rest(INCIDENT)
+            assert.equals(1, typed(sid(3)))
+            assert.equals(1, typed(sid(4)))
+            assert.equals(1, typed(sid(5)))
+            assert.is_true(is_tombstoned(INCIDENT))
+            instance_manager.show_instance_selector(gui, existing, restore_opts)
+            assert.is_nil(gui:choice("__RESUME_REST__" .. INCIDENT))
+        end)
+
+        it("opens nothing when the guard still refuses everything, and says why", function()
+            held_copy()
+            local windows_before = spawned_windows
+            pick_rest(INCIDENT)
+            assert.equals(windows_before, spawned_windows)
+            assert.equals(0, typed(sid(3)))
+            assert.is_true(is_kept(INCIDENT))
+            assert.equals(3, #meta_of(INCIDENT).held_back)
+            assert.truthy(gui.selector.title:find("held back", 1, true))
+        end)
+
+        it("opens nothing when what is running cannot be read", function()
+            held_copy()
+            local windows_before = spawned_windows
+            control_dir_unreadable()
+            pick_rest(INCIDENT)
+            assert.equals(windows_before, spawned_windows)
+            assert.is_true(is_kept(INCIDENT))
+            assert.equals(3, #meta_of(INCIDENT).held_back)
+        end)
+
+        it("is no bypass: a parked or running session is not resumed and leaves the rest", function()
+            held_copy()
+            control_files(
+                { { sid(4), 7004, START, true, START, "C:\\elsewhere" } },
+                { { sid(3), "hibernated", "thrall" } }
+            )
+            pick_rest(INCIDENT)
+            assert.equals(0, typed(sid(3)), "parked")
+            assert.equals(0, typed(sid(4)), "running")
+            assert.equals(1, typed(sid(5)))
+            assert.is_true(is_tombstoned(INCIDENT), "nothing is held back any more")
+        end)
+
+        it("does not reopen a session this terminal has claimed", function()
+            held_copy()
+            local windows_before = spawned_windows
+            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            save_instance_file("1700000101_50001", workspace_of(claude_pane(sid(4), "C:\\work\\new")))
+            restore("1700000101_50001")
+            assert.equals(1, typed(sid(4)))
+            pick_rest(INCIDENT)
+            assert.equals(1, typed(sid(4)), "claimed by the other restore")
+            assert.equals(1, typed(sid(5)))
+            assert.equals(windows_before + 2, spawned_windows)
+        end)
+
+        it("opens no empty pane for a session this terminal has claimed", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(4), BUSY)))
+            restore(INCIDENT)
+            assert.same({ sid(4) }, meta_of(INCIDENT).held_back)
+            save_instance_file("1700000101_50001", workspace_of(claude_pane(sid(4), "C:\\work\\new")))
+            control_files({ { sid(1), 7001, START, true, START, FREE } })
+            restore("1700000101_50001")
+            local windows_before = spawned_windows
+            pick_rest(INCIDENT)
+            assert.equals(windows_before, spawned_windows)
+            assert.equals(1, typed(sid(4)))
+            assert.is_true(is_tombstoned(INCIDENT), "it is running now, so nothing is held back")
+        end)
+
+        it("opens no empty pane for a session whose claim file cannot be read, and keeps it held back", function()
+            held_copy()
+            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            local f = assert(io.open(SPEC_CLAIMS .. real_sep .. sid(4), "wb"))
+            f:write("not json")
+            f:close()
+            pick_rest(INCIDENT)
+            assert.equals(0, typed(sid(4)))
+            assert.equals(1, typed(sid(5)))
+            assert.same({ sid(3), sid(4) }, meta_of(INCIDENT).held_back)
+            assert.truthy(report_text(INCIDENT):find("cannot be read", 1, true))
+        end)
+
+        it("a pane that cannot be opened keeps the copy and the session held back", function()
+            held_copy()
+            control_files({ { sid(1), 7001, START, true, START, FREE } })
+            local real_spawn = wezterm_stub.mux.spawn_window
+            wezterm_stub.mux.spawn_window = function() error("no spawn") end
+            local ok, err = pcall(pick_rest, INCIDENT)
+            wezterm_stub.mux.spawn_window = real_spawn
+            assert.is_true(ok, tostring(err))
+            assert.is_true(is_kept(INCIDENT))
+            assert.same({ sid(3), sid(4), sid(5) }, meta_of(INCIDENT).held_back)
+            assert.truthy(report_text(INCIDENT):find("no spawn", 1, true))
+        end)
+
+        it("refuses a copy with a saved command edited since, even for its other sessions", function()
+            held_copy()
+            local tampered = workspace_of(claude_pane(sid(3), BUSY), claude_pane(sid(4), OTHER_BUSY))
+            tampered.window_states[1].tabs[1].pane_tree.process.argv = {
+                "claude", "--resume", sid(3), "--evil",
+            }
+            local dir = instance_manager.get_instances_dir()
+            file_store[dir .. sep .. INCIDENT .. ".json"] =
+                json.encode({ instance_id = INCIDENT, workspace_state = tampered })
+            local windows_before = spawned_windows
+            control_files({ { sid(1), 7001, START, true, START, FREE } })
+            pick_rest(INCIDENT)
+            assert.equals(windows_before, spawned_windows)
+            assert.equals(0, typed(sid(3)))
+            assert.equals(0, typed(sid(4)))
+            assert.is_true(is_kept(INCIDENT))
+        end)
+
+        it("is reachable from the outcome selector too", function()
+            held_copy()
+            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            gui:pick("__RESUME_REST__" .. INCIDENT, existing)
+            run_timers()
+            assert.equals(1, typed(sid(4)))
+        end)
+
+        it("the report keeps the earlier run after the rest has run", function()
+            held_copy()
+            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            pick_rest(INCIDENT)
+            local text = report_text(INCIDENT)
+            local _, runs = text:gsub("Wezurrect restore report", "")
+            assert.equals(2, runs, text)
+            assert.truthy(text:find("resume the rest", 1, true), text)
+        end)
+
+        it("a tampered held_back list resumes only sessions the copy really holds", function()
+            held_copy()
+            local dir = instance_manager.get_instances_dir()
+            local meta = meta_of(INCIDENT)
+            meta.held_back = { "not a uuid", sid(39) }
+            file_store[dir .. sep .. INCIDENT .. ".meta"] = json.encode(meta)
+            local windows_before = spawned_windows
+            control_files({ { sid(1), 7001, START, true, START, FREE } })
+            pick_rest(INCIDENT)
+            assert.equals(windows_before, spawned_windows)
+            assert.equals(0, typed(sid(39)))
+        end)
     end)
 end)
 

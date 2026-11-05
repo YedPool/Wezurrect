@@ -234,10 +234,13 @@ function pub.default_on_pane_restore(pane_tree)
 
 		if rejected then
 			-- The saved command was refused before any line was built.
-			restore_guard.note_skipped({
+			pane_tree.restore_verdict = {
+				allow = false,
 				state = "unknown",
+				kind = "malformed",
 				reason = "the saved command is not exactly 'claude --resume <session id>', so it is not typed",
-			}, pane:pane_id())
+			}
+			restore_guard.note_skipped(pane_tree.restore_verdict, pane:pane_id())
 			restore_guard.schedule_report(pub.process_restore_delay_seconds + 1)
 		elseif restore_cmd then
 			local pane_id = pane:pane_id()
@@ -250,6 +253,9 @@ function pub.default_on_pane_restore(pane_tree)
 				cwd = pane_tree.cwd
 			end
 			local verdict = restore_guard.check_command(restore_cmd, cwd, pane_id)
+			-- Left on the saved pane for restore_report: this pane's own answer,
+			-- with .typed added below once the delayed line has gone out or not.
+			pane_tree.restore_verdict = verdict
 			if verdict.allow and verdict.target then
 				-- A Claude resume line is never typed as the state file gave
 				-- it. The guard has checked its shape and rebuilt it from
@@ -269,6 +275,7 @@ function pub.default_on_pane_restore(pane_tree)
 					local target_pane = wezterm.mux.get_pane(pane_id)
 					if target_pane and verdict.target and restore_guard.marked_now(verdict.target.session_id) then
 						-- Parked or hibernated while the line was waiting.
+						verdict.typed = "parked"
 						restore_guard.note_skipped({
 							state = "parked",
 							target = verdict.target,
@@ -276,9 +283,12 @@ function pub.default_on_pane_restore(pane_tree)
 						}, pane_id)
 					elseif target_pane then
 						target_pane:send_text(restore_cmd .. ENTER)
+						verdict.typed = "yes"
 						if verdict.target then
 							restore_guard.note_resumed()
 						end
+					else
+						verdict.typed = "no_pane"
 					end
 				end)
 			end

@@ -194,6 +194,13 @@ function pub.marker_dir()
 	return home_dir() .. sep .. ".wezurrect" .. sep .. "no-restore"
 end
 
+--- The folder of restore reports (restore_report.lua), ~/.wezurrect/restore-reports.
+---@return string
+function pub.report_dir()
+	local sep = utils.separator
+	return home_dir() .. sep .. ".wezurrect" .. sep .. "restore-reports"
+end
+
 -- ---------------------------------------------------------------------------
 -- Reading the answer
 -- ---------------------------------------------------------------------------
@@ -969,15 +976,17 @@ end
 ---@param cmd string the restore command built for a pane
 ---@param cwd string|nil the pane's working directory
 ---@param pane_id number|nil the pane the line will be typed into
----@return table verdict { allow, target?, state?, reason?, pid? }
+---@return table verdict { allow, target?, state?, reason?, pid?, kind? } kind as in
+---  inspect, or "claimed" (this process resumed it) or "claim_file" (its claim file
+---  could not be taken: maybe another process is resuming it, maybe nobody is)
 function pub.check_command(cmd, cwd, pane_id)
 	local target = pub.resume_target(cmd)
 	if not target then
 		return { allow = true }
 	end
-	local state, reason, pid = pub.inspect(target, cwd, pub.get_snapshot())
+	local state, reason, pid, kind = pub.inspect(target, cwd, pub.get_snapshot())
 	if state ~= "dead" then
-		return { allow = false, target = target, state = state, reason = reason, pid = pid }
+		return { allow = false, target = target, state = state, reason = reason, pid = pid, kind = kind }
 	end
 	if recently_claimed(target.session_id) then
 		return {
@@ -985,11 +994,12 @@ function pub.check_command(cmd, cwd, pane_id)
 			target = target,
 			state = "live",
 			reason = "already resumed in another pane by this restore",
+			kind = "claimed",
 		}
 	end
 	local taken, why = claim_file(target.session_id, pane_id)
 	if not taken then
-		return { allow = false, target = target, state = "live", reason = why }
+		return { allow = false, target = target, state = "live", reason = why, kind = "claim_file" }
 	end
 	claim(target.session_id, pane_id)
 	return { allow = true, target = target, state = "dead" }
@@ -1097,7 +1107,8 @@ end
 --- anything. Accepts a workspace, window or tab state.
 ---@param state table
 ---@param get_command fun(pane_tree: table): string|nil builds a pane's restore command
----@return table summary { panes, sessions, live, unknown, error? }
+---@return table summary { panes, sessions, live, unknown, error?, entries } entries has one
+---  { node, target, cwd, state, reason, kind } per pane with a session, node being the saved pane
 function pub.summarize(state, get_command)
 	local snapshot = pub.get_snapshot()
 	local summary = {
@@ -1108,6 +1119,7 @@ function pub.summarize(state, get_command)
 		-- Everything that is neither resumable nor known to be running.
 		unknown = 0,
 		error = snapshot.error, error_label = snapshot.error_label,
+		entries = {},
 	}
 
 	local function walk(node, depth)
@@ -1125,7 +1137,10 @@ function pub.summarize(state, get_command)
 		if target then
 			summary.sessions = summary.sessions + 1
 			local cwd = (type(node.process) == "table" and node.process.cwd) or node.cwd
-			local pane_state, _, _, kind = pub.inspect(target, cwd, snapshot)
+			local pane_state, reason, _, kind = pub.inspect(target, cwd, snapshot)
+			table.insert(summary.entries, {
+				node = node, target = target, cwd = cwd, state = pane_state, reason = reason, kind = kind,
+			})
 			if pane_state == "dead" then
 				summary.resumable = summary.resumable + 1
 			elseif pane_state == "live" then
