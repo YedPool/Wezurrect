@@ -10,7 +10,9 @@
 -- ~/.claude/sessions/<pid>.json with the fields sessionId, pid and procStart
 -- (the process start time). A session is LIVE when a control file names it,
 -- that pid is a running process, AND the process start time equals procStart.
--- A pid alone proves nothing: Windows reuses pids.
+-- A pid alone proves nothing: Windows reuses pids. A session is also LIVE when
+-- a running claude process has "--resume <that id>" on its command line: one
+-- such process was seen with no control file at all.
 --
 -- Fail closed. If the control files cannot be read, or the answer for one
 -- session cannot be established, the resume command is NOT sent.
@@ -47,9 +49,10 @@ pub.start_time_tolerance = 10000000
 -- is not used either.
 pub.query_time_limit_seconds = 10
 
--- The work: list the control files and look up each pid. Runs inside the
--- wrapper below. Written without double quotes or newlines so the whole
--- script survives being passed as a single process argument.
+-- The work: list the control files and look up each pid, list the markers,
+-- list the claude processes. Runs inside the wrapper below. Written without
+-- double quotes or newlines so the whole script survives being passed as a
+-- single process argument.
 local QUERY_WORK = table.concat({
 	"$ErrorActionPreference = 'Stop'; $t = [char]9;",
 	"try { $n = 0; $dirs = @(@DIRS@);",
@@ -83,7 +86,33 @@ local QUERY_WORK = table.concat({
 	"$r = [string]$j.reason; $by = [string]$j.by } catch { };",
 	"$r = $r -replace '[^ -~]', ' '; $by = $by -replace '[^ -~]', ' ';",
 	"('M', $f.BaseName, $r, $by) -join $t };",
-	"('END', $n, $m) -join $t }",
+	"$q = 0; $pl = @();",
+	"try { $pl = @(Get-CimInstance -ClassName Win32_Process -Filter 'Name LIKE ''claude%''' -Property ProcessId,Name,CommandLine) }",
+	"catch { throw ('process list unreadable: ' + $_.Exception.Message) };",
+	-- Windows' own argument splitter, shell32 CommandLineToArgvW, declared at
+	-- run time (no compiler process, about 50 ms). Its memory is not freed: the
+	-- process ends right after this.
+	"try { $tb = [AppDomain]::CurrentDomain.DefineDynamicAssembly((New-Object Reflection.AssemblyName 'WezArgv'), 'Run');",
+	"$tb = $tb.DefineDynamicModule('WezArgv').DefineType('WezArgv', 'Public,Class');",
+	"$pm = $tb.DefinePInvokeMethod('CommandLineToArgvW', 'shell32.dll',",
+	"[Reflection.MethodAttributes]'Public,Static,PinvokeImpl', [Reflection.CallingConventions]::Standard,",
+	"[IntPtr], @([string], [int].MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi,",
+	"[Runtime.InteropServices.CharSet]::Unicode);",
+	"$pm.SetImplementationFlags('PreserveSig'); $split = $tb.CreateType() }",
+	"catch { throw ('process list unreadable, no argument splitter: ' + $_.Exception.Message) };",
+	"foreach ($c in $pl) { $cl = [string]$c.CommandLine;",
+	"if ($c.Name -notmatch '^claude(\\d*|-[a-z0-9-]+)(\\.exe)?$') { continue };",
+	"if (-not $cl) { continue };",
+	"$ac = 0; $ap = $split::CommandLineToArgvW($cl, [ref]$ac);",
+	"if ($ap -eq [IntPtr]::Zero) { throw 'process list unreadable: a command line could not be split' };",
+	"$av = @(for ($k = 0; $k -lt $ac; $k++) {",
+	"[Runtime.InteropServices.Marshal]::PtrToStringUni(",
+	"[Runtime.InteropServices.Marshal]::ReadIntPtr($ap, $k * [IntPtr]::Size)) });",
+	"if ($av.Count -ge 2 -and $av[1] -ceq '--chrome-native-host') { continue };",
+	"for ($k = 1; $k -lt $av.Count - 1; $k++) { if ($av[$k] -ceq '--') { break };",
+	"if ($av[$k] -ceq '--resume' -and $av[$k + 1] -cmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\z') {",
+	"$q++; ('P', $av[$k + 1], $c.ProcessId) -join $t } } };",
+	"('END', $n, $m, $q) -join $t }",
 	"catch { ('ERR', $_.Exception.Message) -join $t }",
 }, " ")
 
@@ -100,9 +129,10 @@ local QUERY_SCRIPT = table.concat({
 	"[Console]::Out.Flush(); [Environment]::Exit(0) } }",
 	"catch { ('ERR', $_.Exception.Message) -join $t }",
 }, " ")
---- Ask the operating system which Claude control files exist and whether the
---- process each one names is running. THE ONLY PLACE THIS MODULE TOUCHES THE
---- OS; everything else works on the text it returns.
+--- Ask the operating system which Claude control files exist, whether the
+--- process each one names is running, and which session ids live claude
+--- processes name on their command lines. THE ONLY PLACE THIS MODULE TOUCHES
+--- THE OS; everything else works on the text it returns.
 ---
 --- Contract:
 ---   dirs    control-file directories. The first MUST exist; later ones are
@@ -116,6 +146,7 @@ local QUERY_SCRIPT = table.concat({
 ---       one per *.json control file. sessionId, procStart and cwd are copied
 ---       from the file (empty when the file could not be parsed; pid then
 ---       falls back to the file's base name, which Claude sets to the pid).
+---       No decision reads cwd any more; it stays so the fields keep their places.
 ---       running is 1 when a process with that pid exists now, 0 when not,
 ---       and 1 when the pid is unknown (so it can never read as "gone").
 ---       startTime is that process's start time as a FILETIME in decimal --
@@ -133,8 +164,23 @@ local QUERY_SCRIPT = table.concat({
 ---       one per *.json entry in the marker folder, readable or not. name is
 ---       the entry's base name; reason and by are copied from the file (only
 ---       printable ASCII kept), empty when it could not be parsed.
----   END <n> <m> last line; n is the number of S lines, m of M lines. Its
----               absence means the output is incomplete and must not be trusted.
+---   P <sessionId> <pid>
+---       one per "--resume <lower-case UUID>" on the command line of a live
+---       process named claude, claude<digits> or claude-<name>, from one bulk
+---       Win32_Process query. The line is split by Windows' own
+---       CommandLineToArgvW and --resume and the id must be two whole arguments
+---       before any "--", so text inside another flag's value does not count.
+---       A native host (--chrome-native-host as the first argument, its only
+---       shape) is not a session and is left out. Which flags take a value is
+---       not known here: "--some-flag --resume <id>" as separate arguments still
+---       reads as a resume, which can only refuse that one id. A process whose
+---       command line is unreadable (elevated, or another user's) names nothing
+---       and gives no P line: refusing every restore because of one would be worse than
+---       relying on its control file. A failed query is an ERR for the whole
+---       answer.
+---   END <n> <m> <p> last line; n is the number of S lines, m of M lines, p of
+---               P lines. Its absence, or a count that differs, means the
+---               output is incomplete and must not be trusted.
 ---   ERR <text>  the query failed (for example the first directory is gone).
 ---
 --- Time: wezterm.run_child_process takes no timeout. The script bounds its
@@ -224,13 +270,15 @@ end
 ---@return table[]|nil records { session_id, pid, proc_start, running, start_time, cwd, file_time }
 ---@return string|nil err
 ---@return table[]|nil markers { name, reason, by }
+---@return table[]|nil processes { session_id, pid }
 local function parse_query_output(stdout)
 	if type(stdout) ~= "string" then
 		return nil, "no output"
 	end
 	local records = {}
 	local markers = {}
-	local declared, declared_markers = nil, nil
+	local processes = {}
+	local declared, declared_markers, declared_processes = nil, nil, nil
 	for line in stdout:gmatch("[^\r\n]+") do
 		local fields = split_tabs(line)
 		if fields[1] == "ERR" then
@@ -238,8 +286,11 @@ local function parse_query_output(stdout)
 		elseif fields[1] == "END" then
 			declared = tonumber(fields[2])
 			declared_markers = tonumber(fields[3])
+			declared_processes = tonumber(fields[4])
 		elseif fields[1] == "M" then
 			table.insert(markers, { name = fields[2] or "", reason = fields[3] or "", by = fields[4] or "" })
+		elseif fields[1] == "P" then
+			table.insert(processes, { session_id = fields[2] or "", pid = tonumber(fields[3] or "") })
 		elseif fields[1] == "S" then
 			table.insert(records, {
 				session_id = fields[2] or "",
@@ -255,10 +306,11 @@ local function parse_query_output(stdout)
 			})
 		end
 	end
-	if declared == nil or declared ~= #records or declared_markers ~= #markers then
+	if declared == nil or declared ~= #records or declared_markers ~= #markers
+		or declared_processes ~= #processes then
 		return nil, "incomplete answer from the process query"
 	end
-	return records, nil, markers
+	return records, nil, markers, processes
 end
 
 -- A decimal string as an integer, or nil when it is not one (or overflows).
@@ -324,11 +376,13 @@ end
 
 --- Turn records into a snapshot: sessions[<id>] = { state, pid }, the records
 --- with their state, parked[<id>] = { reason, by } for every no-restore
---- marker, and .error when nothing in it may be trusted.
+--- marker, and .error when nothing in it may be trusted. A session named on a
+--- live claude command line is live whatever its control file says.
 ---@param records table[]
 ---@param markers table[]|nil
+---@param processes table[]|nil
 ---@return table snapshot
-local function build_snapshot(records, markers)
+local function build_snapshot(records, markers, processes)
 	local snapshot = { sessions = {}, records = records, parked = {} }
 	for _, marker in ipairs(markers or {}) do
 		-- Windows file names ignore case. A name that is not a session id
@@ -364,13 +418,26 @@ local function build_snapshot(records, markers)
 			end
 		end
 	end
+	for _, process in ipairs(processes or {}) do
+		if not is_session_id(process.session_id) or not process.pid then
+			-- The script cannot print this, so the answer is not what it seems.
+			snapshot.error = "the process list holds a line that could not be read"
+		else
+			local known = snapshot.sessions[process.session_id]
+			if not known or known.state ~= "live" then
+				snapshot.sessions[process.session_id] = { state = "live", pid = process.pid, on_command_line = true }
+			end
+		end
+	end
 	return snapshot
 end
 
 -- A few plain words for why the running sessions could not be read, short
 -- enough for a selector entry. The full text stays in snapshot.error.
 local function error_label(err)
-	if err:find("control directory not found", 1, true) then
+	if err:find("process list", 1, true) then
+		return "process list unreadable"
+	elseif err:find("control directory not found", 1, true) then
 		return "control folder not found"
 	elseif err:find("no control files", 1, true) then
 		return "control folder is empty"
@@ -399,7 +466,7 @@ function pub.get_snapshot(force)
 	if not force and cached_snapshot and os.time() - cached_at < pub.snapshot_ttl_seconds then
 		return cached_snapshot
 	end
-	local records, markers
+	local records, markers, processes
 	local asked_at = os.time()
 	local stdout, err = pub.run_query(pub.control_dirs(), pub.marker_dir())
 	local took = os.time() - asked_at
@@ -408,10 +475,10 @@ function pub.get_snapshot(force)
 		stdout, err = nil, "the process query took " .. took .. " seconds"
 	end
 	if stdout then
-		records, err, markers = parse_query_output(stdout)
+		records, err, markers, processes = parse_query_output(stdout)
 	end
 	if records then
-		cached_snapshot = build_snapshot(records, markers)
+		cached_snapshot = build_snapshot(records, markers, processes)
 	else
 		cached_snapshot = { sessions = {}, records = {}, parked = {}, error = err or "unknown error" }
 	end
@@ -913,33 +980,6 @@ local function claim_file(session_id, pane_id)
 	return false, "another WezTerm process claimed it at the same moment"
 end
 
--- Compare working directories the way Windows does: slash direction, case and
--- a trailing separator do not matter. WezTerm reports /C:/..., Claude C:\...
-local function normalize_cwd(cwd)
-	if type(cwd) ~= "string" or cwd == "" then
-		return nil
-	end
-	local n = cwd:gsub("\\", "/"):gsub("^/(%a:)", "%1"):gsub("/+$", "")
-	if utils.is_windows then
-		n = n:lower()
-	end
-	return n
-end
-
--- A running session in the pane's directory, other than ones this plugin has
--- just resumed itself. Without a directory to compare, any running session.
-local function running_session_in(cwd, snapshot)
-	local wanted = normalize_cwd(cwd)
-	for _, record in ipairs(snapshot.records) do
-		if record.state ~= "dead" and not recently_claimed(record.session_id) then
-			if not wanted or normalize_cwd(record.cwd) == wanted then
-				return record
-			end
-		end
-	end
-	return nil
-end
-
 --- Whether the session a command would resume is running, per a snapshot.
 ---@param target table from resume_target
 ---@param cwd string|nil the pane's working directory
@@ -949,9 +989,8 @@ end
 ---@return number|nil pid
 ---@return string|nil kind why, as a word: "live", "malformed" (the saved
 ---  command or directory is not usable), "reading" (the running sessions
----  could not be read), "rotated" (maybe running under a new id),
----  "unconfirmed" (a process is there but its start time is not known) or
----  "parked" (a no-restore marker names it)
+---  could not be read), "unconfirmed" (a process is there but its start
+---  time is not known) or "parked" (a no-restore marker names it)
 function pub.inspect(target, cwd, snapshot)
 	if target.unreadable then
 		return "unknown", "the saved command is not exactly 'claude --resume <session id>', so it is not typed",
@@ -972,20 +1011,11 @@ function pub.inspect(target, cwd, snapshot)
 	end
 	local session = snapshot.sessions[target.session_id]
 	if not session or session.state == "dead" then
-		-- Not running under this id. But Claude can give a conversation a
-		-- new id (compaction, /resume); the saved id then has no control
-		-- file while the conversation runs on. The one trace is a running
-		-- session in the same directory, so that is "unknown", not "dead".
-		local other = running_session_in(cwd, snapshot)
-		if other then
-			return "unknown", "not running under this id, but in the same folder as running pid "
-				.. tostring(other.pid) .. ", so it may be the same conversation under a new id"
-				.. " - resume it by hand if it is not", other.pid, "rotated"
-		end
 		return "dead"
 	end
 	if session.state == "live" then
-		return "live", "already running pid " .. tostring(session.pid), session.pid, "live"
+		return "live", "already running pid " .. tostring(session.pid)
+			.. (session.on_command_line and " (named on its command line)" or ""), session.pid, "live"
 	end
 	return "unknown", "liveness unreadable (pid " .. tostring(session.pid)
 		.. " is running but its start time could not be confirmed)", session.pid, "unconfirmed"
@@ -1130,9 +1160,9 @@ function pub.summarize(state, get_command)
 	local snapshot = pub.get_snapshot()
 	local summary = {
 		panes = 0, sessions = 0,
-		-- Of the sessions: will be resumed / already running / maybe running
-		-- under a new id / process there but not confirmed / unusable command.
-		resumable = 0, live = 0, parked = 0, rotated = 0, unconfirmed = 0, malformed = 0,
+		-- Of the sessions: will be resumed / already running / parked /
+		-- process there but not confirmed / unusable command.
+		resumable = 0, live = 0, parked = 0, unconfirmed = 0, malformed = 0,
 		-- Everything that is neither resumable nor known to be running.
 		unknown = 0,
 		error = snapshot.error, error_label = snapshot.error_label,
@@ -1255,13 +1285,6 @@ function pub.refusal(summary)
 	if summary.parked > 0 then
 		table.insert(label, summary.parked .. " parked")
 		table.insert(detail, count_of(summary.parked, "has", "have") .. " a no-restore marker (parked or hibernated)")
-	end
-	if summary.rotated > 0 then
-		table.insert(label, summary.rotated .. " may be running under a new id")
-		table.insert(detail, count_of(summary.rotated, "is", "are") .. " not running under the saved id but"
-			.. " share a working folder with a running session, so may be the same"
-			.. (summary.rotated == 1 and " conversation" or " conversations")
-			.. " under a new id - resume those by hand if they are not")
 	end
 	if summary.unconfirmed > 0 then
 		table.insert(label, summary.unconfirmed .. " could not be checked")

@@ -562,8 +562,9 @@ A restore types `claude --resume <session id>` only after
 `restore_guard.lua` has cleared it. It is never typed when:
 
 - the session is already running (a control file in `~/.claude/sessions`
-  names it, its pid runs, and the process start time matches), or whether it
-  runs cannot be established;
+  names it, its pid runs, and the process start time matches; or a live claude
+  process has `--resume <that id>` on its command line), or whether it runs
+  cannot be established;
 - a restore already resumed or scheduled the same session, and its claim
   still holds: for two minutes, and for as long as the pane it was typed into
   is open. Inside one WezTerm process the claim lives in `wezterm.GLOBAL`, so
