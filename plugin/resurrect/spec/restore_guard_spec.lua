@@ -399,10 +399,32 @@ describe("restore guard: resume commands", function()
         assert.truthy(all_sent(pane):find(DEAD, 1, true))
     end)
 
-    it("treats a parsed control file written before the process started as dead", function()
-        control_files({ { REUSED, 8181, START, true, START, "C:\\work", EARLIER } })
+    it("treats a parsed control file with no procStart written before the process started as dead", function()
+        control_files({ { REUSED, 8181, "", true, START, "C:\\work", EARLIER } })
         local pane = restore_pane(claude_pane(REUSED))
         assert.truthy(all_sent(pane):find(REUSED, 1, true))
+    end)
+
+    it("treats a control file with an unusable procStart written before the process started as dead", function()
+        control_files({ { REUSED, 8181, "not-a-time", true, START, "C:\\work", EARLIER } })
+        local pane = restore_pane(claude_pane(REUSED))
+        assert.truthy(all_sent(pane):find(REUSED, 1, true))
+    end)
+
+    -- A clock stepped back between the process starting and Claude writing its
+    -- file: the file looks older than the process, yet procStart still names it.
+    it("reads a matching procStart as live even when the file looks older than the process", function()
+        control_files({ { LIVE, 4242, START, true, START, "C:\\work", EARLIER } })
+        assert.equals("", all_sent(restore_pane(claude_pane(LIVE))))
+    end)
+
+    it("reads a procStart that differs from the start time as dead, whatever the file's age", function()
+        for _, file_time in ipairs({ LATER, EARLIER }) do
+            guard._test.reset()
+            control_files({ { REUSED, 8181, "134000000000000000", true, START, "C:\\work", file_time } })
+            local pane = restore_pane(claude_pane(REUSED))
+            assert.truthy(all_sent(pane):find(REUSED, 1, true))
+        end
     end)
 
     it("never reads a control file written after the process started as dead", function()
