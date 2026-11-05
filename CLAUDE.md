@@ -18,7 +18,7 @@ Fork of MLFlexer/resurrect.wezterm with Windows fixes, security hardening, and C
 ## Plugin Architecture
 
 - Entry point: `plugin/init.lua`
-- Modules: `plugin/resurrect/` (state_manager, instance_manager, pane_tree, tab_state, window_state, workspace_state, process_handlers, file_io, encryption, fuzzy_loader, utils)
+- Modules: `plugin/resurrect/` (state_manager, instance_manager, pane_tree, tab_state, window_state, workspace_state, process_handlers, file_io, encryption, fuzzy_loader, utils, restore_guard, restore_report)
 - Plugin cache on Windows: `%APPDATA%/wezterm/plugins/httpssCssZssZsgithubsDscomsZsYedPoolsZsresurrectsDswezterm/`
 - After pushing changes, also copy modified files to the plugin cache for immediate testing
 
@@ -52,6 +52,16 @@ Fork of MLFlexer/resurrect.wezterm with Windows fixes, security hardening, and C
 - Spec hygiene: busted runs every spec file in one process; a spec that replaces `os.remove` or other globals must put them back
 - A session with a no-restore marker `~/.wezurrect/no-restore/<id>.json` (parked/hibernated) is never resumed; the marker exists = refused, contents only for the log. The marker folder is listed by the same `run_query` call (`M` lines). Contract in README
 - The instance ID lives in `wezterm.GLOBAL` so a config reload keeps it. A terminal's own instance, and a saved copy whose sessions are all running, cannot be restored
+
+## Partial Restores
+
+- A saved copy is retired (tombstoned) only when nothing of it is waiting. It stays when a session was held back or failed, or its restore threw. Parked sessions are held back on purpose and a session its control file confirms (matching start time) is safe where it runs: neither keeps a copy. Weaker signs of running (an id on a command line with no confirming control file, a claim) still refuse the resume but count as held back: after `--resume X` and `/clear`, or with a pane whose Claude has exited, they read as running with nothing running that conversation. Exception: a claim from this same run, where the session was typed in another pane or copy, counts as running `restore_report.keeps_copy` decides, from `restore_guard.summarize`'s entries and the verdict `default_on_pane_restore` leaves on each pane tree node, never from the guard's report tally (global, and `note_resumed` runs in a timer)
+- A kept copy's `.meta` lists `held_back` (session ids) and `restore_failed`. `last_save_epoch` is never touched, so `retention_days` still prunes it. A restore never creates a copy, so restarts cannot multiply them
+- Reports: `~/.wezurrect/restore-reports/<instance id>.txt`, newest run first, removed with the copy or its tombstone. Never under `state/`: the state lister scans it recursively for `*.json`
+- A copy is retired only after its typing timers have fired (`settle_copy` with `lines_are_out`). A config reload drops those timers, so the copy then stays listed instead of being retired over a line never typed. Its pane's claim still blocks a retry until that pane is closed and the claim has run out; a retry meanwhile holds the session back with its by-hand line
+- The outcome is shown in an InputSelector that stays until dismissed, only when something is held back or failed. It is `fuzzy = true` and every row only closes it: it may appear under someone typing, the default mode selects rows on digits and letters, and fuzzy mode picks the best match on Enter
+- "Resume the rest" (Alt+R only) asks the guard again for the `held_back` sessions only and types through `default_on_pane_restore`, in panes of one new window. There is no force option. A copy holding a malformed command is refused as a whole here too
+- `restore_workspace` catches errors per window, emits `resurrect.error` and returns the failures
 
 ## Multi-Instance State Management
 
