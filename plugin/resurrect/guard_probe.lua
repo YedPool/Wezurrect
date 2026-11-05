@@ -24,7 +24,7 @@ local restore_guard = require("resurrect.restore_guard")
 local pub = {}
 
 -- Bump with every change to what a restore refuses.
-pub.GUARD_VERSION = "2026-10-16.4 (claims per pane + cross-process claim files, no-restore markers)"
+pub.GUARD_VERSION = "2026-11-05.5 (no same-folder guess; a session on a live claude command line, split by Windows into real arguments, is live; matching procStart is live whatever the file time; with no usable procStart, control file older than its process is dead; start time falls back to CIM CreationDate; claims per pane + cross-process claim files, no-restore markers)"
 
 pub.USER_VAR = "resurrect_guard_probe"
 
