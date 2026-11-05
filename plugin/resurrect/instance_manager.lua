@@ -851,10 +851,15 @@ end
 --- A kept copy's last_save_epoch is left as it is: retention_days counts from
 --- the last save, so repeated restores cannot keep it alive. No copy is ever
 --- added here, so restarting can only leave the copies that already existed.
+---
+--- Retiring waits for lines_are_out: resume lines go out from call_after timers,
+--- and a config reload drops those. Done earlier, a reload would leave a retired
+--- copy and a line never typed; this way it leaves the copy still listed.
 ---@param id string
 ---@param meta table|nil
 ---@param report table from restore_report
-local function settle_copy(id, meta, report)
+---@param lines_are_out boolean|nil true when no line of this run is still waiting
+local function settle_copy(id, meta, report, lines_are_out)
 	if restore_report.keeps_copy(report) then
 		-- Without a .meta, cleanup_old_instances would take it for ancient.
 		meta = meta or { instance_id = id, last_save_epoch = os.time(), tab_count = 0, tab_summaries = {} }
@@ -863,13 +868,15 @@ local function settle_copy(id, meta, report)
 		meta.restore_failed = #report.failures > 0 or nil
 		write_meta(id, meta)
 		report.kept = true
-	else
+	elseif lines_are_out then
 		-- Tombstone the old instance: move to restored/ subdirectory rather
 		-- than delete, so a crash before the next save still leaves a
 		-- recoverable copy on disk. Tombstones are filtered out of the
 		-- selector and pruned by cleanup_old_tombstones (retention_days).
 		pub.tombstone_instance(id)
+		report.retired = true
 	end
+	report.copy_meta = meta
 	restore_report.write(report)
 end
 
@@ -896,14 +903,13 @@ local function front_window(window, pane)
 	return window, pane
 end
 
-local resume_rest -- defined below; the outcome selector offers it
-
 --- Show what a restore held back. A toast is gone in 10 seconds, and the log and
 --- the report have to be looked for. An InputSelector stays over the pane until
 --- a key dismisses it, needs nothing but WezTerm itself, is what this plugin
 --- already uses and has been working from action callbacks and call_after
---- timers, and can carry the "resume the rest" entry as well. Nothing is shown
---- when nothing is waiting: it would only teach people to dismiss it.
+--- timers. Fuzzy, because in the default mode digits and letters select rows, and
+--- it may appear under someone typing; and no row of it does anything but close.
+--- Nothing is shown when nothing is waiting: it would only teach people to dismiss it.
 ---@param reports table[]
 ---@param window table GuiWindow to fall back on
 ---@param pane table Pane in it
@@ -913,16 +919,12 @@ local function show_outcome(reports, window, pane)
 	local ok, err = pcall(function()
 		target_window:perform_action(
 			wezterm.action.InputSelector({
-				action = wezterm.action_callback(function(inner_win, inner_pane, id)
-					local rest_id = id and id:match("^" .. restore_report.REST_PREFIX .. "(%d+_%d+)$")
-					if rest_id then
-						resume_rest(rest_id, inner_win, inner_pane)
-					end
-				end),
+				action = wezterm.action_callback(function() end),
 				title = spec.title,
 				description = spec.description,
+				fuzzy_description = spec.fuzzy_description,
 				choices = spec.choices,
-				fuzzy = false,
+				fuzzy = true,
 			}),
 			target_pane
 		)
@@ -937,7 +939,7 @@ end
 local function finish_run(reports, window, pane)
 	for _, report in ipairs(reports) do
 		restore_report.settle(report)
-		restore_report.write(report)
+		settle_copy(report.instance_id, report.copy_meta, report, true)
 	end
 	if restore_report.needs_attention(reports) then
 		show_outcome(reports, window, pane)
@@ -960,12 +962,19 @@ end
 ---@param id string
 ---@param window table GuiWindow
 ---@param pane table Pane
-resume_rest = function(id, window, pane)
+local function resume_rest(id, window, pane)
 	restore_guard.get_snapshot(true)
 	local meta = read_meta(id)
 	local workspace_state = not pub.is_own_instance(id) and pub.load_instance(id) or nil
 	if not workspace_state then
 		restore_guard.notify("cannot resume the rest of instance " .. id .. ": it could not be loaded")
+		return
+	end
+	if not meta then
+		-- The list of what was held back lives there. Nothing can be retired or
+		-- noted without it, and the state itself is still there.
+		restore_guard.notify("cannot resume the rest of instance " .. id .. ": its .meta file could not be read,"
+			.. " so which sessions were held back is not known; restore the copy as a whole instead")
 		return
 	end
 	local summary = restore_guard.summarize(workspace_state, quiet_restore_command)
@@ -1004,7 +1013,7 @@ resume_rest = function(id, window, pane)
 		local foreign = entry.state == "dead" and restore_guard.foreign_claim(session_id)
 		if entry.state == "dead" and restore_guard.is_claimed(session_id) then
 			entry.state, entry.kind = "live", "claimed"
-			entry.reason = "already resumed by this terminal"
+			entry.reason = "a pane of this terminal holds its resume claim"
 		elseif foreign then
 			entry.state, entry.kind, entry.reason = "unknown", "claim_file", foreign
 		end
@@ -1092,7 +1101,7 @@ local function restore_instances(instance_ids, window, pane, restore_opts)
 			end
 
 			local report = restore_report.new(id, copy_name(id, old_meta), "restore", summary.entries, failures or {},
-				summary.panes - summary.sessions)
+				summary.panes - summary.sessions, reports)
 			settle_copy(id, old_meta, report)
 			table.insert(reports, report)
 		end

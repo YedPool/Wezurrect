@@ -397,9 +397,17 @@ running. A saved instance is only retired when nothing of it is waiting:
 - A selector that stays until you dismiss it lists each session and why. The same goes
   to `~/.wezurrect/restore-reports/<instance id>.txt`, newest run first, with the lines
   to resume a held-back session by hand.
-- `[Resume the rest of ...]`, in that selector and in Alt+R, asks the guard again for
-  the held-back sessions only and resumes those it now allows, in new tabs of one new
-  window. It is not a way around the guard: what it still refuses stays held back.
+- Typing in that selector only filters it, and every row only closes it, so it is safe
+  if it appears while you are typing.
+- `[Resume the rest of ...]`, in Alt+R, asks the guard again for the held-back sessions
+  only and resumes those it now allows, in new tabs of one new window. It is not a way
+  around the guard: what it still refuses stays held back.
+- Only a session whose control file confirms it, with a matching start time, counts as
+  already running. An id on a process's command line, or a resume claim held by a pane,
+  still refuses the resume but counts as held back: neither shows that conversation runs.
+- The copy is retired only after its resume lines have been typed. A config reload in
+  those 3 seconds leaves it listed. The pane it was going to type into keeps its claim, so
+  close that pane, wait for the claim to run out (2 minutes) and retry, or resume by hand.
 - Restoring the kept instance as a whole also works; the guard and its claims stop
   anything from being resumed twice.
 

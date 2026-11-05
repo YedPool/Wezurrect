@@ -1306,19 +1306,19 @@ describe("restore guard: a session named on a live command line", function()
         control_files({ { LIVE, 4242, START, true, START } }, nil, { { OTHER, 13132 } })
         local pane = restore_pane(claude_pane(OTHER))
         assert.equals("", all_sent(pane))
-        assert.truthy(logged("not resuming session dddddddd.*already running pid 13132"))
+        assert.truthy(logged("not resuming session dddddddd.*pid 13132 names it on its command line"))
     end)
 
     it("reads live when its control file reads dead", function()
         control_files({ { DEAD, 5151, START, false, "?" } }, nil, { { DEAD, 13132 } })
         assert.equals("", all_sent(restore_pane(claude_pane(DEAD))))
-        assert.truthy(logged("not resuming session bbbbbbbb.*already running pid 13132"))
+        assert.truthy(logged("not resuming session bbbbbbbb.*pid 13132 names it on its command line"))
     end)
 
     it("reads live when its control file reads unknown", function()
         control_files({ { OTHER, 7171, START, true, "?" } }, nil, { { OTHER, 13132 } })
         assert.equals("", all_sent(restore_pane(claude_pane(OTHER))))
-        assert.truthy(logged("not resuming session dddddddd.*already running pid 13132"))
+        assert.truthy(logged("not resuming session dddddddd.*pid 13132 names it on its command line"))
     end)
 
     it("keeps the pid of a live control file", function()
@@ -1340,14 +1340,16 @@ describe("restore guard: a session named on a live command line", function()
         assert.truthy(logged("not resuming session dddddddd.*no%-restore marker"))
     end)
 
-    it("the selector counts it as already running", function()
+    it("the selector refuses it without saying it is running", function()
         instance_manager.instance_id = OWN_ID
         control_files({ { LIVE, 4242, START, true, START } }, nil, { { OTHER, 13132 } })
         save_instance_file(MIXED_ID, workspace_of(claude_pane(OTHER)))
         local gui = new_gui_window()
         instance_manager.show_instance_selector(gui, busy_pane(), restore_opts)
-        assert.truthy(gui:choice(MIXED_ID).label:find("its session is already running", 1, true),
-            gui:choice(MIXED_ID).label)
+        local label = gui:choice(MIXED_ID).label
+        assert.truthy(label:find("cannot restore", 1, true), label)
+        assert.truthy(label:find("1 named on a live command line", 1, true), label)
+        assert.falsy(label:find("already running", 1, true), label)
     end)
 
     it("a command-line process does not make an empty control folder trustworthy", function()
@@ -2448,7 +2450,6 @@ end)
 
 describe("safe partial restore", function()
     local INCIDENT = "1700000100_50000"
-    local RUNNER = "99999999-9999-4999-8999-999999999999" -- another terminal's session
     local FREE, BUSY = "C:\\work\\free", "C:\\work\\busy"
     local real_os_remove = os.remove
     local existing, gui
@@ -2484,6 +2485,20 @@ describe("safe partial restore", function()
         return count
     end
 
+    -- A control file on a running process whose start time cannot be read: the
+    -- guard cannot confirm it and refuses, as uncertain. Unlike a guess from the
+    -- folder, this is a refusal that belongs to the session itself.
+    local function unconfirmed(n, cwd)
+        return { sid(n), 7000 + n, START, true, "?", cwd or BUSY }
+    end
+
+    local function held_open(files)
+        for n = 3, 17 do
+            table.insert(files, unconfirmed(n))
+        end
+        return files
+    end
+
     -- The saved copy of the incident: 18 panes. Run as the incident ran, the
     -- guard allows 1-2, refuses 3-17 as uncertain and 18 as parked.
     local function incident_trees()
@@ -2495,23 +2510,20 @@ describe("safe partial restore", function()
     end
 
     local function incident_world()
-        control_files(
-            { { RUNNER, 7000, START, true, START, BUSY } },
-            { { sid(18), "hibernated", "thrall" } }
-        )
+        control_files(held_open({}), { { sid(18), "hibernated", "thrall" } })
     end
 
     -- What the guard sees after a restart: the two sessions the first restore
-    -- resumed are running, in their own folder. The runner may have gone.
-    local function restarted_world(runner_alive)
+    -- resumed are running. Those it could not confirm may still be uncertain.
+    local function restarted_world(still_uncertain)
         wezterm_stub.GLOBAL = {}
         guard._test.new_lua_state()
         local files = {
             { sid(1), 7101, START, true, START, FREE },
             { sid(2), 7102, START, true, START, FREE },
         }
-        if runner_alive then
-            table.insert(files, { RUNNER, 7000, START, true, START, BUSY })
+        if still_uncertain then
+            held_open(files)
         end
         control_files(files, { { sid(18), "hibernated", "thrall" } })
     end
@@ -2574,7 +2586,7 @@ describe("safe partial restore", function()
             for n = 1, 18 do
                 assert.truthy(text:find(sid(n), 1, true), "session " .. n .. " missing")
             end
-            assert.truthy(text:find("in the same folder as running pid 7000", 1, true), "the guard's reason")
+            assert.truthy(text:find("start time could not be confirmed", 1, true), "the guard's reason")
             assert.truthy(text:find("no-restore marker", 1, true), "the parked reason")
         end)
 
@@ -2586,14 +2598,33 @@ describe("safe partial restore", function()
             assert.truthy(gui.selector, "nothing shown")
             assert.truthy(gui.selector.title:find("held back", 1, true), gui.selector.title)
             assert.equals("__CLOSE__", gui.selector.choices[1].id, "a stray Enter must only close it")
-            assert.truthy(gui:choice("__RESUME_REST__" .. INCIDENT), "no resume-the-rest entry")
             assert.truthy(gui.selector.description:find(guard.report_dir(), 1, true), "no report path")
+            assert.truthy(gui.selector.description:find("Alt+R", 1, true), "where to resume the rest")
+        end)
+
+        -- It appears about 4 seconds after a restore, maybe under someone typing.
+        it("the outcome selector opens with typing as a filter, not as a selection", function()
+            assert.is_true(gui.selector.fuzzy, "non-fuzzy: digits and letters select rows")
+        end)
+
+        -- Fuzzy mode still has Enter pick the top match, so typed text and Enter
+        -- could reach any row: no row may do anything but close.
+        it("no row of the outcome selector can start anything", function()
+            assert.is_nil(gui:choice("__RESUME_REST__" .. INCIDENT))
+            local windows_before = spawned_windows
+            for _, choice in ipairs(gui.selector.choices) do
+                gui.selector.action(gui, existing, choice.id, choice.label)
+                run_timers()
+            end
+            gui.selector.action(gui, existing, nil, nil) -- Esc
+            assert.equals(windows_before, spawned_windows)
+            assert.equals(0, typed(sid(3)))
         end)
 
         it("the selector says why a line was held back", function()
             local found = false
             for _, choice in ipairs(gui.selector.choices) do
-                if choice.label:find(sid(3), 1, true) and choice.label:find("same folder", 1, true) then
+                if choice.label:find(sid(3), 1, true) and choice.label:find("could not be confirmed", 1, true) then
                     found = true
                 end
             end
@@ -2698,7 +2729,7 @@ describe("safe partial restore", function()
         local function three_windows()
             local state = workspace_of(claude_pane(sid(1), FREE))
             local second = workspace_of(claude_pane(sid(2), FREE)).window_states[1]
-            local third = workspace_of(claude_pane(sid(3), FREE)).window_states[1]
+            local third = workspace_of(claude_pane(sid(19), FREE)).window_states[1]
             table.insert(state.window_states, second)
             table.insert(state.window_states, third)
             return state
@@ -2724,7 +2755,7 @@ describe("safe partial restore", function()
             assert.truthy(failures[1].error:find("no such domain", 1, true))
             assert.equals(1, typed(sid(1)))
             assert.equals(0, typed(sid(2)))
-            assert.equals(1, typed(sid(3)))
+            assert.equals(1, typed(sid(19)))
         end)
 
         it("one bad window keeps the copy, and the others are still restored", function()
@@ -2734,7 +2765,7 @@ describe("safe partial restore", function()
             assert.is_true(is_kept(INCIDENT))
             assert.is_false(is_tombstoned(INCIDENT))
             assert.equals(1, typed(sid(1)))
-            assert.equals(1, typed(sid(3)))
+            assert.equals(1, typed(sid(19)))
             assert.same({ sid(2) }, meta_of(INCIDENT).held_back)
             local text = report_text(INCIDENT)
             assert.truthy(text:find("Failed: 1", 1, true), text)
@@ -2865,6 +2896,187 @@ describe("safe partial restore", function()
         end)
     end)
 
+    -- These read live or claimed with nothing running that conversation, so
+    -- they refuse the resume but are no reason to give up the only copy.
+    describe("evidence weaker than a control file", function()
+        local CONFIRMED = { sid(30), 7030, START, true, START, FREE }
+
+        local function pick_rest(id)
+            instance_manager.show_instance_selector(gui, existing, restore_opts)
+            gui:pick("__RESUME_REST__" .. id, existing)
+            run_timers()
+        end
+
+        local function assert_held(id, session)
+            assert.is_true(is_kept(id), "the copy was retired")
+            assert.is_false(is_tombstoned(id))
+            assert.same({ session }, meta_of(id).held_back)
+            local text = report_text(id)
+            assert.truthy(text:find("Already running: 0", 1, true), text)
+            assert.truthy(text:find("Held back: 1", 1, true), text)
+            assert.truthy(text:find("claude --resume " .. session, 1, true), "no by-hand line: " .. text)
+            instance_manager.show_instance_selector(gui, existing, restore_opts)
+            assert.truthy(gui:choice("__RESUME_REST__" .. id), "no resume-the-rest entry")
+        end
+
+        it("--resume X then /clear: the process runs another id, X keeps the copy", function()
+            control_files({ CONFIRMED }, nil, { { sid(1), 7030 } })
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.equals(0, typed(sid(1)))
+            assert.equals(1, typed(sid(2)))
+            assert_held(INCIDENT, sid(1))
+        end)
+
+        it("an id on a command line with no control file keeps the copy", function()
+            control_files({ CONFIRMED }, nil, { { sid(1), 13132 } })
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.equals(0, typed(sid(1)))
+            assert_held(INCIDENT, sid(1))
+            assert.truthy(report_text(INCIDENT):find("pid 13132", 1, true))
+        end)
+
+        it("an id on a command line whose control file reads dead keeps the copy", function()
+            control_files({ { sid(1), 5151, START, false, "?" }, CONFIRMED }, nil, { { sid(1), 13132 } })
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.equals(0, typed(sid(1)))
+            assert_held(INCIDENT, sid(1))
+        end)
+
+        it("Resume the rest resumes it once the process has gone, and the copy retires", function()
+            control_files({ CONFIRMED }, nil, { { sid(1), 7030 } })
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            control_files({ CONFIRMED })
+            pick_rest(INCIDENT)
+            assert.equals(1, typed(sid(1)))
+            assert.is_true(is_tombstoned(INCIDENT))
+        end)
+
+        it("a claim held by a pane whose Claude has exited keeps the copy, and it retires after a retry", function()
+            control_files({ CONFIRMED })
+            save_instance_file("1700000101_50001", workspace_of(claude_pane(sid(1), FREE)))
+            restore("1700000101_50001")
+            assert.equals(1, typed(sid(1)))
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.equals(1, typed(sid(1)), "the claim still refuses it")
+            assert.equals(1, typed(sid(2)))
+            assert_held(INCIDENT, sid(1))
+
+            -- The pane is closed and the claim has run out.
+            for id, pane in pairs(panes) do
+                for _, text in ipairs(pane.sent) do
+                    if text:find(sid(1), 1, true) then panes[id] = nil end
+                end
+            end
+            local ttl = guard.claim_ttl_seconds
+            guard.claim_ttl_seconds = 0
+            local ok, err = pcall(pick_rest, INCIDENT)
+            guard.claim_ttl_seconds = ttl
+            assert.is_true(ok, tostring(err))
+            assert.equals(1, typed(sid(1)), "typed once more, in a new pane")
+            assert.is_true(is_tombstoned(INCIDENT))
+        end)
+
+        it("a session its control file confirms is safely running: the copy retires", function()
+            control_files({ { sid(1), 7001, START, true, START, FREE } }, nil, { { sid(1), 7001 } })
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            assert.equals(0, typed(sid(1)))
+            assert.is_true(is_tombstoned(INCIDENT))
+            assert.truthy(report_text(INCIDENT):find("Already running: 1", 1, true))
+        end)
+
+        it("two copies holding one session in one run: both retire, it is typed once", function()
+            control_files({ CONFIRMED })
+            local second = "1700000101_50001"
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            save_instance_file(second, workspace_of(claude_pane(sid(1), FREE)))
+            instance_manager._test.restore_instances({ INCIDENT, second }, gui, existing, restore_opts)
+            run_timers()
+            assert.equals(1, typed(sid(1)))
+            assert.is_true(is_tombstoned(INCIDENT))
+            assert.is_true(is_tombstoned(second))
+            assert.is_nil(gui.selector)
+        end)
+
+        it("does not pile up: retrying while it still reads weak leaves one copy and one held id", function()
+            control_files({ CONFIRMED }, nil, { { sid(1), 7030 } })
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(1), FREE),
+                claude_pane(sid(2), FREE)))
+            restore(INCIDENT)
+            for _ = 1, 3 do pick_rest(INCIDENT) end
+            assert.same({ sid(1) }, meta_of(INCIDENT).held_back)
+            local copies, reports = 0, 0
+            for path in pairs(file_store) do
+                if path:find(INCIDENT .. ".json", 1, true) then copies = copies + 1 end
+                if path:find(INCIDENT .. ".txt", 1, true) then reports = reports + 1 end
+            end
+            assert.equals(1, copies)
+            assert.equals(1, reports)
+        end)
+    end)
+
+    -- A config reload drops every call_after timer. Nothing that depends on a
+    -- line being typed may have happened before the line goes out.
+    describe("before the delayed lines have gone out", function()
+        local function restore_without_timers(id)
+            instance_manager._test.restore_instances({ id }, gui, existing, restore_opts)
+        end
+
+        it("the copy is not retired yet", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            restore_without_timers(INCIDENT)
+            assert.is_true(is_kept(INCIDENT))
+            assert.is_false(is_tombstoned(INCIDENT))
+            run_timers()
+            assert.is_false(is_kept(INCIDENT))
+            assert.is_true(is_tombstoned(INCIDENT))
+        end)
+
+        it("a reload that drops the timers leaves the copy, and its report says so", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            restore_without_timers(INCIDENT)
+            timers = {}
+            guard._test.new_lua_state()
+            assert.equals(0, typed(sid(1)))
+            assert.is_true(is_kept(INCIDENT))
+            assert.truthy(report_text(INCIDENT):find("still listed by Alt+R", 1, true), report_text(INCIDENT))
+        end)
+
+        it("restoring again after that reload holds the session back with its by-hand line", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            restore_without_timers(INCIDENT)
+            timers = {}
+            guard._test.new_lua_state()
+            restore(INCIDENT)
+            assert.equals(0, typed(sid(1)), "the pane's claim still refuses it")
+            assert.is_true(is_kept(INCIDENT))
+            assert.same({ sid(1) }, meta_of(INCIDENT).held_back)
+            assert.truthy(report_text(INCIDENT):find("claude --resume " .. sid(1), 1, true))
+        end)
+
+        it("a pane closed before its line was typed keeps the copy, with the session held back", function()
+            save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE)))
+            restore_without_timers(INCIDENT)
+            local closed = false
+            for id, pane in pairs(panes) do
+                if pane ~= existing then
+                    panes[id] = nil
+                    closed = true
+                end
+            end
+            assert.is_true(closed)
+            run_timers()
+            assert.is_true(is_kept(INCIDENT))
+            assert.same({ sid(1) }, meta_of(INCIDENT).held_back)
+            assert.truthy(report_text(INCIDENT):find("Failed: 1", 1, true))
+        end)
+    end)
+
     describe("resume the rest", function()
         local function pick_rest(id)
             instance_manager.show_instance_selector(gui, existing, restore_opts)
@@ -2875,10 +3087,7 @@ describe("safe partial restore", function()
         -- A copy with three held-back sessions: 3 in BUSY, 4 and 5 in OTHER_BUSY.
         local OTHER_BUSY = "C:\\work\\busy2"
         local function held_copy()
-            control_files({
-                { RUNNER, 7000, START, true, START, BUSY },
-                { sid(30), 7030, START, true, START, OTHER_BUSY },
-            })
+            control_files({ unconfirmed(3), unconfirmed(4, OTHER_BUSY), unconfirmed(5, OTHER_BUSY) })
             save_instance_file(INCIDENT, workspace_of(
                 claude_pane(sid(1), FREE), claude_pane(sid(3), BUSY),
                 claude_pane(sid(4), OTHER_BUSY), claude_pane(sid(5), OTHER_BUSY)
@@ -2891,8 +3100,8 @@ describe("safe partial restore", function()
             local windows_before = spawned_windows
             local panes_before = {}
             for id in pairs(panes) do panes_before[id] = #panes[id].sent end
-            -- OTHER_BUSY's session has ended; RUNNER is still there.
-            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            -- Sessions 4 and 5 have ended; 3 still cannot be confirmed.
+            control_files({ unconfirmed(3) })
             pick_rest(INCIDENT)
 
             assert.equals(windows_before + 1, spawned_windows, "new panes go in one new window")
@@ -2956,7 +3165,7 @@ describe("safe partial restore", function()
         it("does not reopen a session this terminal has claimed", function()
             held_copy()
             local windows_before = spawned_windows
-            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            control_files({ unconfirmed(3) })
             save_instance_file("1700000101_50001", workspace_of(claude_pane(sid(4), "C:\\work\\new")))
             restore("1700000101_50001")
             assert.equals(1, typed(sid(4)))
@@ -2966,7 +3175,7 @@ describe("safe partial restore", function()
             assert.equals(windows_before + 2, spawned_windows)
         end)
 
-        it("opens no empty pane for a session this terminal has claimed", function()
+        it("opens no empty pane for a claimed session, and retires only once its control file confirms it", function()
             save_instance_file(INCIDENT, workspace_of(claude_pane(sid(1), FREE), claude_pane(sid(4), BUSY)))
             restore(INCIDENT)
             assert.same({ sid(4) }, meta_of(INCIDENT).held_back)
@@ -2977,12 +3186,17 @@ describe("safe partial restore", function()
             pick_rest(INCIDENT)
             assert.equals(windows_before, spawned_windows)
             assert.equals(1, typed(sid(4)))
+            assert.is_true(is_kept(INCIDENT), "a claim alone does not show the session is running")
+            assert.same({ sid(4) }, meta_of(INCIDENT).held_back)
+            control_files({ { sid(1), 7001, START, true, START, FREE }, { sid(4), 7004, START, true, START, FREE } })
+            pick_rest(INCIDENT)
+            assert.equals(1, typed(sid(4)))
             assert.is_true(is_tombstoned(INCIDENT), "it is running now, so nothing is held back")
         end)
 
         it("opens no empty pane for a session whose claim file cannot be read, and keeps it held back", function()
             held_copy()
-            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            control_files({ unconfirmed(3) })
             local f = assert(io.open(SPEC_CLAIMS .. real_sep .. sid(4), "wb"))
             f:write("not json")
             f:close()
@@ -3024,17 +3238,22 @@ describe("safe partial restore", function()
             assert.is_true(is_kept(INCIDENT))
         end)
 
-        it("is reachable from the outcome selector too", function()
+        it("says so when the copy's .meta can no longer be read", function()
             held_copy()
-            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
-            gui:pick("__RESUME_REST__" .. INCIDENT, existing)
+            instance_manager.show_instance_selector(gui, existing, restore_opts)
+            file_store[instance_manager.get_instances_dir() .. sep .. INCIDENT .. ".meta"] = nil
+            local windows_before = spawned_windows
+            local ok, err = pcall(gui.pick, gui, "__RESUME_REST__" .. INCIDENT, existing)
             run_timers()
-            assert.equals(1, typed(sid(4)))
+            assert.is_true(ok, tostring(err))
+            assert.equals(windows_before, spawned_windows)
+            assert.is_true(is_kept(INCIDENT))
+            assert.truthy(logged("cannot resume the rest of instance " .. INCIDENT .. ".*restore the copy as a whole"))
         end)
 
         it("the report keeps the earlier run after the rest has run", function()
             held_copy()
-            control_files({ { RUNNER, 7000, START, true, START, BUSY } })
+            control_files({ unconfirmed(3) })
             pick_rest(INCIDENT)
             local text = report_text(INCIDENT)
             local _, runs = text:gsub("Wezurrect restore report", "")

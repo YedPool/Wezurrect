@@ -698,6 +698,10 @@ describe("instance_manager", function()
             -- Minimal stubs to drive restore_instances
             local fake_pane = { window = function() return {} end, tab = function() return {} end }
             local fake_window = {}
+            local stub_time = require("wezterm").time
+            local real_call_after = stub_time.call_after
+            local due = {}
+            stub_time.call_after = function(_, fn) table.insert(due, fn) end
 
             instance_manager._test.restore_instances(
                 { id },
@@ -705,6 +709,11 @@ describe("instance_manager", function()
                 fake_pane,
                 { relative = true, restore_text = true }
             )
+            stub_time.call_after = real_call_after
+
+            -- Retiring waits for the delayed resume lines to have gone out.
+            assert.truthy(file_store[src_json], "source must stay until the timers have fired")
+            for _, fn in ipairs(due) do fn() end
 
             -- Bug we're guarding against: pre-fix code called delete_instance
             -- here, wiping the snapshot. Post-fix it must be tombstoned.

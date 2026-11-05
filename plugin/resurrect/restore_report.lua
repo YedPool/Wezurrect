@@ -63,7 +63,7 @@ local function outcome_of(entry, threw)
 	elseif verdict then
 		if verdict.state == "parked" then
 			return "parked", verdict.reason
-		elseif verdict.kind == "live" or verdict.kind == "claimed" then
+		elseif verdict.kind == "live" then
 			return "running", verdict.reason
 		end
 		return "held_back", verdict.reason
@@ -75,10 +75,46 @@ local function outcome_of(entry, threw)
 		return "resumed"
 	elseif entry.state == "parked" then
 		return "parked", entry.reason
-	elseif entry.state == "live" then
+	elseif entry.kind == "live" then
 		return "running", entry.reason
 	end
 	return "held_back", entry.reason
+end
+
+-- Whether this restore, in this copy or another of the same run, resumed the session.
+local function resumed_in_run(report, session_id)
+	local function resumed_in(entries)
+		for _, entry in ipairs(entries) do
+			if entry.outcome == "resumed" and entry.target.session_id == session_id then
+				return true
+			end
+		end
+		return false
+	end
+	if resumed_in(report.entries) then
+		return true
+	end
+	for _, other in ipairs(report.same_run or {}) do
+		if other ~= report and resumed_in(other.entries) then
+			return true
+		end
+	end
+	return false
+end
+
+-- A claim says a pane was given this session, not that it still runs there. It
+-- counts for nothing here unless this same restore typed the session elsewhere.
+local function settle_claim(report, entry)
+	local verdict = entry.node.restore_verdict
+	if entry.kind ~= "claimed" and not (verdict and verdict.kind == "claimed") then
+		return
+	end
+	if resumed_in_run(report, entry.target.session_id) then
+		entry.outcome, entry.why = "running", "resumed in another pane by this restore"
+	else
+		entry.why = "a pane of this terminal holds its resume claim, and no control file confirms it is"
+			.. " running - close that pane to retry, or resume it by hand"
+	end
 end
 
 --- Work out every session's outcome again from what is known now. Called once
@@ -88,6 +124,11 @@ function pub.settle(report)
 	report.counts = { held_back = 0, failed = 0, parked = 0, running = 0, resumed = 0 }
 	for _, entry in ipairs(report.entries) do
 		entry.outcome, entry.why = outcome_of(entry, #report.failures > 0)
+	end
+	for _, entry in ipairs(report.entries) do
+		if entry.outcome == "held_back" then
+			settle_claim(report, entry)
+		end
 		report.counts[entry.outcome] = report.counts[entry.outcome] + 1
 	end
 end
@@ -99,11 +140,12 @@ end
 ---@param entries table[] from restore_guard.summarize
 ---@param failures table[] { window?, error }: what threw
 ---@param other_panes number panes with no session in them
+---@param same_run table[]|nil the reports of other copies restored in this run
 ---@return table report
-function pub.new(instance_id, name, run, entries, failures, other_panes)
+function pub.new(instance_id, name, run, entries, failures, other_panes, same_run)
 	local report = {
 		instance_id = instance_id, name = name, run = run, entries = entries, failures = failures,
-		other_panes = other_panes, at = os.date("%Y-%m-%d %H:%M:%S"),
+		other_panes = other_panes, at = os.date("%Y-%m-%d %H:%M:%S"), same_run = same_run,
 	}
 	pub.settle(report)
 	return report
@@ -111,8 +153,10 @@ end
 
 --- True when the saved copy has to stay: a session of it was held back or
 --- failed, or its restore threw. Parked sessions were held back on purpose. A
---- running session is safe where it runs, and every session a restore resumes
---- is one: counting them, a copy could never retire by being restored.
+--- session its control file confirms running is safe where it runs, and every
+--- session a restore resumes is one: counting them, a copy could never retire by
+--- being restored. Weaker signs of running (a command line, a claim) are held
+--- back: retiring the copy over a false one would leave no way back.
 ---@param report table
 ---@return boolean
 function pub.keeps_copy(report)
@@ -160,8 +204,11 @@ function pub.format(report)
 	}
 	if report.kept then
 		table.insert(lines, "Its state:  KEPT - still listed by Alt+R, with 'Resume the rest' if a session can be retried")
-	else
+	elseif report.retired then
 		table.insert(lines, "Its state:  retired to state/instances/restored; nothing in it is waiting")
+	else
+		table.insert(lines, "Its state:  retired once its lines have been typed. If this line stays, a config reload"
+			.. " or exit interrupted that: the copy is still listed by Alt+R")
 	end
 	table.insert(lines, counts_line(report))
 	if report.other_panes and report.other_panes > 0 then
@@ -246,7 +293,10 @@ function pub.rest_label(name, count)
 		.. " held back or failed; the guard still decides, in new panes]"
 end
 
---- The outcome selector. A stray Enter only closes it, so "Close" comes first.
+--- The outcome selector. It appears about 4 seconds after a restore, maybe under
+--- someone still typing, and with fuzzy on, typed text and Enter pick the best
+--- match (wezterm's selector.rs sorts by score). So every row here only closes it:
+--- what starts anything is the "resume the rest" entry in Alt+R, opened on purpose.
 ---@param reports table[]
 ---@return table spec { title, description, choices }
 function pub.outcome_selector(reports)
@@ -257,10 +307,6 @@ function pub.outcome_selector(reports)
 		totals.held_back = totals.held_back + report.counts.held_back
 		totals.failed = totals.failed + report.counts.failed
 		table.insert(paths, report.path or "(not written, see the log)")
-		local held = pub.held_ids(report)
-		if report.kept and #held > 0 then
-			table.insert(choices, { id = pub.REST_PREFIX .. report.instance_id, label = pub.rest_label(report.name, #held) })
-		end
 	end
 	for r, report in ipairs(reports) do
 		table.insert(choices, { id = "__INFO_" .. r, label = clean(report.name) .. ": " .. counts_line(report) })
@@ -281,7 +327,9 @@ function pub.outcome_selector(reports)
 	end
 	return {
 		title = "Restore finished: " .. totals.held_back .. " held back, " .. totals.failed .. " failed",
-		description = "Enter or Esc closes this. Report: " .. table.concat(paths, " ; "),
+		description = "Enter or Esc closes this; typing only filters. To retry: Alt+R, Resume the rest. Report: "
+			.. table.concat(paths, " ; "),
+		fuzzy_description = "Filter (nothing here starts anything): ",
 		choices = choices,
 	}
 end

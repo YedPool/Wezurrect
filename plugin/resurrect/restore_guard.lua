@@ -994,7 +994,9 @@ end
 ---@return string state "dead" (safe to resume), "live", "parked" or "unknown"
 ---@return string|nil reason why it is not "dead"
 ---@return number|nil pid
----@return string|nil kind why, as a word: "live", "malformed" (the saved
+---@return string|nil kind why, as a word: "live" (its control file confirms it,
+---  with a matching start time: the only kind that is known to be running),
+---  "command_line" (a live process names it, nothing confirms it), "malformed" (the saved
 ---  command or directory is not usable), "reading" (the running sessions
 ---  could not be read), "unconfirmed" (a process is there but its start
 ---  time is not known) or "parked" (a no-restore marker names it)
@@ -1020,9 +1022,14 @@ function pub.inspect(target, cwd, snapshot)
 	if not session or session.state == "dead" then
 		return "dead"
 	end
+	if session.on_command_line then
+		-- Enough to refuse, not enough to say it runs: after "--resume X" and
+		-- /clear the process runs another id with X still on its command line.
+		return "unknown", "pid " .. tostring(session.pid) .. " names it on its command line, but no control file"
+			.. " confirms that session is running there", session.pid, "command_line"
+	end
 	if session.state == "live" then
-		return "live", "already running pid " .. tostring(session.pid)
-			.. (session.on_command_line and " (named on its command line)" or ""), session.pid, "live"
+		return "live", "already running pid " .. tostring(session.pid), session.pid, "live"
 	end
 	return "unknown", "liveness unreadable (pid " .. tostring(session.pid)
 		.. " is running but its start time could not be confirmed)", session.pid, "unconfirmed"
@@ -1173,7 +1180,7 @@ function pub.summarize(state, get_command)
 		panes = 0, sessions = 0,
 		-- Of the sessions: will be resumed / already running / parked /
 		-- process there but not confirmed / unusable command.
-		resumable = 0, live = 0, parked = 0, unconfirmed = 0, malformed = 0,
+		resumable = 0, live = 0, parked = 0, unconfirmed = 0, command_line = 0, malformed = 0,
 		-- Everything that is neither resumable nor known to be running.
 		unknown = 0,
 		error = snapshot.error, error_label = snapshot.error_label,
@@ -1300,6 +1307,11 @@ function pub.refusal(summary)
 	if summary.parked > 0 then
 		table.insert(label, summary.parked .. " parked")
 		table.insert(detail, count_of(summary.parked, "has", "have") .. " a no-restore marker (parked or hibernated)")
+	end
+	if summary.command_line > 0 then
+		table.insert(label, summary.command_line .. " named on a live command line")
+		table.insert(detail, count_of(summary.command_line, "is", "are")
+			.. " named on the command line of a live process, with no control file confirming it")
 	end
 	if summary.unconfirmed > 0 then
 		table.insert(label, summary.unconfirmed .. " could not be checked")
