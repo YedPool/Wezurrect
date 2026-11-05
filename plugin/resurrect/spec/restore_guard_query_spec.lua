@@ -153,6 +153,29 @@ describe_windows("restore guard: the real process query", function()
         assert.equals("dead", aged.records[1].state)
     end)
 
+    -- A real stand-in process, through the real script. Stopped by its own pid.
+    it("a matching procStart reads live even when the file's time is older than the process", function()
+        local dir = ROOT .. "\\ctl-clockback"
+        local sid = "ce19dc26-7a4b-4c1e-9d2f-3b5a6c7d8e90"
+        mkdir(dir)
+        local out = run_powershell("$p = Start-Process -PassThru -WindowStyle Hidden -FilePath powershell.exe "
+            .. "-ArgumentList '-NoProfile','-Command','Start-Sleep 60';"
+            .. "$p.Id; $p.StartTime.ToFileTimeUtc()")
+        local pid, started = out:match("(%d+)%s+(%d+)")
+        assert.truthy(pid, "the stand-in did not start: " .. out)
+        local file = dir .. "\\" .. pid .. ".json"
+        write(file, '{"sessionId":"' .. sid .. '","pid":' .. pid .. ',"procStart":"' .. started
+            .. '","cwd":"C:\\\\work"}')
+        run_powershell("(Get-Item -LiteralPath '" .. file .. "').LastWriteTimeUtc = [datetime]'2000-01-01 00:00:00Z'")
+        guard.control_dirs = function() return { dir } end
+        guard.marker_dir = function() return ROOT .. "\\missing" end
+        local ok, snapshot = pcall(guard.get_snapshot, true)
+        run_powershell("Stop-Process -Id " .. pid .. " -ErrorAction SilentlyContinue")
+        assert.is_true(ok, snapshot)
+        assert.is_nil(snapshot.error)
+        assert.equals("live", snapshot.sessions[sid].state)
+    end)
+
     it("passes the query as one argument without double quotes or newlines", function()
         local seen
         local original = wezterm_stub.run_child_process

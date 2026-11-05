@@ -126,8 +126,9 @@ local QUERY_SCRIPT = table.concat({
 ---       Windows reused after a reboot still shows a start time and reads as
 ---       dead. If both fail the value stays ? (fail closed).
 ---       fileTime is the control file's last write time (LastWriteTimeUtc) as
----       a FILETIME in decimal, empty when it could not be read. A file last
----       written before its process started cannot belong to it (classify).
+---       a FILETIME in decimal, empty when it could not be read. Used only
+---       when procStart is missing or unusable: a file last written before its
+---       process started then cannot belong to it (classify).
 ---   M <name> <reason> <by>
 ---       one per *.json entry in the marker folder, readable or not. name is
 ---       the entry's base name; reason and by are copied from the file (only
@@ -278,21 +279,26 @@ local function classify(record)
 	end
 	local expected = to_integer(record.proc_start)
 	local actual = to_integer(record.start_time)
-	local written = to_integer(record.file_time)
-	if actual and written and written < actual - pub.start_time_tolerance then
-		-- Claude creates its control file after the process has started and
-		-- keeps writing it. A file last written before the process its pid
-		-- names started was left by an earlier process: the pid was reused.
-		-- This holds whether or not the file could be parsed.
+	if record.pid and expected and actual then
+		-- The file's own word for its process decides, either way. A file time
+		-- has no say here: a clock stepped back before the file was written
+		-- makes the file of a live session look older than its process.
+		if math.abs(expected - actual) <= pub.start_time_tolerance then
+			return "live"
+		end
 		return "dead"
 	end
-	if not record.pid or not expected or not actual then
-		return "unknown"
+	-- procStart is missing or unusable (a control file that does not parse).
+	-- Claude creates its control file after the process has started and keeps
+	-- writing it, so a file last written before the process its pid names
+	-- started was left by an earlier process: the pid was reused. A clock
+	-- stepped back could make this wrong too, but only for a file with no
+	-- procStart, which a running Claude has not been seen to leave.
+	local written = to_integer(record.file_time)
+	if actual and written and written < actual - pub.start_time_tolerance then
+		return "dead"
 	end
-	if math.abs(expected - actual) <= pub.start_time_tolerance then
-		return "live"
-	end
-	return "dead"
+	return "unknown"
 end
 
 local STATE_RANK = { dead = 1, unknown = 2, live = 3 }
