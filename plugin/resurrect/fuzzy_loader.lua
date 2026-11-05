@@ -1,6 +1,7 @@
 local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes the LSP module for Wezterm
 local utils = require("resurrect.utils")
 local file_io = require("resurrect.file_io")
+local ps_quote = require("resurrect.ps_quote")
 local pub = {}
 
 ---@alias fmt_fun fun(label: string): string
@@ -95,8 +96,8 @@ local function find_json_files(base_path)
 			-- CJK), so without this the scan returns corrupted paths: the picker
 			-- displays "?" and the id it hands back does not name a real file.
 			"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-				.. "if (Test-Path -LiteralPath '%s') { "
-				.. "Get-ChildItem -LiteralPath '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue | "
+				.. "if (Test-Path -LiteralPath %s) { "
+				.. "Get-ChildItem -LiteralPath %s -Filter '*.json' -File -ErrorAction SilentlyContinue | "
 				.. "ForEach-Object { "
 				-- The cast must be parenthesised before .ToString(). Without the
 				-- outer parens "[int][double]::Parse(x).ToString() + ' ' + y"
@@ -107,8 +108,8 @@ local function find_json_files(base_path)
 				-- nothing and the picker reports "no existing state files".
 				.. "([int][double]::Parse(($_.LastWriteTimeUtc - [datetime]'1970-01-01').TotalSeconds))"
 				.. ".ToString() + ' ' + $_.FullName } }",
-			base_path:gsub("'", "''"),
-			base_path:gsub("'", "''")
+			ps_quote.quote(base_path),
+			ps_quote.quote(base_path)
 		)
 		success, stdout, stderr = wezterm.run_child_process({
 			"powershell.exe",
@@ -203,16 +204,13 @@ local function insert_choices(stdout, opts)
 		-- MacOS it is from January 1st, 1904 0 UTC
 		-- Windows NTFS (up to Win 11) it is from January 1st, 1601 0 UTC
 		-- The function `os.date()` used later on will convert the date according to the host OS
-		-- Skip instance files when ignore_instances is set (they use their own selector)
-		if type == "instances" and opts.ignore_instances then
-			-- fall through: do not add instance files to the fuzzy loader
-		elseif type == nil or files[type] == nil then
-			-- Unknown state type: skip it. `files` and `fmt_cost` are keyed by
-			-- the supported types only, so anything else (a .backups/, .trash/
-			-- or restored/ directory, or a future subdirectory) would index
-			-- them as nil and raise an arithmetic error below, taking the whole
-			-- picker down. Skipping keeps the loader forward-compatible.
-		elseif epoch and file and not opts[string.format("ignore_%ss", type)] then
+		-- Skip instance files when ignore_instances is set (they use their own selector).
+		-- Also skip an unknown state type: `files` and `fmt_cost` are keyed by the supported
+		-- types only, so anything else (a .backups/, .trash/ or restored/ directory, or a
+		-- future subdirectory) would index them as nil and raise an arithmetic error below,
+		-- taking the whole picker down. Skipping keeps the loader forward-compatible.
+		local skip_type = (type == "instances" and opts.ignore_instances) or type == nil or files[type] == nil
+		if not skip_type and epoch and file and not opts[string.format("ignore_%ss", type)] then
 			-- consider the "cost" of the formatting of the filename, i.e., if the format function adds characters
 			-- to the visible part of the file section, we test the three possible formatter to get the highest cost
 			-- we use a real entry instead of an empty string to prevent formatting error if the format function has

@@ -2,6 +2,7 @@ local wezterm = require("wezterm") --[[@as Wezterm]] --- this type cast invokes 
 local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
 local restore_guard = require("resurrect.restore_guard")
+local ps_quote = require("resurrect.ps_quote")
 
 local pub = {}
 
@@ -66,9 +67,9 @@ local function list_dated_backups(backups_dir, basename)
 				-- empty, and backups accumulate without bound -- observed at
 				-- 2,979 files for a single base against a retention of 10.
 				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-					.. "Get-ChildItem -Path '%s' -Filter '%s' -File -ErrorAction SilentlyContinue "
+					.. "Get-ChildItem -Path %s -Filter %s -File -ErrorAction SilentlyContinue "
 					.. "| ForEach-Object { $_.Name }",
-				backups_dir:gsub("'", "''"), pattern:gsub("'", "''")
+				ps_quote.quote(backups_dir), ps_quote.quote(pattern)
 			),
 		})
 		if ok then stdout = output end

@@ -11,6 +11,7 @@ local wezterm = require("wezterm") --[[@as Wezterm]]
 local file_io = require("resurrect.file_io")
 local utils = require("resurrect.utils")
 local restore_guard = require("resurrect.restore_guard")
+local ps_quote = require("resurrect.ps_quote")
 
 local pub = {}
 
@@ -441,9 +442,9 @@ function pub.list_instances()
 				-- ids are numeric so they cannot be corrupted today, but the
 				-- same helper shape is used for name-bearing directories.
 				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-					.. "Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue "
+					.. "Get-ChildItem -Path %s -Filter '*.json' -File -ErrorAction SilentlyContinue "
 					.. "| ForEach-Object { $_.BaseName }",
-				instances_dir:gsub("'", "''")
+				ps_quote.quote(instances_dir)
 			),
 		})
 		if success then
@@ -565,9 +566,9 @@ local function list_ids_in_dir(dir)
 				-- ids are numeric so they cannot be corrupted today, but the
 				-- same helper shape is used for name-bearing directories.
 				"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-					.. "Get-ChildItem -Path '%s' -Filter '*.json' -File -ErrorAction SilentlyContinue "
+					.. "Get-ChildItem -Path %s -Filter '*.json' -File -ErrorAction SilentlyContinue "
 					.. "| ForEach-Object { $_.BaseName }",
-				dir:gsub("'", "''")
+				ps_quote.quote(dir)
 			),
 		})
 		if ok then stdout = output end

@@ -20,6 +20,7 @@
 
 local wezterm = require("wezterm") --[[@as Wezterm]]
 local utils = require("resurrect.utils")
+local ps_quote = require("resurrect.ps_quote")
 
 local pub = {}
 
@@ -145,10 +146,10 @@ function pub.run_query(dirs, marker_dir)
 	end
 	local quoted = {}
 	for _, dir in ipairs(dirs) do
-		table.insert(quoted, "'" .. dir:gsub("'", "''") .. "'")
+		table.insert(quoted, ps_quote.quote(dir))
 	end
 	local dir_list = table.concat(quoted, ", ")
-	local markers = "'" .. (marker_dir or pub.marker_dir()):gsub("'", "''") .. "'"
+	local markers = ps_quote.quote(marker_dir or pub.marker_dir())
 	local script = QUERY_SCRIPT:gsub("@DIRS@", function()
 		return dir_list
 	end):gsub("@MARKERS@", function()

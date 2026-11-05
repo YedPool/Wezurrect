@@ -327,3 +327,18 @@ describe("state_manager _test helpers", function()
     assert.equals("a" .. sep_loc .. "b", state_manager._test.dirname("a" .. sep_loc .. "b" .. sep_loc .. "c.json"))
   end)
 end)
+
+describe("state_manager list_dated_backups command quoting", function()
+  it("doubles a typographic apostrophe in the directory and the name", function()
+    local seen
+    local real_rcp = wezterm_stub.run_child_process
+    wezterm_stub.run_child_process = function(argv) seen = argv; return true, "", "" end
+    state_manager._test.list_dated_backups("C:/Users/O\u{2019}Brien/.backups", "it\u{2019}s")
+    wezterm_stub.run_child_process = real_rcp
+    if sep_for_stub == "\\" then
+      local cmd = seen[#seen]
+      assert.is_truthy(cmd:find("O\u{2019}\u{2019}Brien", 1, true))
+      assert.is_truthy(cmd:find("it\u{2019}\u{2019}s.*.json'", 1))
+    end
+  end)
+end)
