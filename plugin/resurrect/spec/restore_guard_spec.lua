@@ -217,7 +217,7 @@ local START = "134363212579349896"
 local query_calls = 0
 
 -- Answer the guard's one OS question with these control files.
--- Each is { session, pid, proc_start, running (bool), start_time, cwd }.
+-- Each is { session, pid, proc_start, running (bool), start_time, cwd, file_time }.
 -- markers: the no-restore marker files, each { file base name, reason, by };
 -- reason and by are nil for a marker whose contents could not be read.
 local function control_files(files, markers)
@@ -228,7 +228,7 @@ local function control_files(files, markers)
         local lines = {}
         for _, f in ipairs(files) do
             table.insert(lines, table.concat({
-                "S", f[1], tostring(f[2]), f[3], f[4] and "1" or "0", f[5] or "?", f[6] or "",
+                "S", f[1], tostring(f[2]), f[3], f[4] and "1" or "0", f[5] or "?", f[6] or "", f[7],
             }, "\t"))
         end
         for _, m in ipairs(markers) do
@@ -380,6 +380,61 @@ describe("restore guard: resume commands", function()
         control_files({ { "", 8181, "", false, "?", "" } })
         local pane = restore_pane(claude_pane(DEAD))
         assert.truthy(all_sent(pane):find(DEAD, 1, true))
+    end)
+
+    -- A control file last written before the process its pid names started
+    -- cannot belong to that process: the pid was reused.
+    local LATER = tostring(math.tointeger(tonumber(START)) + 50000000) -- 5 s after start
+    local EARLIER = tostring(math.tointeger(tonumber(START)) - 50000000) -- 5 s before start
+
+    it("treats an unparseable control file written before the process started as dead", function()
+        control_files({ { "", 8181, "", true, START, "", EARLIER } })
+        local pane = restore_pane(claude_pane(DEAD))
+        assert.truthy(all_sent(pane):find(DEAD, 1, true))
+    end)
+
+    it("treats a parsed control file with no procStart written before the process started as dead", function()
+        control_files({ { REUSED, 8181, "", true, START, "C:\\work", EARLIER } })
+        local pane = restore_pane(claude_pane(REUSED))
+        assert.truthy(all_sent(pane):find(REUSED, 1, true))
+    end)
+
+    it("treats a control file with an unusable procStart written before the process started as dead", function()
+        control_files({ { REUSED, 8181, "not-a-time", true, START, "C:\\work", EARLIER } })
+        local pane = restore_pane(claude_pane(REUSED))
+        assert.truthy(all_sent(pane):find(REUSED, 1, true))
+    end)
+
+    -- A clock stepped back between the process starting and Claude writing its
+    -- file: the file looks older than the process, yet procStart still names it.
+    it("reads a matching procStart as live even when the file looks older than the process", function()
+        control_files({ { LIVE, 4242, START, true, START, "C:\\work", EARLIER } })
+        assert.equals("", all_sent(restore_pane(claude_pane(LIVE))))
+    end)
+
+    it("reads a procStart that differs from the start time as dead, whatever the file's age", function()
+        for _, file_time in ipairs({ LATER, EARLIER }) do
+            guard._test.reset()
+            control_files({ { REUSED, 8181, "134000000000000000", true, START, "C:\\work", file_time } })
+            local pane = restore_pane(claude_pane(REUSED))
+            assert.truthy(all_sent(pane):find(REUSED, 1, true))
+        end
+    end)
+
+    it("never reads a control file written after the process started as dead", function()
+        control_files({ { "", 8181, "", true, START, "", LATER } })
+        assert.equals("", all_sent(restore_pane(claude_pane(DEAD))))
+        guard._test.reset()
+        control_files({ { LIVE, 4242, START, true, START, "C:\\work", LATER } })
+        assert.equals("", all_sent(restore_pane(claude_pane(LIVE))))
+    end)
+
+    it("keeps today's answer when the start time or the file time is missing", function()
+        control_files({ { "", 8181, "", true, "?", "", EARLIER } })
+        assert.equals("", all_sent(restore_pane(claude_pane(DEAD))))
+        guard._test.reset()
+        control_files({ { "", 8181, "", true, START, "", nil } })
+        assert.equals("", all_sent(restore_pane(claude_pane(DEAD))))
     end)
 
     it("resumes a session only once when two panes ask for it", function()
