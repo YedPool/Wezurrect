@@ -10,6 +10,14 @@ local pub = {}
 -- disable dated backups (the rolling .bak still runs).
 pub.backup_retention_count = 10
 
+-- Upper bound on dated backups deleted by ONE save. Pruning runs inside the
+-- periodic save on WezTerm's Lua thread, so a large backlog (tens of thousands
+-- of files from before name matching worked) must drain gradually instead of
+-- in one long burst of os.remove calls. Steady state needs only about one
+-- deletion per save; the one-off backlog is better cleared with
+-- tools/prune-backups.ps1.
+pub.max_prunes_per_save = 25
+
 ---@param file_name string
 ---@param type string
 ---@param opt_name string?
@@ -117,9 +125,12 @@ local function rotate_backup(file_path)
 
 		-- Prune oldest beyond retention.
 		local entries = list_dated_backups(backups_dir, base)
-		while #entries > pub.backup_retention_count do
+		-- Oldest first, at most max_prunes_per_save per call.
+		local removed = 0
+		while #entries > pub.backup_retention_count and removed < pub.max_prunes_per_save do
 			local oldest = table.remove(entries, 1)
 			os.remove(oldest.path)
+			removed = removed + 1
 		end
 	end
 end

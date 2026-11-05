@@ -237,6 +237,84 @@ describe("state_manager save_state backup rotation", function()
   end)
 end)
 
+describe("state_manager capped backup pruning", function()
+  local real_rcp
+  -- U+2733 (eight spoked asterisk) written as an escape: source stays ASCII.
+  local STAR = "\u{2733}"
+
+  local function fake_listing(base_name, n)
+    local lines = {}
+    for i = 1, n do
+      -- Distinct, sortable stamps; i is the sort key (zero padded seconds slot).
+      local stamp = string.format("20260101-%06d", i)
+      lines[#lines + 1] = base_name .. "." .. stamp .. ".json"
+    end
+    return table.concat(lines, "\r\n") .. "\r\n"
+  end
+
+  before_each(function()
+    file_store = {}
+    move_calls = {}
+    write_calls = {}
+    removed_paths = {}
+    state_manager.save_state_dir = base
+    state_manager.backup_retention_count = 10
+    real_rcp = wezterm_stub.run_child_process
+  end)
+
+  after_each(function()
+    wezterm_stub.run_child_process = real_rcp
+  end)
+
+  local function count_backup_removals()
+    local n = 0
+    for _, p in ipairs(removed_paths) do
+      if p:find(".backups", 1, true) then n = n + 1 end
+    end
+    return n
+  end
+
+  it("exposes a small positive cap", function()
+    assert.is_number(state_manager.max_prunes_per_save)
+    assert.is_true(state_manager.max_prunes_per_save >= 1 and state_manager.max_prunes_per_save <= 100)
+  end)
+
+  it("deletes at most the cap per save when a huge backlog exists (non-ASCII base)", function()
+    local name = STAR .. "+Claude+Code"
+    wezterm_stub.run_child_process = function() return true, fake_listing(name, 5000), "" end
+    state_manager.save_state({ title = name, tabs = {} })
+    removed_paths = {}
+    state_manager.save_state({ title = name, tabs = {} })
+    assert.equals(state_manager.max_prunes_per_save, count_backup_removals())
+  end)
+
+  it("removes the OLDEST entries first", function()
+    local name = STAR .. "x"
+    wezterm_stub.run_child_process = function() return true, fake_listing(name, 200), "" end
+    state_manager.save_state({ title = name, tabs = {} })
+    removed_paths = {}
+    state_manager.save_state({ title = name, tabs = {} })
+    local first = removed_paths[1] or ""
+    assert.is_truthy(first:find("20260101-000001.json", 1, true))
+  end)
+
+  it("still trims a small excess completely", function()
+    wezterm_stub.run_child_process = function() return true, fake_listing("plain", 13), "" end
+    state_manager.save_state({ title = "plain", tabs = {} })
+    removed_paths = {}
+    state_manager.save_state({ title = "plain", tabs = {} })
+    assert.equals(3, count_backup_removals())
+  end)
+
+  it("removes nothing when at or under retention", function()
+    wezterm_stub.run_child_process = function() return true, fake_listing("plain", 10), "" end
+    state_manager.save_state({ title = "plain", tabs = {} })
+    removed_paths = {}
+    state_manager.save_state({ title = "plain", tabs = {} })
+    assert.equals(0, count_backup_removals())
+  end)
+end)
+
 describe("state_manager _test helpers", function()
   it("basename_no_ext strips directory and .json suffix", function()
     local sep_loc = package.config:sub(1, 1)
