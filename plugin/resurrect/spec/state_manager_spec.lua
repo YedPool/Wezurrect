@@ -342,3 +342,63 @@ describe("state_manager list_dated_backups command quoting", function()
     end
   end)
 end)
+
+describe("state_manager list_dated_backups on POSIX finds real files", function()
+  local real_rcp
+  local tmp = (os.getenv("TMPDIR") or "/tmp"):gsub("/$", "")
+  local root = tmp .. "/resurrect_list_dated_test"
+  local backups = root .. "/.backups"
+
+  before_each(function()
+    if is_windows() then
+      return
+    end
+    real_rcp = wezterm_stub.run_child_process
+    os.execute("rm -rf '" .. root .. "' && mkdir -p '" .. backups .. "'")
+  end)
+
+  after_each(function()
+    if is_windows() then
+      return
+    end
+    wezterm_stub.run_child_process = real_rcp
+    os.execute("rm -rf '" .. root .. "'")
+  end)
+
+  -- Run the argv the plugin itself would run, so the test does not care whether
+  -- it lists with ls through a shell or with find's own -name matching.
+  local function execute(argv)
+    local cmd
+    if argv[1] == "sh" or argv[1] == "bash" then
+      cmd = argv[#argv]
+    else
+      local parts = {}
+      for _, a in ipairs(argv) do
+        parts[#parts + 1] = "'" .. tostring(a):gsub("'", "'\\''") .. "'"
+      end
+      cmd = table.concat(parts, " ")
+    end
+    local pipe = io.popen(cmd)
+    local out = pipe:read("*a")
+    local ok = pipe:close()
+    return ok and true or false, out, ""
+  end
+
+  it("lists dated backups whose base name is a plain word", function()
+    if is_windows() then
+      return
+    end
+    for i = 1, 3 do
+      local f = io.open(string.format("%s/plain.20260101-00000%d.json", backups, i), "w")
+      assert.is_truthy(f, "could not create test backup " .. i)
+      f:write("{}")
+      f:close()
+    end
+    wezterm_stub.run_child_process = execute
+
+    local entries = state_manager._test.list_dated_backups(backups, "plain")
+    assert.equals(3, #entries)
+    assert.equals(backups .. "/plain.20260101-000001.json", entries[1].path)
+    assert.equals(backups .. "/plain.20260101-000003.json", entries[3].path)
+  end)
+end)

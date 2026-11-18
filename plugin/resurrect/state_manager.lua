@@ -74,22 +74,21 @@ local function list_dated_backups(backups_dir, basename)
 		})
 		if ok then stdout = output end
 	else
-		local safe = backups_dir:gsub("'", "'\\''")
-		local safe_pat = pattern:gsub("'", "'\\''")
 		local ok, output = wezterm.run_child_process({
-			"sh", "-c",
-			"ls '" .. safe .. "'/'" .. safe_pat .. "' 2>/dev/null | xargs -n1 basename",
+			"find", backups_dir, "-maxdepth", "1", "-type", "f", "-name", pattern, "-print",
 		})
 		if ok then stdout = output end
 	end
 	local entries = {}
 	if not stdout then return entries end
-	for name in stdout:gmatch("[^\r\n]+") do
-		name = name:match("^%s*(.-)%s*$")
+	for line in stdout:gmatch("[^\r\n]+") do
+		local listed = line:match("^%s*(.-)%s*$")
+		local name = listed:match("[^/\\]+$") or listed
 		-- Match the dated suffix we generate: basename.YYYYMMDD-HHMMSS.json
 		local stamp = name:match("^" .. basename:gsub("[%-%.%+%(%)%%%[%]%*%?%^%$]", "%%%1") .. "%.(%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d)%.json$")
 		if stamp then
-			table.insert(entries, { path = backups_dir .. utils.separator .. name, stamp = stamp })
+			local path = listed:find("[/\\]") and listed or (backups_dir .. utils.separator .. name)
+			table.insert(entries, { path = path, stamp = stamp })
 		end
 	end
 	table.sort(entries, function(a, b) return a.stamp < b.stamp end)
