@@ -13,6 +13,24 @@ local is_safe_cwd = utils.is_safe_cwd
 -- Every line a restore types ends with this (bare CR on Windows; see utils).
 local ENTER = utils.ENTER
 
+---@param node pane_tree | nil
+---@return integer
+local function subtree_max_right(node)
+	if node == nil then
+		return -1
+	end
+	local max_right = (node.left or 0) + (node.width or 0)
+	local right_max = subtree_max_right(node.right)
+	local bottom_max = subtree_max_right(node.bottom)
+	if right_max > max_right then
+		max_right = right_max
+	end
+	if bottom_max > max_right then
+		max_right = bottom_max
+	end
+	return max_right
+end
+
 ---Function used to split panes when mapping over the pane_tree
 ---@param opts restore_opts
 ---@return fun(acc: {active_pane: Pane, is_zoomed: boolean}, pane_tree: pane_tree): {active_pane: Pane, is_zoomed: boolean}
@@ -29,27 +47,41 @@ local function make_splits(opts)
 		end
 
 		local bottom = pane_tree.bottom
-		if bottom then
-			local split_args = { direction = "Bottom", cwd = bottom.cwd }
-			if opts.relative then
-				split_args.size = bottom.height / (pane_tree.height + bottom.height)
-			elseif opts.absolute then
-				split_args.size = bottom.height
-			end
+		local right = pane_tree.right
 
-			bottom.pane = pane:split(split_args)
+		local function split_bottom()
+			if bottom then
+				local split_args = { direction = "Bottom", cwd = bottom.cwd }
+				if opts.relative then
+					split_args.size = bottom.height / (pane_tree.height + bottom.height)
+				elseif opts.absolute then
+					split_args.size = bottom.height
+				end
+
+				bottom.pane = pane:split(split_args)
+			end
 		end
 
-		local right = pane_tree.right
-		if right then
-			local split_args = { direction = "Right", cwd = right.cwd }
-			if opts.relative then
-				split_args.size = right.width / (pane_tree.width + right.width)
-			elseif opts.absolute then
-				split_args.size = right.width
-			end
+		local function split_right()
+			if right then
+				local split_args = { direction = "Right", cwd = right.cwd }
+				if opts.relative then
+					split_args.size = right.width / (pane_tree.width + right.width)
+				elseif opts.absolute then
+					split_args.size = right.width
+				end
 
-			right.pane = pane:split(split_args)
+				right.pane = pane:split(split_args)
+			end
+		end
+
+		local pane_right = (pane_tree.left or 0) + (pane_tree.width or 0)
+		if bottom and right and subtree_max_right(bottom) > pane_right then
+			split_bottom()
+			split_right()
+		else
+			split_right()
+			split_bottom()
 		end
 
 		if pane_tree.is_active then
