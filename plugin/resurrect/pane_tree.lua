@@ -75,10 +75,12 @@ local MAX_PANE_DEPTH = 100
 ---@param root pane_tree | nil
 ---@param panes PaneInformation[]
 ---@param depth? number current recursion depth (defaults to 0)
+---@param visited? table<table, boolean> panes already claimed by another branch
 ---@return pane_tree | nil
-local function insert_panes(root, panes, depth)
+local function insert_panes(root, panes, depth, visited)
 	depth = depth or 0
-	if root == nil then
+	visited = visited or {}
+	if root == nil or visited[root] then
 		return nil
 	end
 	if depth > MAX_PANE_DEPTH then
@@ -86,12 +88,12 @@ local function insert_panes(root, panes, depth)
 		return root
 	end
 
-	-- Guard against duplicate processing in symmetric layouts
-	-- In a perfect cross layout, a pane can appear in both right and bottom branches
-	-- If already processed by another branch, skip to avoid nil pane access
+	-- Guard against duplicate processing if a pane was already serialized
 	if root.pane == nil then
-		return root
+		return nil
 	end
+
+	visited[root] = true
 
 	local domain = root.pane:get_domain_name()
 	if not wezterm.mux.get_domain(domain):is_spawnable() then
@@ -151,12 +153,12 @@ local function insert_panes(root, panes, depth)
 				process_info = {
 					name = bin,
 					executable = bin,
-					argv = process_info.argv or {},
-					cwd = process_info.cwd or "",
+					argv = (process_info and process_info.argv) or {},
+					cwd = (process_info and process_info.cwd) or "",
 				}
 			end
 
-			if root.alt_screen_active or has_handler then
+			if (root.alt_screen_active or has_handler) and process_info then
 				process_info.children = nil
 				process_info.pid = nil
 				process_info.ppid = nil
@@ -271,22 +273,60 @@ local function insert_panes(root, panes, depth)
 
 	local right, bottom = {}, {}
 	for _, pane in ipairs(panes) do
-		if is_right(root, pane) then
-			table.insert(right, pane)
-		end
-		if is_bottom(root, pane) then
-			table.insert(bottom, pane)
+		if not visited[pane] then
+			if is_right(root, pane) then
+				table.insert(right, pane)
+			end
+			if is_bottom(root, pane) then
+				table.insert(bottom, pane)
+			end
 		end
 	end
 
-	if #right > 0 then
-		local right_child = pop_connected_right(root, right)
-		root.right = insert_panes(right_child, right, depth + 1)
+	-- If any pane below root crosses root's right edge, the horizontal split at
+	-- root's bottom edge is outermost; traverse bottom before right so panes on
+	-- the lower row stay attached to the bottom subtree without duplication.
+	local has_bottom_crossing_right = false
+	local root_right = root.left + root.width
+	for _, pane in ipairs(bottom) do
+		if pane.left <= root_right and pane.left + pane.width > root_right then
+			has_bottom_crossing_right = true
+			break
+		end
 	end
 
-	if #bottom > 0 then
-		local bottom_child = pop_connected_bottom(root, bottom)
-		root.bottom = insert_panes(bottom_child, bottom, depth + 1)
+	local function build_right()
+		local remaining = {}
+		for _, pane in ipairs(right) do
+			if not visited[pane] then
+				table.insert(remaining, pane)
+			end
+		end
+		if #remaining > 0 then
+			local right_child = pop_connected_right(root, remaining)
+			root.right = insert_panes(right_child, remaining, depth + 1, visited)
+		end
+	end
+
+	local function build_bottom()
+		local remaining = {}
+		for _, pane in ipairs(bottom) do
+			if not visited[pane] then
+				table.insert(remaining, pane)
+			end
+		end
+		if #remaining > 0 then
+			local bottom_child = pop_connected_bottom(root, remaining)
+			root.bottom = insert_panes(bottom_child, remaining, depth + 1, visited)
+		end
+	end
+
+	if has_bottom_crossing_right then
+		build_bottom()
+		build_right()
+	else
+		build_right()
+		build_bottom()
 	end
 
 	return root
@@ -298,7 +338,7 @@ end
 function pub.create_pane_tree(panes)
 	table.sort(panes, compare_pane_by_coord)
 	local root = table.remove(panes, 1)
-	return insert_panes(root, panes)
+	return insert_panes(root, panes, 0, {})
 end
 
 ---maps over the pane tree (mutates in place)
